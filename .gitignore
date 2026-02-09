@@ -1,0 +1,75 @@
+# Environment & Secrets
+.env
+.env.local
+.env.production
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+*.whl
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker/data/
+
+# Logs
+logs/
+*.log
+
+# Data files (large)
+data/
+*.csv
+*.parquet
+*.h5
+*.hdf5
+
+# ML artifacts
+mlruns/
+wandb/
+models/*.pkl
+models/*.h5
+models/*.pt
+
+# Node (frontend)
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+
+# Misc
+*.bak
+*.tmp

@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+  # ---------------------------------------------------------------------------
+  # TimescaleDB (PostgreSQL with time-series extensions)
+  # ---------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: nifty-timescaledb
+    restart: unless-stopped
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${DB_NAME:-nifty_trader}
+      POSTGRES_USER: ${DB_USER:-trader}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change_me_in_production}
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-trader} -d ${DB_NAME:-nifty_trader}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Redis (cache + message broker for Celery)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: nifty-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  timescaledb_data:
+    driver: local
+  redis_data:
+    driver: local

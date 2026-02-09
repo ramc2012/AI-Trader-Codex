@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+*.egg
+
+# Tests (not needed in production image)
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend (built separately)
+frontend/
+
+# Docker
+docker/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Env files
+.env
+.env.*
+
+# Docs
+*.md
+docs/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files
+*.csv
+*.parquet
+*.h5
+*.hdf5
+
+# Logs
+*.log
+logs/

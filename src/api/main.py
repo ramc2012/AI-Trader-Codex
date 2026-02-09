@@ -6,7 +6,13 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.api.routes.backtest import router as backtest_router
 from src.api.routes.market_data import router as market_data_router
+from src.api.routes.monitoring import router as monitoring_router
+from src.api.routes.risk import router as risk_router
+from src.api.routes.strategies import router as strategies_router
+from src.api.routes.trading import router as trading_router
+from src.api.routes.websocket import router as websocket_router
 from src.config.constants import API_V1_PREFIX
 from src.config.settings import get_settings
 from src.database.connection import dispose_engine, get_engine
@@ -50,6 +56,12 @@ def create_app() -> FastAPI:
 
     # Routes
     app.include_router(market_data_router, prefix=API_V1_PREFIX)
+    app.include_router(trading_router, prefix=API_V1_PREFIX)
+    app.include_router(strategies_router, prefix=API_V1_PREFIX)
+    app.include_router(risk_router, prefix=API_V1_PREFIX)
+    app.include_router(monitoring_router, prefix=API_V1_PREFIX)
+    app.include_router(backtest_router, prefix=API_V1_PREFIX)
+    app.include_router(websocket_router, prefix=API_V1_PREFIX)
 
     return app
 

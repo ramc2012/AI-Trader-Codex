@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Save,
   Loader2,
@@ -49,6 +49,32 @@ export function FyersCredentialsForm({
   const [validationMessage, setValidationMessage] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [loginUrl, setLoginUrl] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  // Load existing credentials on mount
+  useEffect(() => {
+    const loadCredentials = async () => {
+      try {
+        const response = await fetch('/api/v1/auth/credentials');
+        if (response.ok) {
+          const data = await response.json();
+          if (data.app_id && data.redirect_uri) {
+            setFormData((prev) => ({
+              ...prev,
+              appId: data.app_id,
+              redirectUri: data.redirect_uri,
+            }));
+          }
+        }
+      } catch (error) {
+        console.error('Failed to load credentials:', error);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    loadCredentials();
+  }, []);
 
   const handleInputChange = (field: keyof FormData, value: string) => {
     setFormData((prev) => ({ ...prev, [field]: value }));
@@ -177,6 +203,15 @@ export function FyersCredentialsForm({
       setIsSaving(false);
     }
   };
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8">
+        <Loader2 className="h-6 w-6 animate-spin text-slate-400" />
+        <span className="ml-3 text-sm text-slate-400">Loading credentials...</span>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

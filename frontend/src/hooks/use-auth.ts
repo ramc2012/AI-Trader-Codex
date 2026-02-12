@@ -8,8 +8,9 @@ export function useAuthStatus() {
   return useQuery<AuthStatus>({
     queryKey: ['auth-status'],
     queryFn: () => apiFetch<AuthStatus>('/auth/status'),
-    refetchInterval: 10000,
+    refetchInterval: 60000, // Reduced frequency to 60 seconds to prevent form interference
     retry: 1,
+    staleTime: 30000, // Consider data fresh for 30 seconds
   });
 }
 

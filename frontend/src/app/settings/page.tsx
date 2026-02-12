@@ -133,10 +133,10 @@ export default function SettingsPage() {
               onSuccess={() => {
                 setAuthMessage({
                   type: 'success',
-                  text: 'Credentials saved! Complete the authentication in the new window.',
+                  text: 'Authentication successful! You are now connected to Fyers.',
                 });
                 // Reload auth status after a delay
-                setTimeout(() => window.location.reload(), 2000);
+                setTimeout(() => window.location.reload(), 1500);
               }}
             />
           </div>

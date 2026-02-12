@@ -210,17 +210,19 @@ async def validate_credentials(
     a login URL if they are valid.
     """
     try:
-        # Create temporary FyersClient with provided credentials
-        from fyers_apiv3 import fyersModel
+        # Create temporary SessionModel with provided credentials
+        from fyers_apiv3.fyersModel import SessionModel
 
-        temp_client = fyersModel.FyersModel(
+        session = SessionModel(
             client_id=credentials.app_id,
-            token="",  # No token yet
-            log_path="",
+            redirect_uri=credentials.redirect_uri,
+            response_type="code",
+            secret_key=credentials.secret_key,
+            grant_type="authorization_code",
         )
 
         # Generate auth URL - this will fail if credentials are invalid
-        response = temp_client.generate_authcode()
+        response = session.generate_authcode()
 
         if not response or not isinstance(response, str):
             return ValidateCredentialsResponse(

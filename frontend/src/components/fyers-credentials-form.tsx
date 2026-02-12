@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Save,
   Loader2,
@@ -51,30 +51,38 @@ export function FyersCredentialsForm({
   const [loginUrl, setLoginUrl] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Load existing credentials on mount
+  // Use ref to track if credentials have been loaded - prevents re-loading on re-renders
+  const hasLoadedRef = useRef(false);
+
+  // Load existing credentials on mount - ONLY ONCE
   useEffect(() => {
+    if (hasLoadedRef.current) {
+      return; // Already loaded, skip
+    }
+
     const loadCredentials = async () => {
       try {
         const response = await fetch('/api/v1/auth/credentials');
         if (response.ok) {
           const data = await response.json();
           if (data.app_id && data.redirect_uri) {
-            setFormData((prev) => ({
-              ...prev,
+            setFormData({
               appId: data.app_id,
+              secretKey: '',
               redirectUri: data.redirect_uri,
-            }));
+            });
           }
         }
       } catch (error) {
         console.error('Failed to load credentials:', error);
       } finally {
         setIsLoading(false);
+        hasLoadedRef.current = true;
       }
     };
 
     loadCredentials();
-  }, []);
+  }, []); // Empty dependency array - truly only run once
 
   const handleInputChange = (field: keyof FormData, value: string) => {
     setFormData((prev) => ({ ...prev, [field]: value }));

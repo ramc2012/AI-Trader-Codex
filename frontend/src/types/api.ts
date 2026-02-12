@@ -6,8 +6,10 @@ export interface Position {
   current_price: number;
   unrealized_pnl: number;
   unrealized_pnl_pct: number;
+  realized_pnl?: number;
   market_value: number;
   strategy_tag: string;
+  entry_time?: string;
 }
 
 export interface Order {
@@ -176,4 +178,64 @@ export interface OHLCResponse {
   timeframe: string;
   count: number;
   candles: OHLCCandle[];
+}
+
+// =========================================================================
+// Auth Types
+// =========================================================================
+
+export interface AuthStatus {
+  authenticated: boolean;
+  profile: Record<string, unknown> | null;
+  app_configured: boolean;
+}
+
+export interface AuthLoginUrl {
+  url: string;
+}
+
+// =========================================================================
+// Watchlist Types
+// =========================================================================
+
+export interface DataSummaryItem {
+  timeframe: string;
+  count: number;
+  latest_timestamp: string | null;
+}
+
+export interface WatchlistSymbol {
+  symbol: string;
+  display_name: string;
+  data_summary: DataSummaryItem[];
+  latest_price: number | null;
+  price_change_pct: number | null;
+}
+
+export interface CollectionStatus {
+  symbol: string;
+  timeframe: string;
+  status: 'idle' | 'collecting' | 'completed' | 'failed';
+  progress: number;
+  candles_collected: number;
+  error: string | null;
+}
+
+// =========================================================================
+// Dashboard WebSocket Types
+// =========================================================================
+
+export interface EquitySnapshot {
+  time: string;
+  value: number;
+}
+
+export interface DashboardWSPayload {
+  type: 'dashboard_update';
+  timestamp: string;
+  portfolio: PortfolioSummary;
+  risk: Partial<RiskSummary>;
+  alerts: AlertCounts;
+  equity_snapshot: EquitySnapshot;
+  ws_connections: number;
 }

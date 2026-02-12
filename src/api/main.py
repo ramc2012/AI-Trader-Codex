@@ -12,6 +12,7 @@ from src.api.routes.monitoring import router as monitoring_router
 from src.api.routes.risk import router as risk_router
 from src.api.routes.strategies import router as strategies_router
 from src.api.routes.trading import router as trading_router
+from src.api.routes.auth import router as auth_router
 from src.api.routes.websocket import router as websocket_router
 from src.config.constants import API_V1_PREFIX
 from src.config.settings import get_settings
@@ -62,6 +63,7 @@ def create_app() -> FastAPI:
     app.include_router(monitoring_router, prefix=API_V1_PREFIX)
     app.include_router(backtest_router, prefix=API_V1_PREFIX)
     app.include_router(websocket_router, prefix=API_V1_PREFIX)
+    app.include_router(auth_router, prefix=API_V1_PREFIX)
 
     return app
 

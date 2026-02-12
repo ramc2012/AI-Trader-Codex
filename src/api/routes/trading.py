@@ -6,7 +6,8 @@ history from the in-memory managers.
 
 from __future__ import annotations
 
-from typing import List
+from datetime import datetime
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends
 
@@ -98,6 +99,36 @@ def list_closed_trades(
             strategy_tag=t.get("strategy_tag", ""),
         )
         for t in trades
+    ]
+
+
+@router.get("/portfolio/equity-curve")
+def get_equity_curve(
+    pm: PositionManager = Depends(get_position_manager),
+) -> List[Dict[str, Any]]:
+    """Get equity curve data points.
+
+    Returns accumulated portfolio value snapshots. If no snapshots
+    exist yet (no trading activity), returns initial capital as a
+    baseline single data point.
+    """
+    # Check if PositionManager has equity snapshots
+    snapshots = getattr(pm, "_equity_snapshots", [])
+
+    if snapshots:
+        return snapshots
+
+    # No snapshots yet - return initial capital baseline
+    portfolio = pm.get_portfolio_summary()
+    capital = portfolio.get("total_market_value", 1000000)
+    if capital == 0:
+        capital = 1000000  # Default when no positions
+
+    return [
+        {
+            "time": datetime.now().isoformat(),
+            "value": capital,
+        }
     ]
 
 

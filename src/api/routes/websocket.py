@@ -192,4 +192,11 @@ def _build_dashboard_payload() -> Dict[str, Any]:
         "portfolio": portfolio,
         "risk": risk,
         "alerts": alert_counts,
+        "equity_snapshot": {
+            "time": datetime.now().isoformat(),
+            "value": portfolio.get("total_market_value", 0)
+            if isinstance(portfolio, dict)
+            else 0,
+        },
+        "ws_connections": dashboard_manager.active_connections,
     }

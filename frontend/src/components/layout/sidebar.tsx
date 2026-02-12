@@ -10,6 +10,8 @@ import {
   CandlestickChart,
   Activity,
   FlaskConical,
+  List,
+  Settings,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -21,10 +23,39 @@ const navItems = [
   { href: '/market', label: 'Market', icon: CandlestickChart },
   { href: '/monitoring', label: 'Monitoring', icon: Activity },
   { href: '/backtest', label: 'Backtest', icon: FlaskConical },
+  { href: '/watchlist', label: 'Watchlist', icon: List },
+];
+
+const bottomNavItems = [
+  { href: '/settings', label: 'Settings', icon: Settings },
 ];
 
 export function Sidebar() {
   const pathname = usePathname();
+
+  const renderNavLink = (item: (typeof navItems)[0]) => {
+    const isActive =
+      item.href === '/'
+        ? pathname === '/'
+        : pathname.startsWith(item.href);
+    const Icon = item.icon;
+
+    return (
+      <Link
+        key={item.href}
+        href={item.href}
+        className={cn(
+          'flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors',
+          isActive
+            ? 'bg-slate-800 text-emerald-400'
+            : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
+        )}
+      >
+        <Icon className="h-5 w-5" />
+        {item.label}
+      </Link>
+    );
+  };
 
   return (
     <aside className="fixed left-0 top-0 z-40 flex h-screen w-60 flex-col border-r border-slate-800 bg-slate-950">
@@ -34,30 +65,12 @@ export function Sidebar() {
       </div>
 
       <nav className="flex-1 space-y-1 px-3 py-4">
-        {navItems.map((item) => {
-          const isActive =
-            item.href === '/'
-              ? pathname === '/'
-              : pathname.startsWith(item.href);
-          const Icon = item.icon;
-
-          return (
-            <Link
-              key={item.href}
-              href={item.href}
-              className={cn(
-                'flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors',
-                isActive
-                  ? 'bg-slate-800 text-emerald-400'
-                  : 'text-slate-400 hover:bg-slate-900 hover:text-slate-200'
-              )}
-            >
-              <Icon className="h-5 w-5" />
-              {item.label}
-            </Link>
-          );
-        })}
+        {navItems.map(renderNavLink)}
       </nav>
+
+      <div className="border-t border-slate-800 px-3 py-2">
+        {bottomNavItems.map(renderNavLink)}
+      </div>
 
       <div className="border-t border-slate-800 px-4 py-3">
         <p className="text-xs text-slate-500">Nifty AI Trader v0.1</p>

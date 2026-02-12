@@ -9,22 +9,14 @@ import {
   Tooltip,
 } from 'recharts';
 import { Shield, AlertTriangle } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
 import { useRiskSummary } from '@/hooks/use-risk-summary';
 import { useRiskMetrics } from '@/hooks/use-risk-metrics';
+import { apiFetch } from '@/lib/api';
 import { formatINR, formatPercent, formatNumber } from '@/lib/formatters';
 import { cn } from '@/lib/utils';
-
-// Sample equity data for the chart
-const sampleEquityData = Array.from({ length: 30 }, (_, i) => ({
-  day: `Day ${i + 1}`,
-  equity: 1000000 + Math.round((Math.random() - 0.3) * 20000 * (i + 1)),
-}));
-
-function Skeleton({ className }: { className?: string }) {
-  return (
-    <div className={cn('animate-pulse rounded bg-slate-800', className)} />
-  );
-}
+import { Skeleton } from '@/components/ui/skeleton';
+import type { EquitySnapshot } from '@/types/api';
 
 function MetricCard({
   title,
@@ -59,6 +51,40 @@ function MetricCard({
 export default function RiskPage() {
   const { data: risk, isLoading: riskLoading } = useRiskSummary();
   const { data: metrics, isLoading: metricsLoading } = useRiskMetrics();
+
+  // Fetch equity curve from API instead of hardcoded sample data
+  const { data: equityCurveApi, isLoading: equityLoading } = useQuery<EquitySnapshot[]>({
+    queryKey: ['equity-curve'],
+    queryFn: () => apiFetch<EquitySnapshot[]>('/portfolio/equity-curve'),
+    refetchInterval: 10000,
+  });
+
+  // Also check for live WebSocket snapshots
+  const { data: equityCurveLive } = useQuery<EquitySnapshot[]>({
+    queryKey: ['equity-curve-live'],
+    enabled: false, // populated by WebSocket hook on dashboard
+  });
+
+  // Use live data if available, else API data, else empty
+  const equityCurveData = (equityCurveLive && equityCurveLive.length > 1)
+    ? equityCurveLive.map((s) => ({
+        time: new Date(s.time).toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+          timeZone: 'Asia/Kolkata',
+        }),
+        value: s.value,
+      }))
+    : (equityCurveApi ?? []).map((s) => ({
+        time: new Date(s.time).toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+          timeZone: 'Asia/Kolkata',
+        }),
+        value: s.value,
+      }));
 
   return (
     <div className="space-y-8">
@@ -159,50 +185,68 @@ export default function RiskPage() {
 
       {/* Equity Curve */}
       <div className="rounded-xl border border-slate-800 bg-slate-900 p-5">
-        <h3 className="mb-4 text-sm font-medium text-slate-400">
-          Equity Curve
-        </h3>
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-medium text-slate-400">
+            Equity Curve
+          </h3>
+          {equityCurveLive && equityCurveLive.length > 1 && (
+            <span className="text-xs text-emerald-500">
+              {equityCurveLive.length} live snapshots
+            </span>
+          )}
+        </div>
         <div className="h-72">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={sampleEquityData}>
-              <defs>
-                <linearGradient id="riskEquity" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <XAxis
-                dataKey="day"
-                stroke="#475569"
-                fontSize={12}
-                tickLine={false}
-                axisLine={false}
-              />
-              <YAxis
-                stroke="#475569"
-                fontSize={12}
-                tickLine={false}
-                axisLine={false}
-                tickFormatter={(val) => `${(Number(val) / 100000).toFixed(0)}L`}
-              />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: '#1e293b',
-                  border: '1px solid #334155',
-                  borderRadius: '8px',
-                  color: '#f1f5f9',
-                }}
-                formatter={(val) => [formatINR(Number(val)), 'Equity']}
-              />
-              <Area
-                type="monotone"
-                dataKey="equity"
-                stroke="#10b981"
-                strokeWidth={2}
-                fill="url(#riskEquity)"
-              />
-            </AreaChart>
-          </ResponsiveContainer>
+          {equityLoading ? (
+            <div className="flex h-full items-center justify-center">
+              <Skeleton className="h-full w-full" />
+            </div>
+          ) : equityCurveData.length > 0 ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={equityCurveData}>
+                <defs>
+                  <linearGradient id="riskEquity" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <XAxis
+                  dataKey="time"
+                  stroke="#475569"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                />
+                <YAxis
+                  stroke="#475569"
+                  fontSize={12}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={(val) => `${(Number(val) / 100000).toFixed(1)}L`}
+                />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: '#1e293b',
+                    border: '1px solid #334155',
+                    borderRadius: '8px',
+                    color: '#f1f5f9',
+                  }}
+                  formatter={(val) => [formatINR(Number(val)), 'Equity']}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="value"
+                  stroke="#10b981"
+                  strokeWidth={2}
+                  fill="url(#riskEquity)"
+                  isAnimationActive={false}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-slate-500">
+              Equity data will appear once trading begins
+            </div>
+          )}
         </div>
       </div>
 

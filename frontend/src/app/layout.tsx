@@ -27,7 +27,9 @@ export default function RootLayout({
           <Sidebar />
           <Header />
           <main className="ml-60 mt-16 min-h-[calc(100vh-4rem)] p-6">
-            {children}
+            <div className="animate-fade-in">
+              {children}
+            </div>
           </main>
         </Providers>
       </body>

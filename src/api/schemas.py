@@ -284,3 +284,64 @@ class BacktestRunRequest(BaseModel):
     quantity: int = Field(default=1, description="Trade quantity per signal")
     commission: float = Field(default=0.0, description="Per-trade commission")
     slippage_pct: float = Field(default=0.0, description="Slippage as % of price")
+
+
+# =========================================================================
+# Auth Schemas
+# =========================================================================
+
+
+class AuthStatusResponse(BaseModel):
+    """Fyers authentication status."""
+
+    authenticated: bool = False
+    profile: Optional[Dict[str, Any]] = None
+    app_configured: bool = False
+
+
+class AuthLoginUrlResponse(BaseModel):
+    """OAuth authorization URL response."""
+
+    url: str
+
+
+# =========================================================================
+# Watchlist / Data Collection Schemas
+# =========================================================================
+
+
+class DataSummaryItem(BaseModel):
+    """Data availability for one symbol-timeframe pair."""
+
+    timeframe: str
+    count: int = 0
+    latest_timestamp: Optional[str] = None
+
+
+class WatchlistSymbolResponse(BaseModel):
+    """Symbol with data collection summary."""
+
+    symbol: str
+    display_name: str
+    data_summary: List[DataSummaryItem] = Field(default_factory=list)
+    latest_price: Optional[float] = None
+    price_change_pct: Optional[float] = None
+
+
+class CollectionRequest(BaseModel):
+    """POST body for triggering data collection."""
+
+    symbol: str = Field(..., description="Symbol to collect data for")
+    timeframe: str = Field(default="D", description="Timeframe to collect")
+    days_back: int = Field(default=90, ge=1, le=730, description="Days of history to collect")
+
+
+class CollectionStatusResponse(BaseModel):
+    """Status of a data collection job."""
+
+    symbol: str
+    timeframe: str
+    status: str = "idle"  # idle, collecting, completed, failed
+    progress: float = 0.0
+    candles_collected: int = 0
+    error: Optional[str] = None

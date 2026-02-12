@@ -10,6 +10,7 @@ from src.database.connection import get_session_factory
 from src.execution.order_manager import OrderManager
 from src.execution.position_manager import PositionManager
 from src.execution.strategy_executor import StrategyExecutor
+from src.integrations.fyers_client import FyersClient
 from src.monitoring.alerts import AlertManager
 from src.monitoring.health import HealthMonitor
 from src.risk.risk_calculator import RiskCalculator
@@ -46,6 +47,7 @@ _risk_manager: Optional[RiskManager] = None
 _risk_calculator: Optional[RiskCalculator] = None
 _health_monitor: Optional[HealthMonitor] = None
 _alert_manager: Optional[AlertManager] = None
+_fyers_client: Optional[FyersClient] = None
 
 
 def get_order_manager() -> OrderManager:
@@ -108,10 +110,19 @@ def get_alert_manager() -> AlertManager:
     return _alert_manager
 
 
+def get_fyers_client() -> FyersClient:
+    """Get or create the singleton FyersClient."""
+    global _fyers_client
+    if _fyers_client is None:
+        _fyers_client = FyersClient()
+    return _fyers_client
+
+
 def reset_managers() -> None:
     """Reset all manager singletons to None (for testing)."""
     global _order_manager, _position_manager, _strategy_executor
     global _risk_manager, _risk_calculator, _health_monitor, _alert_manager
+    global _fyers_client
 
     _order_manager = None
     _position_manager = None
@@ -120,3 +131,4 @@ def reset_managers() -> None:
     _risk_calculator = None
     _health_monitor = None
     _alert_manager = None
+    _fyers_client = None

@@ -305,6 +305,33 @@ class AuthLoginUrlResponse(BaseModel):
     url: str
 
 
+class FyersCredentialsRequest(BaseModel):
+    """Request model for saving Fyers API credentials."""
+
+    app_id: str = Field(..., min_length=1, description="Fyers App ID")
+    secret_key: str = Field(..., min_length=1, description="Fyers Secret Key")
+    redirect_uri: str = Field(
+        default="http://localhost:8000/api/v1/auth/callback",
+        description="OAuth redirect URI",
+    )
+
+
+class FyersCredentialsResponse(BaseModel):
+    """Response model for Fyers credentials (without secret)."""
+
+    app_id: str
+    redirect_uri: str
+    configured: bool = True
+
+
+class ValidateCredentialsResponse(BaseModel):
+    """Response model for credential validation."""
+
+    valid: bool
+    message: str
+    login_url: Optional[str] = None
+
+
 # =========================================================================
 # Watchlist / Data Collection Schemas
 # =========================================================================

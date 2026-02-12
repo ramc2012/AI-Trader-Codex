@@ -14,15 +14,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 
 from src.api.dependencies import get_fyers_client
-from src.api.schemas import AuthLoginUrlResponse, AuthStatusResponse
+from src.api.schemas import (
+    AuthLoginUrlResponse,
+    AuthStatusResponse,
+    FyersCredentialsRequest,
+    FyersCredentialsResponse,
+    ValidateCredentialsResponse,
+)
 from src.config.settings import get_settings
 from src.integrations.fyers_client import FyersClient
+from src.utils.env_manager import EnvManager
 from src.utils.exceptions import AuthenticationError
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["Auth"])
+env_manager = EnvManager()
 
 
 @router.get("/auth/status", response_model=AuthStatusResponse)
@@ -121,3 +129,159 @@ async def logout(
         logger.info("token_file_removed")
 
     return {"message": "Logged out successfully"}
+
+
+@router.get("/auth/credentials", response_model=FyersCredentialsResponse)
+async def get_credentials() -> FyersCredentialsResponse:
+    """Get current Fyers API credentials (without exposing secret key)."""
+    settings = get_settings()
+
+    return FyersCredentialsResponse(
+        app_id=settings.fyers_app_id if settings.fyers_app_id else "",
+        redirect_uri=settings.fyers_redirect_uri,
+        configured=bool(settings.fyers_app_id and settings.fyers_secret_key),
+    )
+
+
+@router.post("/auth/credentials", response_model=FyersCredentialsResponse)
+async def save_credentials(
+    credentials: FyersCredentialsRequest,
+) -> FyersCredentialsResponse:
+    """Save Fyers API credentials to .env file.
+
+    This updates the .env file and reloads settings. A backup is created
+    automatically before updating.
+    """
+    try:
+        # Validate inputs
+        if not credentials.app_id or not credentials.secret_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Both app_id and secret_key are required",
+            )
+
+        # Update .env file
+        updates = {
+            "FYERS_APP_ID": credentials.app_id,
+            "FYERS_SECRET_KEY": credentials.secret_key,
+            "FYERS_REDIRECT_URI": credentials.redirect_uri,
+        }
+
+        success = env_manager.update_env(updates, create_backup=True)
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to update credentials. Check server logs.",
+            )
+
+        # Clear settings cache to reload new values
+        get_settings.cache_clear()
+
+        logger.info(
+            "fyers_credentials_saved",
+            app_id=credentials.app_id,
+            redirect_uri=credentials.redirect_uri,
+        )
+
+        return FyersCredentialsResponse(
+            app_id=credentials.app_id,
+            redirect_uri=credentials.redirect_uri,
+            configured=True,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("save_credentials_failed", error=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save credentials: {str(exc)}",
+        )
+
+
+@router.post("/auth/validate", response_model=ValidateCredentialsResponse)
+async def validate_credentials(
+    credentials: FyersCredentialsRequest,
+) -> ValidateCredentialsResponse:
+    """Validate Fyers API credentials and generate login URL.
+
+    This endpoint validates the credentials without saving them and returns
+    a login URL if they are valid.
+    """
+    try:
+        # Create temporary FyersClient with provided credentials
+        from fyers_apiv3 import fyersModel
+
+        temp_client = fyersModel.FyersModel(
+            client_id=credentials.app_id,
+            token="",  # No token yet
+            log_path="",
+        )
+
+        # Generate auth URL - this will fail if credentials are invalid
+        response = temp_client.generate_authcode()
+
+        if not response or not isinstance(response, str):
+            return ValidateCredentialsResponse(
+                valid=False,
+                message="Invalid credentials: Unable to generate authorization URL",
+            )
+
+        logger.info("credentials_validated", app_id=credentials.app_id)
+
+        return ValidateCredentialsResponse(
+            valid=True,
+            message="Credentials are valid",
+            login_url=response,
+        )
+
+    except Exception as exc:
+        logger.warning("credential_validation_failed", error=str(exc))
+        return ValidateCredentialsResponse(
+            valid=False,
+            message=f"Invalid credentials: {str(exc)}",
+        )
+
+
+@router.post("/auth/save-and-login")
+async def save_and_login(
+    credentials: FyersCredentialsRequest,
+) -> Dict[str, Any]:
+    """Save credentials and initiate automated login flow.
+
+    This is a convenience endpoint that:
+    1. Saves credentials to .env
+    2. Validates them
+    3. Returns login URL for OAuth flow
+    """
+    try:
+        # Save credentials first
+        await save_credentials(credentials)
+
+        # Validate and get login URL
+        validation = await validate_credentials(credentials)
+
+        if not validation.valid:
+            raise HTTPException(
+                status_code=400,
+                detail=validation.message,
+            )
+
+        logger.info("save_and_login_success", app_id=credentials.app_id)
+
+        return {
+            "success": True,
+            "message": "Credentials saved successfully",
+            "login_url": validation.login_url,
+            "next_step": "Open the login_url in a browser to complete authentication",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("save_and_login_failed", error=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save and login: {str(exc)}",
+        )

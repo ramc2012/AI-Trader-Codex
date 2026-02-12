@@ -12,9 +12,11 @@ import {
   Loader2,
   Server,
   Database,
+  Edit3,
 } from 'lucide-react';
 import { useAuth } from '@/contexts/auth-context';
 import { useLoginUrl, useLogout } from '@/hooks/use-auth';
+import { FyersCredentialsForm } from '@/components/fyers-credentials-form';
 import { cn } from '@/lib/utils';
 
 export default function SettingsPage() {
@@ -27,6 +29,8 @@ export default function SettingsPage() {
     type: 'success' | 'error';
     text: string;
   } | null>(null);
+
+  const [showCredentialsForm, setShowCredentialsForm] = useState(false);
 
   // Check for auth redirect params
   useEffect(() => {
@@ -109,27 +113,32 @@ export default function SettingsPage() {
             </span>
           </div>
         ) : !appConfigured ? (
-          /* Not Configured */
-          <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-4">
-            <div className="flex items-start gap-3">
-              <AlertTriangle className="h-5 w-5 shrink-0 text-yellow-400 mt-0.5" />
-              <div>
-                <p className="text-sm font-medium text-yellow-400">
-                  Fyers API Not Configured
-                </p>
-                <p className="mt-1 text-sm text-slate-400">
-                  To connect to Fyers, set{' '}
-                  <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs text-slate-300">
-                    FYERS_APP_ID
-                  </code>{' '}
-                  and{' '}
-                  <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs text-slate-300">
-                    FYERS_SECRET_KEY
-                  </code>{' '}
-                  in your <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs text-slate-300">.env</code> file, then restart the backend.
-                </p>
+          /* Not Configured - Show Form */
+          <div className="space-y-4">
+            <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-4">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="h-5 w-5 shrink-0 text-yellow-400 mt-0.5" />
+                <div>
+                  <p className="text-sm font-medium text-yellow-400">
+                    Fyers API Not Configured
+                  </p>
+                  <p className="mt-1 text-sm text-slate-400">
+                    Enter your Fyers API credentials below to get started.
+                  </p>
+                </div>
               </div>
             </div>
+
+            <FyersCredentialsForm
+              onSuccess={() => {
+                setAuthMessage({
+                  type: 'success',
+                  text: 'Credentials saved! Complete the authentication in the new window.',
+                });
+                // Reload auth status after a delay
+                setTimeout(() => window.location.reload(), 2000);
+              }}
+            />
           </div>
         ) : isAuthenticated ? (
           /* Connected */
@@ -175,21 +184,50 @@ export default function SettingsPage() {
               </div>
             )}
 
-            <button
-              onClick={handleDisconnect}
-              disabled={logoutMutation.isPending}
-              className="flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-            >
-              {logoutMutation.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <LogOut className="h-4 w-4" />
-              )}
-              Disconnect from Fyers
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleDisconnect}
+                disabled={logoutMutation.isPending}
+                className="flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+              >
+                {logoutMutation.isPending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <LogOut className="h-4 w-4" />
+                )}
+                Disconnect from Fyers
+              </button>
+
+              <button
+                onClick={() => setShowCredentialsForm(true)}
+                className="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-4 py-2 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-700"
+              >
+                <Edit3 className="h-4 w-4" />
+                Update Credentials
+              </button>
+            </div>
+
+            {showCredentialsForm && (
+              <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-4">
+                <h4 className="text-sm font-medium text-slate-300 mb-4">
+                  Update API Credentials
+                </h4>
+                <FyersCredentialsForm
+                  onSuccess={() => {
+                    setShowCredentialsForm(false);
+                    setAuthMessage({
+                      type: 'success',
+                      text: 'Credentials updated successfully!',
+                    });
+                    setTimeout(() => window.location.reload(), 1500);
+                  }}
+                  onCancel={() => setShowCredentialsForm(false)}
+                />
+              </div>
+            )}
           </div>
         ) : (
-          /* Disconnected */
+          /* Disconnected but Configured */
           <div className="space-y-4">
             <div className="flex items-center gap-3">
               <span className="h-3 w-3 rounded-full bg-red-500" />
@@ -203,18 +241,46 @@ export default function SettingsPage() {
               and trading. You&apos;ll be redirected to Fyers to authorize access.
             </p>
 
-            <button
-              onClick={handleConnect}
-              disabled={fetchingUrl}
-              className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500 disabled:opacity-50"
-            >
-              {fetchingUrl ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <ExternalLink className="h-4 w-4" />
-              )}
-              Connect to Fyers
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleConnect}
+                disabled={fetchingUrl}
+                className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500 disabled:opacity-50"
+              >
+                {fetchingUrl ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <ExternalLink className="h-4 w-4" />
+                )}
+                Connect to Fyers
+              </button>
+
+              <button
+                onClick={() => setShowCredentialsForm(!showCredentialsForm)}
+                className="flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-4 py-2 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-700"
+              >
+                <Edit3 className="h-4 w-4" />
+                {showCredentialsForm ? 'Hide' : 'Update'} Credentials
+              </button>
+            </div>
+
+            {showCredentialsForm && (
+              <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-4">
+                <h4 className="text-sm font-medium text-slate-300 mb-4">
+                  Update API Credentials
+                </h4>
+                <FyersCredentialsForm
+                  onSuccess={() => {
+                    setShowCredentialsForm(false);
+                    setAuthMessage({
+                      type: 'success',
+                      text: 'Credentials updated! You can now connect to Fyers.',
+                    });
+                  }}
+                  onCancel={() => setShowCredentialsForm(false)}
+                />
+              </div>
+            )}
           </div>
         )}
       </div>

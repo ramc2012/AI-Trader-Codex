@@ -19,6 +19,8 @@ from src.api.schemas import (
     AuthStatusResponse,
     FyersCredentialsRequest,
     FyersCredentialsResponse,
+    ManualAuthCodeRequest,
+    ManualAuthResponse,
     ValidateCredentialsResponse,
 )
 from src.config.settings import get_settings
@@ -286,4 +288,43 @@ async def save_and_login(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to save and login: {str(exc)}",
+        )
+
+
+@router.post("/auth/manual-code", response_model=ManualAuthResponse)
+async def submit_manual_auth_code(
+    request: ManualAuthCodeRequest,
+    client: FyersClient = Depends(get_fyers_client),
+) -> ManualAuthResponse:
+    """Submit authorization code manually for authentication.
+
+    Use this when the automatic redirect doesn't work. After opening the
+    Fyers login URL, copy the authorization code from the redirect URL
+    and submit it here.
+    """
+    try:
+        # Authenticate using the provided code
+        await asyncio.to_thread(client.authenticate, request.auth_code)
+
+        logger.info("manual_auth_success")
+
+        return ManualAuthResponse(
+            success=True,
+            message="Authentication successful! You are now connected to Fyers.",
+            authenticated=True,
+        )
+
+    except AuthenticationError as exc:
+        logger.error("manual_auth_failed", error=str(exc))
+        return ManualAuthResponse(
+            success=False,
+            message=f"Authentication failed: {str(exc)}",
+            authenticated=False,
+        )
+    except Exception as exc:
+        logger.error("manual_auth_error", error=str(exc))
+        return ManualAuthResponse(
+            success=False,
+            message=f"Unexpected error: {str(exc)}",
+            authenticated=False,
         )

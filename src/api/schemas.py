@@ -332,6 +332,20 @@ class ValidateCredentialsResponse(BaseModel):
     login_url: Optional[str] = None
 
 
+class ManualAuthCodeRequest(BaseModel):
+    """Request model for manual authorization code entry."""
+
+    auth_code: str = Field(..., min_length=1, description="Authorization code from Fyers")
+
+
+class ManualAuthResponse(BaseModel):
+    """Response model for manual auth code submission."""
+
+    success: bool
+    message: str
+    authenticated: bool
+
+
 # =========================================================================
 # Watchlist / Data Collection Schemas
 # =========================================================================

@@ -14,6 +14,7 @@ import {
   HelpCircle,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { ManualAuthCodeForm } from './manual-auth-code-form';
 
 interface FyersCredentialsFormProps {
   onSuccess?: () => void;
@@ -164,17 +165,8 @@ export function FyersCredentialsForm({
 
       if (data.success && data.login_url) {
         setValidationStatus('valid');
-        setValidationMessage('Credentials saved! Opening login page...');
-
-        // Open login URL
-        setTimeout(() => {
-          window.open(data.login_url, '_blank');
-        }, 500);
-
-        // Call success callback
-        setTimeout(() => {
-          onSuccess?.();
-        }, 1000);
+        setValidationMessage('Credentials saved! Use the manual authentication below.');
+        setLoginUrl(data.login_url);
       }
     } catch (error) {
       setValidationStatus('invalid');
@@ -367,6 +359,27 @@ export function FyersCredentialsForm({
           </button>
         )}
       </div>
+
+      {/* Manual Authentication Form */}
+      {validationStatus === 'valid' && loginUrl && (
+        <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-4">
+          <h4 className="text-sm font-medium text-slate-300 mb-4">
+            Manual Authentication
+          </h4>
+          <ManualAuthCodeForm
+            loginUrl={loginUrl}
+            onSuccess={() => {
+              setValidationStatus('idle');
+              setLoginUrl(null);
+              onSuccess?.();
+            }}
+            onCancel={() => {
+              setLoginUrl(null);
+              setValidationStatus('idle');
+            }}
+          />
+        </div>
+      )}
     </div>
   );
 }

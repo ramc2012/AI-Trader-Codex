@@ -311,7 +311,7 @@ class FyersCredentialsRequest(BaseModel):
     app_id: str = Field(..., min_length=1, description="Fyers App ID")
     secret_key: str = Field(..., min_length=1, description="Fyers Secret Key")
     redirect_uri: str = Field(
-        default="http://localhost:8000/api/v1/auth/callback",
+        default="https://trade.fyers.in/api-login/redirect-uri/index.html",
         description="OAuth redirect URI",
     )
 

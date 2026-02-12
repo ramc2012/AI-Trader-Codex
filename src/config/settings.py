@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     # --- Fyers API ---
     fyers_app_id: str = ""
     fyers_secret_key: str = ""
-    fyers_redirect_uri: str = "http://localhost:8000/api/v1/auth/callback"
+    fyers_redirect_uri: str = "https://trade.fyers.in/api-login/redirect-uri/index.html"
     fyers_redirect_frontend_url: str = "http://localhost:3000/settings"
 
     # --- Database ---

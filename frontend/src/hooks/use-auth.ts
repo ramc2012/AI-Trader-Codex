@@ -9,6 +9,8 @@ export function useAuthStatus() {
     queryKey: ['auth-status'],
     queryFn: () => apiFetch<AuthStatus>('/auth/status'),
     refetchInterval: 60000, // Reduced frequency to 60 seconds to prevent form interference
+    refetchOnWindowFocus: false, // Prevent refetch when switching browser tabs
+    refetchOnMount: false, // Prevent refetch on component remount
     retry: 1,
     staleTime: 30000, // Consider data fresh for 30 seconds
   });

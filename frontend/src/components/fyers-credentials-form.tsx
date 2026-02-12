@@ -41,7 +41,7 @@ export function FyersCredentialsForm({
   const [formData, setFormData] = useState<FormData>({
     appId: initialData?.appId || '',
     secretKey: '',
-    redirectUri: initialData?.redirectUri || 'http://localhost:8000/api/v1/auth/callback',
+    redirectUri: initialData?.redirectUri || 'https://trade.fyers.in/api-login/redirect-uri/index.html',
   });
 
   const [showSecretKey, setShowSecretKey] = useState(false);

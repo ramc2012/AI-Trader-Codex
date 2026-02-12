@@ -1,6 +1,6 @@
 """Indian market trading hours and calendar utilities."""
 
-from datetime import time
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -23,3 +23,26 @@ DATA_FEED_END = time(15, 35)
 
 # Days the market is open (Monday=0, Sunday=6)
 TRADING_DAYS = {0, 1, 2, 3, 4}  # Mon-Fri
+
+
+def is_market_open(dt: datetime = None) -> bool:
+    """Check if market is currently open.
+
+    Args:
+        dt: Datetime to check (defaults to now in IST)
+
+    Returns:
+        True if market is open, False otherwise
+    """
+    if dt is None:
+        dt = datetime.now(IST)
+    elif dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST)
+
+    # Check if it's a trading day (Mon-Fri)
+    if dt.weekday() not in TRADING_DAYS:
+        return False
+
+    # Check if time is within market hours
+    current_time = dt.time()
+    return MARKET_OPEN <= current_time <= MARKET_CLOSE

@@ -119,7 +119,7 @@ class TestRiskSummary:
         assert data["winning_trades"] == 0
         assert data["losing_trades"] == 0
         assert data["open_positions"] == 0
-        assert data["max_open_positions"] == 5
+        assert data["max_open_positions"] == 6
         assert data["circuit_breaker_triggered"] is False
         assert data["emergency_stop"] is False
         assert data["position_values"] == {}

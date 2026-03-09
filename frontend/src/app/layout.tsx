@@ -2,8 +2,9 @@ import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
 import './globals.css';
 import { Providers } from '@/lib/providers';
-import { Sidebar } from '@/components/layout/sidebar';
-import { Header } from '@/components/layout/header';
+import { TopNav } from '@/components/layout/top-nav';
+import { TickerStrip } from '@/components/layout/ticker-strip';
+import { APP_DISPLAY_NAME } from '@/lib/app-brand';
 
 const inter = Inter({
   variable: '--font-inter',
@@ -11,8 +12,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: 'Nifty AI Trader',
-  description: 'AI-driven automated Nifty options trading dashboard',
+  title: APP_DISPLAY_NAME,
+  description: `${APP_DISPLAY_NAME} trading dashboard`,
 };
 
 export default function RootLayout({
@@ -24,9 +25,12 @@ export default function RootLayout({
     <html lang="en" className="dark">
       <body className={`${inter.variable} bg-slate-950 text-slate-100 antialiased`}>
         <Providers>
-          <Sidebar />
-          <Header />
-          <main className="ml-60 mt-16 min-h-[calc(100vh-4rem)] p-6">
+          {/* Top navigation bar (h-11 = 44px) */}
+          <TopNav />
+          {/* Mini watchlist ticker strip (h-7 = 28px, positioned at top-11) */}
+          <TickerStrip />
+          {/* Main content: offset by nav (44px) + ticker (28px) = 72px */}
+          <main className="mt-[72px] min-h-[calc(100vh-72px)] p-4">
             <div className="animate-fade-in">
               {children}
             </div>

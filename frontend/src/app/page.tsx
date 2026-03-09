@@ -133,7 +133,7 @@ export default function DashboardPage() {
         value: s.value,
       }));
 
-  const totalPnl = portfolio?.total_pnl ?? 0;
+  const totalPnl = portfolio?.total_pnl_inr ?? portfolio?.total_pnl ?? 0;
   const pnlColor = totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400';
   const PnlIcon = totalPnl >= 0 ? TrendingUp : TrendingDown;
 
@@ -184,7 +184,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
         <StatCard
           title="Portfolio Value"
-          value={formatINR(portfolio?.total_market_value ?? 0)}
+          value={formatINR(portfolio?.total_market_value_inr ?? portfolio?.total_market_value ?? 0)}
           subtitle={`${portfolio?.position_count ?? 0} positions`}
           icon={Briefcase}
           isLoading={portfolioLoading}
@@ -195,7 +195,7 @@ export default function DashboardPage() {
           value={formatINR(totalPnl)}
           subtitle={
             portfolio
-              ? `Realized: ${formatINR(portfolio.total_realized_pnl)} | Unrealized: ${formatINR(portfolio.total_unrealized_pnl)}`
+              ? `Realized: ${formatINR(portfolio.total_realized_pnl_inr ?? portfolio.total_realized_pnl)} | Unrealized: ${formatINR(portfolio.total_unrealized_pnl_inr ?? portfolio.total_unrealized_pnl)}`
               : undefined
           }
           icon={PnlIcon}

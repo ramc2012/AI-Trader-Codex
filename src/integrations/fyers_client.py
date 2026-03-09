@@ -14,10 +14,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import requests
+from dateutil import parser
 from fyers_apiv3.fyersModel import FyersModel, SessionModel
 from tenacity import (
     retry,
@@ -37,8 +39,16 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Default token file location (relative to project root)
-_DEFAULT_TOKEN_PATH = Path(".fyers_token.json")
+# Default token file location — uses DATA_DIR so it persists across Docker restarts.
+# Falls back to project root when running locally without DATA_DIR set.
+def _default_token_path() -> Path:
+    from src.config.settings import get_settings
+    return get_settings().token_file_path
+_ACCESS_TOKEN_LIFETIME = timedelta(hours=24)
+_REFRESH_TOKEN_LIFETIME = timedelta(days=15)
+_ACCESS_TOKEN_REFRESH_BUFFER = timedelta(minutes=10)
+_REFRESH_TOKEN_EXPIRY_BUFFER = timedelta(minutes=15)
+_AUTO_REFRESH_COOLDOWN = timedelta(seconds=30)
 
 
 class FyersClient:
@@ -66,12 +76,16 @@ class FyersClient:
         self._app_id = app_id or settings.fyers_app_id
         self._secret_key = secret_key or settings.fyers_secret_key
         self._redirect_uri = redirect_uri or settings.fyers_redirect_uri
-        self._token_path = token_path or _DEFAULT_TOKEN_PATH
+        self._token_path = token_path or _default_token_path()
         self._rate_limit = rate_limit or settings.fyers_rate_limit_per_sec
         self._log_path = log_path
 
         self._access_token: str | None = None
         self._fyers: FyersModel | None = None
+        self._refresh_token: str | None = None
+        self._access_token_expires_at: str | None = None
+        self._refresh_token_expires_at: str | None = None
+        self._last_auto_refresh_attempt: datetime | None = None
 
         # Rate limiting state
         self._last_request_time: float = 0.0
@@ -137,9 +151,18 @@ class FyersClient:
                 f"Token generation failed: {response.get('message', response)}"
             )
 
+        now = datetime.now()
         self._access_token = response["access_token"]
+        self._access_token_expires_at = (now + _ACCESS_TOKEN_LIFETIME).isoformat()
+
+        # Store refresh token if provided by Fyers (BEFORE saving)
+        if "refresh_token" in response:
+            self._refresh_token = response["refresh_token"]
+            self._refresh_token_expires_at = (now + _REFRESH_TOKEN_LIFETIME).isoformat()
+            logger.info("refresh_token_captured")
+
         self._init_fyers_model()
-        self._save_token()
+        self._save_token()  # Save token AFTER capturing refresh token
 
         logger.info("authentication_successful")
         return response
@@ -165,20 +188,41 @@ class FyersClient:
         except Exception:
             return False
 
+    @property
+    def access_token(self) -> str | None:
+        """Current access token (read-only)."""
+        return self._access_token
+
     # =========================================================================
     # Token Persistence
     # =========================================================================
 
     def _save_token(self) -> None:
-        """Save the current access token to disk."""
+        """Save the current access token and refresh token to disk."""
         if not self._access_token:
             return
+
+        now = datetime.now()
         data = {
             "access_token": self._access_token,
-            "saved_at": datetime.now().isoformat(),
+            "saved_at": now.isoformat(),
         }
+
+        # Add refresh token if available
+        if self._refresh_token:
+            data["refresh_token"] = self._refresh_token
+
+        if self._access_token_expires_at:
+            data["access_token_expires_at"] = self._access_token_expires_at
+        else:
+            data["access_token_expires_at"] = (now + _ACCESS_TOKEN_LIFETIME).isoformat()
+            self._access_token_expires_at = data["access_token_expires_at"]
+
+        if self._refresh_token and self._refresh_token_expires_at:
+            data["refresh_token_expires_at"] = self._refresh_token_expires_at
+
         self._token_path.write_text(json.dumps(data, indent=2))
-        logger.debug("token_saved", path=str(self._token_path))
+        logger.debug("token_saved", path=str(self._token_path), has_refresh=bool(self._refresh_token))
 
     def _load_token(self) -> None:
         """Load a previously saved token from disk."""
@@ -189,8 +233,25 @@ class FyersClient:
             token = data.get("access_token")
             if token:
                 self._access_token = token
+                self._refresh_token = data.get("refresh_token")
+                self._access_token_expires_at = data.get("access_token_expires_at")
+                self._refresh_token_expires_at = data.get("refresh_token_expires_at")
+
+                saved_at_str = data.get("saved_at")
+                if saved_at_str:
+                    try:
+                        saved_at = parser.isoparse(saved_at_str)
+                        if not self._access_token_expires_at:
+                            self._access_token_expires_at = (saved_at + _ACCESS_TOKEN_LIFETIME).isoformat()
+                        if self._refresh_token and not self._refresh_token_expires_at:
+                            self._refresh_token_expires_at = (saved_at + _REFRESH_TOKEN_LIFETIME).isoformat()
+                    except Exception:
+                        logger.debug("token_saved_at_parse_failed", path=str(self._token_path))
+
                 self._init_fyers_model()
-                logger.info("token_loaded_from_disk", path=str(self._token_path))
+                logger.info("token_loaded_from_disk",
+                           path=str(self._token_path),
+                           has_refresh=bool(self._refresh_token))
         except (json.JSONDecodeError, KeyError) as exc:
             logger.warning("token_load_failed", error=str(exc))
 
@@ -475,6 +536,257 @@ class FyersClient:
             Cancellation response.
         """
         return self._call("cancel_order", {"id": order_id})
+
+    # =========================================================================
+    # Token Refresh Support
+    # =========================================================================
+
+    def _is_access_token_expired(self) -> bool:
+        """Check if access token is expired or will expire soon.
+
+        Returns:
+            True if token is expired or will expire within refresh buffer
+        """
+        if not self._access_token:
+            return True
+
+        if not self._access_token_expires_at:
+            # Missing metadata on older installs: treat as valid and rely on auth check.
+            # This avoids aggressive refresh attempts during credential entry.
+            logger.debug("access_token_expiry_missing_assuming_valid")
+            return False
+
+        try:
+            expiry = parser.isoparse(self._access_token_expires_at)
+            return datetime.now() >= expiry - _ACCESS_TOKEN_REFRESH_BUFFER
+        except Exception:
+            return True
+
+    def _is_refresh_token_valid(self) -> bool:
+        """Check if refresh token is still valid.
+
+        Returns:
+            True if refresh token exists and hasn't expired
+        """
+        if not self._refresh_token:
+            return False
+
+        if not self._refresh_token_expires_at:
+            # Legacy token files may not contain refresh-token expiry.
+            # Allow refresh attempt; server-side validation remains authoritative.
+            return True
+
+        try:
+            expiry = parser.isoparse(self._refresh_token_expires_at)
+            return datetime.now() < expiry - _REFRESH_TOKEN_EXPIRY_BUFFER
+        except Exception:
+            return True
+
+    def _generate_app_id_hash(self) -> str:
+        """Generate SHA-256 hash of app_id + secret_key for refresh token API.
+
+        Returns:
+            Hexadecimal SHA-256 hash
+        """
+        from src.utils.crypto import generate_app_id_hash
+        return generate_app_id_hash(self._app_id, self._secret_key)
+
+    def refresh_access_token(self, pin: str) -> dict[str, Any]:
+        """Use refresh token to get a new access token.
+
+        This calls the Fyers refresh token API to exchange a refresh token
+        for a new access token, avoiding the need for full OAuth flow.
+
+        Args:
+            pin: User's FYERS PIN
+
+        Returns:
+            Token response dict from Fyers with new access_token
+
+        Raises:
+            AuthenticationError: If refresh token is missing, invalid, or refresh fails
+        """
+        if not hasattr(self, '_refresh_token') or not self._refresh_token:
+            raise AuthenticationError(
+                "No refresh token available. Please authenticate via OAuth."
+            )
+
+        if not self._is_refresh_token_valid():
+            raise AuthenticationError(
+                "Refresh token has expired. Please re-authenticate via OAuth."
+            )
+
+        try:
+            # Prepare request
+            url = "https://api-t1.fyers.in/api/v3/validate-refresh-token"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "grant_type": "refresh_token",
+                "appIdHash": self._generate_app_id_hash(),
+                "refresh_token": self._refresh_token,
+                "pin": str(pin),
+            }
+
+            logger.info("refresh_token_request", url=url)
+
+            # Make request
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            # Check response
+            if data.get("s") != "ok" or "access_token" not in data:
+                raise AuthenticationError(
+                    f"Token refresh failed: {data.get('message', data)}"
+                )
+
+            # Update tokens
+            now = datetime.now()
+            self._access_token = data["access_token"]
+            self._access_token_expires_at = (now + _ACCESS_TOKEN_LIFETIME).isoformat()
+
+            # Some APIs return a new refresh token, others reuse the same one
+            if "refresh_token" in data:
+                self._refresh_token = data["refresh_token"]
+                self._refresh_token_expires_at = (now + _REFRESH_TOKEN_LIFETIME).isoformat()
+
+            # Reinitialize Fyers model with new token
+            self._init_fyers_model()
+
+            # Save updated tokens
+            self._save_token()
+
+            logger.info("token_refresh_successful")
+            return data
+
+        except AuthenticationError:
+            raise
+        except requests.exceptions.RequestException as exc:
+            logger.error("token_refresh_network_error", error=str(exc))
+            raise AuthenticationError(f"Network error during token refresh: {str(exc)}")
+        except Exception as exc:
+            logger.error("token_refresh_failed", error=str(exc))
+            raise AuthenticationError(f"Token refresh failed: {str(exc)}")
+
+    def try_auto_refresh_with_saved_pin(self, force: bool = False) -> bool:
+        """Best-effort refresh using stored PIN when access token is expiring/expired.
+
+        Args:
+            force: If True, bypasses expiry check but still honors cooldown.
+
+        Returns:
+            True when a refresh happened successfully; otherwise False.
+        """
+        now = datetime.now()
+
+        if (
+            self._last_auto_refresh_attempt is not None
+            and now - self._last_auto_refresh_attempt < _AUTO_REFRESH_COOLDOWN
+        ):
+            return False
+
+        if not force and not self._is_access_token_expired():
+            return False
+
+        if not self._is_refresh_token_valid():
+            return False
+
+        try:
+            from src.utils.pin_storage import has_saved_pin, load_pin
+        except Exception as exc:
+            logger.warning("pin_storage_unavailable", error=str(exc))
+            return False
+
+        if not has_saved_pin():
+            return False
+
+        pin = load_pin()
+        if not pin:
+            logger.warning("saved_pin_missing_or_unreadable")
+            return False
+
+        self._last_auto_refresh_attempt = now
+        try:
+            self.refresh_access_token(pin)
+            logger.info("token_auto_refreshed_with_saved_pin")
+            return True
+        except AuthenticationError as exc:
+            logger.warning("token_auto_refresh_failed", error=str(exc))
+            return False
+
+    def auto_refresh_if_needed(self, pin: str | None = None) -> bool:
+        """Automatically refresh token if expired or expiring soon.
+
+        Args:
+            pin: Optional PIN for refresh. Required if token needs refresh.
+
+        Returns:
+            True if token was refreshed, False if still valid
+
+        Raises:
+            AuthenticationError: If refresh is needed but PIN not provided or refresh fails
+        """
+        if not self._is_access_token_expired():
+            logger.debug("token_still_valid_no_refresh_needed")
+            return False
+
+        if not self._is_refresh_token_valid():
+            raise AuthenticationError(
+                "Both access and refresh tokens expired. Full re-authentication required."
+            )
+
+        if not pin:
+            raise AuthenticationError(
+                "Access token expired. PIN required for automatic refresh."
+            )
+
+        logger.info("auto_refreshing_expired_token")
+        self.refresh_access_token(pin)
+        return True
+
+    def get_token_status(self) -> dict[str, Any]:
+        """Get detailed status of current tokens.
+
+        Returns:
+            Dict with token status information:
+            {
+                "access_token_valid": bool,
+                "access_token_expires_in_hours": float or None,
+                "refresh_token_valid": bool,
+                "refresh_token_expires_in_days": float or None,
+                "needs_full_reauth": bool
+            }
+        """
+        status = {
+            "access_token_valid": bool(self._access_token and not self._is_access_token_expired()),
+            "access_token_expires_in_hours": None,
+            "refresh_token_valid": self._is_refresh_token_valid(),
+            "refresh_token_expires_in_days": None,
+            "needs_full_reauth": False,
+        }
+
+        # Calculate time until access token expiry
+        if hasattr(self, '_access_token_expires_at') and self._access_token_expires_at:
+            try:
+                expiry = parser.isoparse(self._access_token_expires_at)
+                delta = expiry - datetime.now()
+                status["access_token_expires_in_hours"] = delta.total_seconds() / 3600
+            except Exception:
+                pass
+
+        # Calculate time until refresh token expiry
+        if hasattr(self, '_refresh_token_expires_at') and self._refresh_token_expires_at:
+            try:
+                expiry = parser.isoparse(self._refresh_token_expires_at)
+                delta = expiry - datetime.now()
+                status["refresh_token_expires_in_days"] = delta.total_seconds() / 86400
+            except Exception:
+                pass
+
+        # Determine if full re-auth is needed
+        status["needs_full_reauth"] = not status["refresh_token_valid"]
+
+        return status
 
     # =========================================================================
     # Cleanup

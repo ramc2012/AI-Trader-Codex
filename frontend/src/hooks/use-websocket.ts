@@ -2,7 +2,37 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 
-const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/api/v1';
+function defaultWsBase(): string {
+  if (typeof window === 'undefined') {
+    return 'ws://localhost:8000/api/v1';
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const host = window.location.hostname;
+  const frontendPort = window.location.port || '';
+  const explicitMap: Record<string, string> = {
+    '3000': '8000',
+    '3100': '8080',
+    '3200': '8200',
+    '3201': '8201',
+  };
+  const mapped = explicitMap[frontendPort];
+  const backendPort = mapped || (frontendPort ? String(Number(frontendPort) + 5000) : '8201');
+  return `${protocol}://${host}:${backendPort}/api/v1`;
+}
+
+function resolveWsUrl(path: string): string {
+  const wsBase = process.env.NEXT_PUBLIC_WS_URL || defaultWsBase();
+  if (wsBase.startsWith('ws://') || wsBase.startsWith('wss://')) {
+    return `${wsBase}${path}`;
+  }
+
+  if (wsBase.startsWith('/')) {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}${wsBase}${path}`;
+  }
+
+  return `${wsBase}${path}`;
+}
 
 interface UseWebSocketOptions {
   path: string;
@@ -26,6 +56,7 @@ export function useWebSocket({
 }: UseWebSocketOptions): UseWebSocketReturn {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectRef = useRef<() => void>(() => {});
   const [isConnected, setIsConnected] = useState(false);
   const [lastMessage, setLastMessage] = useState<unknown>(null);
 
@@ -33,7 +64,7 @@ export function useWebSocket({
     if (!enabled) return;
 
     try {
-      const ws = new WebSocket(`${WS_BASE}${path}`);
+      const ws = new WebSocket(resolveWsUrl(path));
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -56,7 +87,7 @@ export function useWebSocket({
         wsRef.current = null;
 
         if (enabled) {
-          reconnectTimerRef.current = setTimeout(connect, reconnectInterval);
+          reconnectTimerRef.current = setTimeout(() => connectRef.current(), reconnectInterval);
         }
       };
 
@@ -65,7 +96,7 @@ export function useWebSocket({
       };
     } catch {
       if (enabled) {
-        reconnectTimerRef.current = setTimeout(connect, reconnectInterval);
+        reconnectTimerRef.current = setTimeout(() => connectRef.current(), reconnectInterval);
       }
     }
   }, [path, onMessage, reconnectInterval, enabled]);
@@ -79,6 +110,10 @@ export function useWebSocket({
   const reconnect = useCallback(() => {
     wsRef.current?.close();
     connect();
+  }, [connect]);
+
+  useEffect(() => {
+    connectRef.current = connect;
   }, [connect]);
 
   useEffect(() => {

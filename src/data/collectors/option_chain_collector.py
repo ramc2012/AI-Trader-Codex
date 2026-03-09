@@ -30,8 +30,11 @@ class OptionStrike:
     expiry: date
     strike: float
     option_type: str  # "CE" or "PE"
+    symbol: str | None = None
     ltp: float | None = None
     oi: int = 0
+    prev_oi: int = 0
+    oich: int = 0
     volume: int = 0
     iv: float | None = None
     delta: float | None = None
@@ -46,8 +49,11 @@ class OptionStrike:
             "expiry": self.expiry,
             "strike": self.strike,
             "option_type": self.option_type,
+            "symbol": self.symbol,
             "ltp": self.ltp,
             "oi": self.oi,
+            "prev_oi": self.prev_oi,
+            "oich": self.oich,
             "volume": self.volume,
             "iv": self.iv,
             "delta": self.delta,
@@ -208,32 +214,52 @@ class OptionChainCollector:
     def _parse_response(
         self, symbol: str, timestamp: datetime, response: dict[str, Any]
     ) -> list[OptionStrike]:
-        """Parse Fyers option chain response into OptionStrike objects."""
+        """Parse Fyers option chain response into OptionStrike objects.
+
+        Fyers returns a flat `optionsChain` array with one row per CE/PE
+        contract plus one underlying row (`strike_price=-1`).
+        """
         strikes: list[OptionStrike] = []
         data = response.get("data", response)
         options_chain = data.get("optionsChain", [])
 
         for item in options_chain:
+            option_type = str(item.get("option_type", "")).upper().strip()
+
             expiry_raw = item.get("expiry")
             if isinstance(expiry_raw, (int, float)):
                 expiry_date = datetime.fromtimestamp(expiry_raw, tz=IST).date()
             elif isinstance(expiry_raw, str):
-                expiry_date = datetime.strptime(expiry_raw, "%Y-%m-%d").date()
+                # Accept both YYYY-MM-DD and DD-MM-YYYY payload variants.
+                parsed = None
+                for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+                    try:
+                        parsed = datetime.strptime(expiry_raw, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+                expiry_date = parsed or date.today()
             else:
                 expiry_date = date.today()
 
-            strike_price = float(item.get("strike_price", item.get("strikePrice", 0)))
+            strike_price = float(item.get("strike_price", item.get("strikePrice", item.get("strike", 0))))
+            if strike_price < 0:
+                continue
 
-            # Parse CE side
-            ce = item.get("ce", item.get("CE", {}))
-            if ce:
+            if option_type in {"CE", "PE"}:
+                strikes.append(self._parse_strike(
+                    timestamp, symbol, expiry_date, strike_price, option_type, item
+                ))
+                continue
+
+            # Backward compatibility: nested CE/PE payloads.
+            ce = item.get("ce", item.get("CE"))
+            pe = item.get("pe", item.get("PE"))
+            if isinstance(ce, dict):
                 strikes.append(self._parse_strike(
                     timestamp, symbol, expiry_date, strike_price, "CE", ce
                 ))
-
-            # Parse PE side
-            pe = item.get("pe", item.get("PE", {}))
-            if pe:
+            if isinstance(pe, dict):
                 strikes.append(self._parse_strike(
                     timestamp, symbol, expiry_date, strike_price, "PE", pe
                 ))
@@ -250,15 +276,23 @@ class OptionChainCollector:
         data: dict[str, Any],
     ) -> OptionStrike:
         """Parse a single CE or PE side from the chain response."""
+        oi = int(data.get("oi", data.get("open_interest", 0)) or 0)
+        oich = int(data.get("oich", data.get("oi_change", data.get("oichg", 0))) or 0)
+        prev_oi = int(data.get("prev_oi", data.get("prevOi", 0)) or 0)
+        if prev_oi <= 0 and oi > 0 and oich:
+            prev_oi = max(oi - oich, 0)
         return OptionStrike(
             timestamp=timestamp,
             underlying=underlying,
             expiry=expiry,
             strike=strike,
             option_type=option_type,
+            symbol=data.get("symbol"),
             ltp=data.get("ltp"),
-            oi=int(data.get("oi", data.get("open_interest", 0))),
-            volume=int(data.get("volume", data.get("vol_traded_today", 0))),
+            oi=oi,
+            prev_oi=prev_oi,
+            oich=oich,
+            volume=int(data.get("volume", data.get("vol_traded_today", 0)) or 0),
             iv=data.get("iv", data.get("implied_vol")),
             delta=data.get("delta"),
             gamma=data.get("gamma"),

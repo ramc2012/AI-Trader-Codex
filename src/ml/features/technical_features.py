@@ -12,9 +12,25 @@ from typing import List
 import numpy as np
 import pandas as pd
 
-from src.analysis.indicators.momentum import MACD, RSI
+from src.analysis.indicators.momentum import (
+    CCI,
+    MACD,
+    ROC,
+    RSI,
+    StochasticOscillator,
+    UltimateOscillator,
+    WilliamsR,
+)
 from src.analysis.indicators.moving_averages import EMA, SMA
-from src.analysis.indicators.volatility import ATR, BollingerBands
+from src.analysis.indicators.trend import ADX
+from src.analysis.indicators.volatility import (
+    ATR,
+    BollingerBands,
+    DonchianChannels,
+    KeltnerChannels,
+    RollingStdDev,
+)
+from src.analysis.indicators.volume import ChaikinMoneyFlow
 from src.ml.features.base import FeatureExtractor
 from src.utils.logger import get_logger
 
@@ -78,6 +94,17 @@ class TechnicalFeatureExtractor(FeatureExtractor):
         names.append("macd_histogram")
         names.append("bb_position")
         names.append("atr_norm")
+        names.append("adx")
+        names.append("stoch_k")
+        names.append("stoch_d")
+        names.append("cci")
+        names.append("williams_r")
+        names.append("roc_12")
+        names.append("ultimate_oscillator")
+        names.append("keltner_position")
+        names.append("donchian_width")
+        names.append("stddev_20")
+        names.append("cmf")
 
         return names
 
@@ -125,6 +152,29 @@ class TechnicalFeatureExtractor(FeatureExtractor):
         # --- Normalised ATR ---
         atr_val = ATR().calculate(close, high=high, low=low)
         features["atr_norm"] = atr_val / close
+
+        # --- Trend strength ---
+        adx_df = ADX().calculate(data)
+        features["adx"] = adx_df["adx"]
+
+        # --- Additional momentum indicators ---
+        stoch_df = StochasticOscillator().calculate(data)
+        features["stoch_k"] = stoch_df["k"]
+        features["stoch_d"] = stoch_df["d"]
+        features["cci"] = CCI().calculate(data)
+        features["williams_r"] = WilliamsR().calculate(data)
+        features["roc_12"] = ROC(period=12).calculate(close)
+        features["ultimate_oscillator"] = UltimateOscillator().calculate(data)
+
+        # --- Channel and volatility enrichments ---
+        keltner_df = KeltnerChannels().calculate(data)
+        keltner_range = (keltner_df["upper"] - keltner_df["lower"]).replace(0, np.nan)
+        features["keltner_position"] = (close - keltner_df["lower"]) / keltner_range
+        features["donchian_width"] = DonchianChannels().calculate(data)["width"]
+        features["stddev_20"] = RollingStdDev(period=20).calculate(close)
+
+        # --- Volume pressure ---
+        features["cmf"] = ChaikinMoneyFlow(period=20).calculate(data)
 
         result = pd.DataFrame(features, index=data.index)
         return result

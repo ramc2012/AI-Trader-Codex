@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+from src.config.agent_universe import DEFAULT_AGENT_CRYPTO_SYMBOLS, DEFAULT_AGENT_US_SYMBOLS
+from src.config.constants import DEFAULT_AGENT_NSE_SYMBOLS
 
 
 # =========================================================================
@@ -40,10 +42,42 @@ class OrderResponse(BaseModel):
     value: float = 0.0
 
 
+class PlaceOrderRequest(BaseModel):
+    """Request payload for creating an order."""
+
+    symbol: str
+    quantity: int = Field(..., ge=1)
+    side: str = Field(..., description="BUY or SELL")
+    order_type: str = Field(default="MARKET", description="MARKET, LIMIT, STOP, STOP_LIMIT")
+    product_type: str = Field(default="INTRADAY", description="INTRADAY, CNC, MARGIN")
+    limit_price: Optional[float] = None
+    stop_price: Optional[float] = None
+    market_price_hint: Optional[float] = Field(
+        default=None,
+        description="Price hint for market orders in paper mode.",
+    )
+    tag: str = ""
+    stop_loss: Optional[float] = Field(
+        default=None,
+        description="Optional stop-loss used for pre-trade risk validation.",
+    )
+    validate_risk: bool = True
+
+
+class ModifyOrderRequest(BaseModel):
+    """Request payload for modifying an existing order."""
+
+    quantity: Optional[int] = Field(default=None, ge=1)
+    limit_price: Optional[float] = None
+    stop_price: Optional[float] = None
+
+
 class PositionResponse(BaseModel):
     """Serialized representation of a Position."""
 
     symbol: str
+    market: str = "NSE"
+    market_open: bool = False
     quantity: int
     side: str  # PositionSide.value
     avg_price: float
@@ -55,6 +89,18 @@ class PositionResponse(BaseModel):
     unrealized_pnl_pct: float = 0.0
     market_value: float = 0.0
     is_profitable: bool = False
+    currency: str = "INR"
+    currency_symbol: str = "₹"
+    fx_to_inr: float = 1.0
+    unrealized_pnl_inr: float = 0.0
+    market_value_inr: float = 0.0
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
+    time_exit_at: Optional[datetime] = None
+    time_left_seconds: Optional[int] = None
+    distance_to_stop_pct: Optional[float] = None
+    distance_to_target_pct: Optional[float] = None
+    progress_to_target_pct: Optional[float] = None
 
 
 class PortfolioSummaryResponse(BaseModel):
@@ -65,6 +111,14 @@ class PortfolioSummaryResponse(BaseModel):
     total_unrealized_pnl: float = 0.0
     total_realized_pnl: float = 0.0
     total_pnl: float = 0.0
+    total_market_value_inr: float = 0.0
+    total_unrealized_pnl_inr: float = 0.0
+    total_realized_pnl_inr: float = 0.0
+    total_pnl_inr: float = 0.0
+    base_currency: str = "INR"
+    usd_inr_rate: float = 83.0
+    currency_breakdown: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    market_breakdown: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     positions: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
 
@@ -79,6 +133,66 @@ class ClosedTradeResponse(BaseModel):
     pnl: float
     closed_at: Optional[datetime] = None
     strategy_tag: str = ""
+
+
+class TradePairResponse(BaseModel):
+    """A matched trade pair (entry + exit) built from fill history."""
+
+    pair_id: str
+    symbol: str
+    side: str
+    quantity: int
+    entry_price: float
+    exit_price: Optional[float] = None
+    pnl: float
+    pnl_pct: float = 0.0
+    currency: str = "INR"
+    currency_symbol: str = "₹"
+    fx_to_inr: float = 1.0
+    pnl_inr: float = 0.0
+    entry_time: Optional[datetime] = None
+    exit_time: Optional[datetime] = None
+    entry_order_id: Optional[str] = None
+    exit_order_id: Optional[str] = None
+    strategy_tag: str = ""
+
+
+class InstrumentPerformanceRowResponse(BaseModel):
+    """Performance summary for one instrument over a selected period."""
+
+    symbol: str
+    currency: str = "INR"
+    currency_symbol: str = "₹"
+    fx_to_inr: float = 1.0
+    trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    buy_notional: float = 0.0
+    sell_notional: float = 0.0
+    realized_pnl: float = 0.0
+    realized_pnl_inr: float = 0.0
+    unrealized_pnl: float = 0.0
+    unrealized_pnl_inr: float = 0.0
+    net_pnl_inr: float = 0.0
+    avg_hold_minutes: float = 0.0
+    last_trade_time: Optional[datetime] = None
+    open_quantity: int = 0
+    open_market_value: float = 0.0
+    open_market_value_inr: float = 0.0
+
+
+class PortfolioInstrumentSummaryResponse(BaseModel):
+    """Portfolio summary grouped by instrument for a selected period."""
+
+    period: str
+    from_time: datetime
+    to_time: datetime
+    total_instruments: int = 0
+    total_trades: int = 0
+    total_realized_pnl_inr: float = 0.0
+    total_unrealized_pnl_inr: float = 0.0
+    total_net_pnl_inr: float = 0.0
+    rows: List[InstrumentPerformanceRowResponse] = Field(default_factory=list)
 
 
 # =========================================================================
@@ -264,6 +378,7 @@ class BacktestResultResponse(BaseModel):
     profit_factor: float = 0.0
     avg_win: float = 0.0
     avg_loss: float = 0.0
+    data_source: str = "database"
     trades: List[BacktestTradeResponse] = Field(default_factory=list)
 
 
@@ -273,6 +388,9 @@ class BacktestRunRequest(BaseModel):
     strategy: str = Field(..., description="Strategy name (e.g. 'ema_crossover')")
     symbol: str = Field(
         default="NSE:NIFTY50-INDEX", description="Symbol to backtest"
+    )
+    timeframe: str = Field(
+        default="15", description="Candle timeframe (1, 3, 5, 15, 30, 60, D, W, M)"
     )
     start_date: Optional[datetime] = Field(
         default=None, description="Backtest start date (ISO 8601)"
@@ -324,6 +442,41 @@ class FyersCredentialsResponse(BaseModel):
     configured: bool = True
 
 
+class MarketDataProvidersRequest(BaseModel):
+    """Request model for market-data provider API keys."""
+
+    finnhub_api_key: str = ""
+    alphavantage_api_key: str = ""
+
+
+class MarketDataProvidersResponse(BaseModel):
+    """Response model exposing provider-key availability state."""
+
+    finnhub_configured: bool = False
+    alphavantage_configured: bool = False
+
+
+class TelegramConfigRequest(BaseModel):
+    """Request model for Telegram integration credentials."""
+
+    enabled: Optional[bool] = None
+    bot_token: Optional[str] = None
+    chat_id: Optional[str] = None
+    status_interval_minutes: Optional[int] = Field(default=None, ge=0, le=1440)
+
+
+class TelegramConfigResponse(BaseModel):
+    """Response model for Telegram integration status."""
+
+    configured: bool = False
+    enabled: bool = True
+    bot_configured: bool = False
+    chat_configured: bool = False
+    active: bool = False
+    status_interval_minutes: int = 30
+    last_error: Optional[str] = None
+
+
 class ValidateCredentialsResponse(BaseModel):
     """Response model for credential validation."""
 
@@ -344,6 +497,48 @@ class ManualAuthResponse(BaseModel):
     success: bool
     message: str
     authenticated: bool
+
+
+class TokenRefreshRequest(BaseModel):
+    """Request model for token refresh with PIN."""
+
+    pin: str = Field(..., min_length=4, max_length=6, description="FYERS PIN")
+
+
+class TokenRefreshResponse(BaseModel):
+    """Response model for token refresh."""
+
+    success: bool
+    message: str
+    access_token_expires_at: Optional[str] = None
+    refresh_token_expires_in_days: Optional[float] = None
+    needs_full_reauth: bool = False
+
+
+class SavePinRequest(BaseModel):
+    """Request model for saving encrypted PIN."""
+
+    pin: str = Field(..., min_length=4, max_length=6, description="FYERS PIN")
+    save_pin: bool = Field(default=True, description="Whether to save PIN for auto-refresh")
+
+
+class SavePinResponse(BaseModel):
+    """Response model for PIN save operation."""
+
+    success: bool
+    message: str
+    pin_saved: bool = False
+
+
+class TokenStatusResponse(BaseModel):
+    """Detailed token status information."""
+
+    access_token_valid: bool
+    access_token_expires_in_hours: Optional[float] = None
+    refresh_token_valid: bool
+    refresh_token_expires_in_days: Optional[float] = None
+    needs_full_reauth: bool
+    has_saved_pin: bool = False
 
 
 # =========================================================================
@@ -386,3 +581,143 @@ class CollectionStatusResponse(BaseModel):
     progress: float = 0.0
     candles_collected: int = 0
     error: Optional[str] = None
+
+
+# =========================================================================
+# AI Agent Schemas
+# =========================================================================
+
+
+class AgentConfigRequest(BaseModel):
+    """POST body for /agent/start — configures the trading agent."""
+
+    symbols: List[str] = Field(
+        default=list(DEFAULT_AGENT_NSE_SYMBOLS),
+        description="Primary NSE symbols to trade",
+    )
+    us_symbols: List[str] = Field(
+        default=list(DEFAULT_AGENT_US_SYMBOLS),
+        description="US symbols activated during US session",
+    )
+    crypto_symbols: List[str] = Field(
+        default=list(DEFAULT_AGENT_CRYPTO_SYMBOLS),
+        description="Crypto pairs for 24x7 execution",
+    )
+    trade_nse_when_open: bool = Field(
+        default=True,
+        description="Enable NSE universe during NSE market hours",
+    )
+    trade_us_when_open: bool = Field(
+        default=True,
+        description="Enable US universe during US market hours",
+    )
+    trade_us_options: bool = Field(
+        default=True,
+        description="Route US directional signals to US option contracts (ATM) in paper/live simulation",
+    )
+    trade_crypto_24x7: bool = Field(
+        default=True,
+        description="Enable crypto universe continuously (24x7)",
+    )
+    strategies: List[str] = Field(
+        default=[
+            "EMA_Crossover",
+            "RSI_Reversal",
+            "Supertrend_Breakout",
+            "MP_OrderFlow_Breakout",
+            "Fractal_Profile_Breakout",
+        ],
+        description="Strategy names to activate",
+    )
+    scan_interval_seconds: int = Field(default=30, ge=10, le=300)
+    paper_mode: bool = Field(default=True, description="Paper or live trading")
+    capital: float = Field(default=250000.0, ge=10000)
+    max_daily_loss_pct: float = Field(default=2.0, ge=0.1, le=10.0)
+    timeframe: str = Field(default="15", description="Candle timeframe in minutes")
+    execution_timeframes: List[str] = Field(
+        default=["3", "5", "15"],
+        description="Primary execution timeframes used for signal generation",
+    )
+    reference_timeframes: List[str] = Field(
+        default=["60", "D"],
+        description="Higher timeframes used for spot trend confirmation",
+    )
+    liberal_bootstrap_enabled: bool = Field(
+        default=True,
+        description="Temporarily loosen risk constraints for aggressive early learning",
+    )
+    bootstrap_cycles: int = Field(
+        default=300,
+        ge=1,
+        le=5000,
+        description="Number of initial scan cycles to run in liberal mode",
+    )
+    bootstrap_size_multiplier: float = Field(default=2.0, ge=1.0, le=5.0)
+    bootstrap_max_concentration_pct: float = Field(default=100.0, ge=30.0, le=100.0)
+    bootstrap_max_open_positions: int = Field(default=20, ge=1, le=100)
+    bootstrap_risk_per_trade_pct: float = Field(default=2.0, ge=0.1, le=10.0)
+    option_time_exit_minutes: int = Field(
+        default=30,
+        ge=1,
+        le=480,
+        description="Force-exit option positions after this holding time",
+    )
+    option_default_stop_loss_pct: float = Field(default=10.0, ge=1.0, le=90.0)
+    option_default_target_pct: float = Field(default=18.0, ge=1.0, le=400.0)
+    reinforcement_enabled: bool = Field(default=True)
+    reinforcement_alpha: float = Field(default=0.2, ge=0.01, le=1.0)
+    reinforcement_size_boost_pct: float = Field(default=60.0, ge=0.0, le=300.0)
+    telegram_status_interval_minutes: int = Field(
+        default=30,
+        ge=0,
+        le=1440,
+        description="Periodic Telegram status update interval (0 disables periodic updates)",
+    )
+
+
+class AgentStatusResponse(BaseModel):
+    """Agent runtime status and metrics."""
+
+    state: str
+    paper_mode: bool = True
+    uptime_seconds: float = 0.0
+    current_cycle: int = 0
+    symbols: List[str] = Field(default_factory=list)
+    us_symbols: List[str] = Field(default_factory=list)
+    crypto_symbols: List[str] = Field(default_factory=list)
+    trade_nse_when_open: bool = True
+    trade_us_when_open: bool = True
+    trade_crypto_24x7: bool = True
+    trade_us_options: bool = True
+    active_strategies: List[str] = Field(default_factory=list)
+    active_symbols: List[str] = Field(default_factory=list)
+    active_sessions: List[str] = Field(default_factory=list)
+    market_readiness: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    execution_timeframes: List[str] = Field(default_factory=list)
+    reference_timeframes: List[str] = Field(default_factory=list)
+    telegram_status_interval_minutes: int = 30
+    positions_count: int = 0
+    daily_pnl: float = 0.0
+    total_signals: int = 0
+    total_trades: int = 0
+    market_stats: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    market_pnl_inr: Dict[str, float] = Field(default_factory=dict)
+    strategy_stats: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    strategy_controls: List[Dict[str, Any]] = Field(default_factory=list)
+    last_scan_time: Optional[str] = None
+    bootstrap_mode_active: bool = False
+    emergency_stop: bool = False
+    strategy_reward_ema: Dict[str, float] = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+class AgentEventResponse(BaseModel):
+    """A single agent event."""
+
+    event_id: str
+    event_type: str
+    timestamp: str
+    title: str
+    message: str
+    severity: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)

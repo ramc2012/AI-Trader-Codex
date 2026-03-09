@@ -5,13 +5,13 @@ import Link from 'next/link';
 import { getCurrentIST } from '@/lib/formatters';
 import { useAuth } from '@/contexts/auth-context';
 import { cn } from '@/lib/utils';
+import { APP_DISPLAY_NAME } from '@/lib/app-brand';
 
 export function Header() {
-  const [time, setTime] = useState<string>('');
+  const [time, setTime] = useState<string>(() => getCurrentIST());
   const { isAuthenticated, isLoading: authLoading } = useAuth();
 
   useEffect(() => {
-    setTime(getCurrentIST());
     const interval = setInterval(() => {
       setTime(getCurrentIST());
     }, 1000);
@@ -19,44 +19,39 @@ export function Header() {
   }, []);
 
   return (
-    <header className="fixed left-60 right-0 top-0 z-30 flex h-16 items-center justify-between border-b border-slate-800 bg-slate-950/80 px-6 backdrop-blur-sm">
-      <h1 className="text-lg font-semibold text-slate-100">
-        Nifty AI Trader
-      </h1>
+    <header className="fixed left-48 right-0 top-0 z-30 flex h-10 items-center justify-between border-b border-slate-800 bg-[#020617]/90 px-4 backdrop-blur-sm">
+      <div className="flex items-center gap-3">
+        <span className="text-[10px] font-mono text-slate-600 uppercase tracking-widest">
+          {APP_DISPLAY_NAME}
+        </span>
+      </div>
 
-      <div className="flex items-center gap-4">
-        {/* Fyers connection status */}
+      <div className="flex items-center gap-3">
+        {/* Fyers status */}
         <Link
           href="/settings"
-          className="flex items-center gap-2 rounded-md px-3 py-1 transition-colors hover:bg-slate-800"
+          className="flex items-center gap-1.5 rounded px-2 py-0.5 transition-colors hover:bg-slate-800"
         >
           {authLoading ? (
-            <span className="h-2 w-2 animate-pulse rounded-full bg-slate-500" />
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-slate-500" />
           ) : (
             <span
               className={cn(
-                'h-2 w-2 rounded-full',
+                'h-1.5 w-1.5 rounded-full',
                 isAuthenticated ? 'bg-emerald-500' : 'bg-red-500'
               )}
             />
           )}
-          <span className="text-xs text-slate-400">
-            {authLoading
-              ? 'Checking...'
-              : isAuthenticated
-                ? 'Fyers Connected'
-                : 'Fyers Disconnected'}
+          <span className="text-[10px] font-mono text-slate-500">
+            {authLoading ? '...' : isAuthenticated ? 'FYERS' : 'OFFLINE'}
           </span>
         </Link>
 
-        <span className="rounded-md bg-yellow-500/20 px-3 py-1 text-xs font-semibold uppercase tracking-wider text-yellow-400">
-          Paper Mode
+        <span className="rounded bg-yellow-500/10 px-2 py-0.5 text-[10px] font-mono font-semibold uppercase tracking-wider text-yellow-500/80">
+          Paper
         </span>
 
-        <div className="flex items-center gap-2 text-sm text-slate-400">
-          <span>IST</span>
-          <span className="font-mono text-slate-200">{time}</span>
-        </div>
+        <span className="font-mono text-[11px] text-slate-400">{time}</span>
       </div>
     </header>
   );

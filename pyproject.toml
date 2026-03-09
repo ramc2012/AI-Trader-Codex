@@ -17,9 +17,9 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-asyncio_mode = "auto"
 addopts = "-v --tb=short --strict-markers"
 markers = [
+    "asyncio: marks async coroutine tests",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks integration tests",
     "requires_fyers: marks tests that need Fyers API credentials",

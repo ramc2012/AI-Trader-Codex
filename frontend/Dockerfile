@@ -16,12 +16,23 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
+# Accept build argument for API_HOST
+ARG API_HOST=localhost
+ARG NEXT_PUBLIC_API_URL=/api/v1
+ARG NEXT_PUBLIC_WS_URL=ws://localhost:8000/api/v1
+ARG NEXT_PUBLIC_APP_NAME_BASE="AI TRADER"
+ARG NEXT_PUBLIC_APP_INSTANCE_LABEL=LOCAL
+
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Set the API URL for the build (will be overridden at runtime via env)
-ENV NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
-ENV NEXT_PUBLIC_WS_URL=ws://localhost:8000/api/v1
+# API calls use same-origin /api/v1 proxy route in Next.js.
+# WebSockets must target backend directly (Next route handlers don't proxy WS upgrades).
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL
+ENV NEXT_PUBLIC_APP_NAME_BASE=$NEXT_PUBLIC_APP_NAME_BASE
+ENV NEXT_PUBLIC_APP_INSTANCE_LABEL=$NEXT_PUBLIC_APP_INSTANCE_LABEL
+ENV API_HOST=$API_HOST
 
 # Build Next.js in standalone mode
 RUN npm run build
@@ -31,8 +42,16 @@ FROM node:20-alpine AS runner
 
 WORKDIR /app
 
+# Accept build argument for API_HOST
+ARG API_HOST=localhost
+ARG NEXT_PUBLIC_APP_NAME_BASE="AI TRADER"
+ARG NEXT_PUBLIC_APP_INSTANCE_LABEL=LOCAL
+
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
+ENV API_HOST=$API_HOST
+ENV NEXT_PUBLIC_APP_NAME_BASE=$NEXT_PUBLIC_APP_NAME_BASE
+ENV NEXT_PUBLIC_APP_INSTANCE_LABEL=$NEXT_PUBLIC_APP_INSTANCE_LABEL
 
 # Create non-root user
 RUN addgroup --system --gid 1001 nodejs \

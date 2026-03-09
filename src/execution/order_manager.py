@@ -7,11 +7,16 @@ trading through the Fyers API.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.config.settings import get_settings
+from src.config.market_hours import IST
 from src.utils.exceptions import OrderError
 from src.utils.logger import get_logger
 
@@ -83,6 +88,7 @@ class Order:
     product_type: ProductType = ProductType.INTRADAY
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None
+    market_price_hint: Optional[float] = None
     tag: str = ""
 
     # Set after placement
@@ -162,11 +168,18 @@ class OrderManager:
         paper_mode: If True, simulate orders without hitting broker API.
     """
 
-    def __init__(self, paper_mode: bool = True) -> None:
+    def __init__(self, paper_mode: bool = True, state_path: Path | str | None = None) -> None:
         self.paper_mode = paper_mode
         self._orders: Dict[str, Order] = {}
         self._order_counter: int = 0
         self._fyers_client: Any = None
+        if state_path is not None:
+            self._state_path: Path | None = Path(state_path)
+        elif os.environ.get("PYTEST_CURRENT_TEST"):
+            self._state_path = None
+        else:
+            self._state_path = get_settings().data_path / "order_manager_state.json"
+        self._load_state()
         logger.info(
             "order_manager_initialized",
             paper_mode=paper_mode,
@@ -319,6 +332,7 @@ class OrderManager:
             new_limit_price=new_limit_price,
             new_stop_price=new_stop_price,
         )
+        self._persist_state()
 
         return OrderResult(
             success=True,
@@ -398,22 +412,39 @@ class OrderManager:
         """
         order_id = self._generate_order_id()
         order.order_id = order_id
-        order.placed_at = datetime.now()
+        order.placed_at = datetime.now(tz=IST)
 
         if order.order_type == OrderType.MARKET:
-            # Market orders fill immediately in paper mode
-            order.status = OrderStatus.FILLED
-            order.fill_price = order.limit_price or 0.0
-            order.fill_quantity = order.quantity
-            order.filled_at = datetime.now()
-            logger.info(
-                "paper_order_filled",
-                order_id=order_id,
-                symbol=order.symbol,
-                side=order.side.name,
-                quantity=order.quantity,
-                fill_price=order.fill_price,
+            # Market orders fill immediately in paper mode using available price hints.
+            fill_price = (
+                order.market_price_hint
+                if order.market_price_hint is not None
+                else order.limit_price
             )
+            if fill_price is None or fill_price <= 0:
+                order.status = OrderStatus.REJECTED
+                order.rejection_reason = (
+                    "Market order requires market_price_hint or limit_price in paper mode."
+                )
+                logger.warning(
+                    "paper_market_order_rejected_no_price",
+                    order_id=order_id,
+                    symbol=order.symbol,
+                    side=order.side.name,
+                )
+            else:
+                order.status = OrderStatus.FILLED
+                order.fill_price = float(fill_price)
+                order.fill_quantity = order.quantity
+                order.filled_at = datetime.now(tz=IST)
+                logger.info(
+                    "paper_order_filled",
+                    order_id=order_id,
+                    symbol=order.symbol,
+                    side=order.side.name,
+                    quantity=order.quantity,
+                    fill_price=order.fill_price,
+                )
         else:
             # Limit/stop orders stay in placed status
             order.status = OrderStatus.PLACED
@@ -429,6 +460,7 @@ class OrderManager:
             )
 
         self._orders[order_id] = order
+        self._persist_state()
 
         return OrderResult(
             success=True,
@@ -448,6 +480,7 @@ class OrderManager:
         """
         order = self._orders[order_id]
         order.status = OrderStatus.CANCELLED
+        self._persist_state()
 
         logger.info("paper_order_cancelled", order_id=order_id)
 
@@ -501,7 +534,7 @@ class OrderManager:
 
         order.fill_price = fill_price
         order.fill_quantity = min(order.fill_quantity + qty, order.quantity)
-        order.filled_at = datetime.now()
+        order.filled_at = datetime.now(tz=IST)
 
         if order.fill_quantity >= order.quantity:
             order.status = OrderStatus.FILLED
@@ -516,6 +549,7 @@ class OrderManager:
             total_filled=order.fill_quantity,
             status=order.status.value,
         )
+        self._persist_state()
 
         return OrderResult(
             success=True,
@@ -547,7 +581,7 @@ class OrderManager:
 
         order_id = self._generate_order_id()
         order.order_id = order_id
-        order.placed_at = datetime.now()
+        order.placed_at = datetime.now(tz=IST)
 
         try:
             params = order.to_fyers_params()
@@ -565,6 +599,7 @@ class OrderManager:
                     symbol=order.symbol,
                     side=order.side.name,
                 )
+                self._persist_state()
 
                 return OrderResult(
                     success=True,
@@ -583,6 +618,7 @@ class OrderManager:
                     order_id=order_id,
                     reason=msg,
                 )
+                self._persist_state()
 
                 return OrderResult(
                     success=False,
@@ -601,6 +637,7 @@ class OrderManager:
                 order_id=order_id,
                 error=str(exc),
             )
+            self._persist_state()
 
             return OrderResult(
                 success=False,
@@ -634,6 +671,7 @@ class OrderManager:
             if response.get("s") == "ok":
                 order.status = OrderStatus.CANCELLED
                 logger.info("live_order_cancelled", order_id=order_id)
+                self._persist_state()
                 return OrderResult(
                     success=True,
                     order_id=order_id,
@@ -679,3 +717,83 @@ class OrderManager:
         """
         self._order_counter += 1
         return f"PAPER-{self._order_counter:04d}"
+
+    def _persist_state(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            payload = {
+                "order_counter": int(self._order_counter),
+                "orders": [self._serialize_order(order) for order in self.get_all_orders()],
+            }
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._state_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            tmp_path.replace(self._state_path)
+        except Exception as exc:
+            logger.warning("order_manager_persist_failed", error=str(exc))
+
+    def _load_state(self) -> None:
+        if self._state_path is None or not self._state_path.exists():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+            self._order_counter = int(payload.get("order_counter", 0) or 0)
+            self._orders = {}
+            for raw in payload.get("orders", []):
+                order = self._deserialize_order(raw)
+                if order.order_id:
+                    self._orders[order.order_id] = order
+            logger.info("order_manager_state_loaded", orders=len(self._orders))
+        except Exception as exc:
+            logger.warning("order_manager_state_load_failed", error=str(exc))
+
+    @staticmethod
+    def _serialize_order(order: Order) -> dict[str, Any]:
+        return {
+            "symbol": order.symbol,
+            "quantity": int(order.quantity),
+            "side": order.side.name,
+            "order_type": order.order_type.name,
+            "product_type": order.product_type.value,
+            "limit_price": order.limit_price,
+            "stop_price": order.stop_price,
+            "market_price_hint": order.market_price_hint,
+            "tag": order.tag,
+            "order_id": order.order_id,
+            "status": order.status.value,
+            "fill_price": order.fill_price,
+            "fill_quantity": int(order.fill_quantity),
+            "placed_at": order.placed_at.isoformat() if order.placed_at else None,
+            "filled_at": order.filled_at.isoformat() if order.filled_at else None,
+            "rejection_reason": order.rejection_reason,
+        }
+
+    @staticmethod
+    def _deserialize_order(payload: dict[str, Any]) -> Order:
+        return Order(
+            symbol=str(payload.get("symbol") or ""),
+            quantity=int(payload.get("quantity") or 0),
+            side=OrderSide[str(payload.get("side") or "BUY")],
+            order_type=OrderType[str(payload.get("order_type") or "MARKET")],
+            product_type=ProductType(str(payload.get("product_type") or ProductType.INTRADAY.value)),
+            limit_price=payload.get("limit_price"),
+            stop_price=payload.get("stop_price"),
+            market_price_hint=payload.get("market_price_hint"),
+            tag=str(payload.get("tag") or ""),
+            order_id=payload.get("order_id"),
+            status=OrderStatus(str(payload.get("status") or OrderStatus.PENDING.value)),
+            fill_price=payload.get("fill_price"),
+            fill_quantity=int(payload.get("fill_quantity") or 0),
+            placed_at=(
+                datetime.fromisoformat(str(payload["placed_at"]))
+                if payload.get("placed_at")
+                else None
+            ),
+            filled_at=(
+                datetime.fromisoformat(str(payload["filled_at"]))
+                if payload.get("filled_at")
+                else None
+            ),
+            rejection_reason=payload.get("rejection_reason"),
+        )

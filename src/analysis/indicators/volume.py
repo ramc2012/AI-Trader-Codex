@@ -1,4 +1,4 @@
-"""Volume indicators: OBV, VWAP, MFI, Accumulation/Distribution."""
+"""Volume indicators: OBV, VWAP, MFI, A/D, CMF, and volume profile."""
 
 from __future__ import annotations
 
@@ -196,3 +196,65 @@ class AccumulationDistribution(Indicator):
 
     def __repr__(self) -> str:
         return "<AccumulationDistribution()>"
+
+
+class ChaikinMoneyFlow(Indicator):
+    """Chaikin Money Flow (CMF)."""
+
+    name = "ChaikinMoneyFlow"
+
+    def __init__(self, period: int = 20) -> None:
+        if period < 1:
+            raise ValueError("period must be >= 1")
+        self.period = period
+
+    def calculate(self, data: pd.DataFrame) -> pd.Series:
+        high = data["high"]
+        low = data["low"]
+        close = data["close"]
+        volume = data["volume"]
+
+        hl = (high - low).replace(0, np.nan)
+        money_flow_multiplier = ((close - low) - (high - close)) / hl
+        money_flow_volume = money_flow_multiplier.fillna(0.0) * volume
+
+        cmf = (
+            money_flow_volume.rolling(window=self.period, min_periods=self.period).sum()
+            / volume.rolling(window=self.period, min_periods=self.period).sum().replace(0, np.nan)
+        )
+        return pd.Series(cmf, index=data.index, name="cmf")
+
+
+class VolumeProfile(Indicator):
+    """Volume profile using fixed number of price bins."""
+
+    name = "VolumeProfile"
+
+    def __init__(self, bins: int = 30) -> None:
+        if bins < 2:
+            raise ValueError("bins must be >= 2")
+        self.bins = bins
+
+    def calculate(self, data: pd.DataFrame) -> pd.Series:
+        if data.empty:
+            return pd.Series(dtype=float, name="volume_profile")
+
+        low = float(data["low"].min())
+        high = float(data["high"].max())
+        if high <= low:
+            return pd.Series(dtype=float, name="volume_profile")
+
+        edges = np.linspace(low, high, self.bins + 1)
+        mids = (edges[:-1] + edges[1:]) / 2.0
+        volumes = np.zeros(self.bins, dtype=float)
+
+        for _, row in data.iterrows():
+            c_low = float(row["low"])
+            c_high = float(row["high"])
+            c_vol = float(row["volume"])
+            mask = (mids >= c_low) & (mids <= c_high)
+            count = int(mask.sum())
+            if count > 0:
+                volumes[mask] += c_vol / count
+
+        return pd.Series(volumes, index=np.round(mids, 6), name="volume_profile")

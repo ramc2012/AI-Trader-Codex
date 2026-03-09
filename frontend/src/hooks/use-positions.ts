@@ -8,6 +8,10 @@ export function usePositions() {
   return useQuery<Position[]>({
     queryKey: ['positions'],
     queryFn: () => apiFetch<Position[]>('/positions'),
-    refetchInterval: 5000,
+    refetchInterval: 2500,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: true,
+    staleTime: 1500,
   });
 }

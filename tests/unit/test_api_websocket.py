@@ -242,7 +242,7 @@ class TestTickWebSocket:
             assert "symbol" in data
             assert "timestamp" in data
             assert "message" in data
-            assert data["message"] == "Tick streaming placeholder"
+            assert data["message"] == "waiting_for_tick"
 
     def test_tick_ws_with_different_symbol(self, client: TestClient) -> None:
         """The symbol in the URL is echoed back in the heartbeat message."""

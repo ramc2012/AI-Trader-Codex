@@ -152,7 +152,7 @@ class RiskCalculator:
         excess_returns = returns - daily_rf
         std = excess_returns.std(ddof=1)
 
-        if std == 0 or np.isnan(std):
+        if std <= 1e-12 or np.isnan(std):
             return 0.0
 
         return float(

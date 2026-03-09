@@ -131,7 +131,35 @@ class TestTickCollectorParsing:
         assert tick is not None
         assert tick.symbol == "NSE:NIFTY50-INDEX"
         assert tick.ltp == 22150.5
-        assert tick.volume == 150000
+        # First tick uses volume delta; baseline tick emits 0.
+        assert tick.volume == 0
+
+    def test_parse_volume_delta_between_ticks(self) -> None:
+        tc = self._make_collector()
+        first = {
+            "symbol": "NSE:NIFTY50-INDEX",
+            "ltp": 22150.5,
+            "timestamp": 1707369000,
+            "vol_traded_today": 150000,
+        }
+        second = {
+            "symbol": "NSE:NIFTY50-INDEX",
+            "ltp": 22150.7,
+            "timestamp": 1707369001,
+            "vol_traded_today": 150040,
+        }
+        t1 = tc._parse_tick(first)
+        t2 = tc._parse_tick(second)
+        assert t1 is not None
+        assert t2 is not None
+        assert t2.volume == 40
+
+    def test_parse_rejects_outlier_jump(self) -> None:
+        tc = self._make_collector()
+        first = tc._parse_tick({"symbol": "NSE:NIFTY50-INDEX", "ltp": 22000.0, "vol_traded_today": 1})
+        outlier = tc._parse_tick({"symbol": "NSE:NIFTY50-INDEX", "ltp": 25000.0, "vol_traded_today": 2})
+        assert first is not None
+        assert outlier is None
 
     def test_parse_missing_symbol(self) -> None:
         tc = self._make_collector()

@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from src.api.dependencies import get_order_manager, get_position_manager, reset_managers
 from src.api.main import create_app
+from src.api.routes.trading import _build_trade_pairs
 from src.execution.order_manager import Order, OrderManager, OrderSide, OrderType
 from src.execution.position_manager import PositionManager, PositionSide
 
@@ -540,6 +541,77 @@ class TestOrders:
         data = client.get("/api/v1/orders").json()[0]
         # value = fill_price * quantity = 22000 * 10
         assert data["value"] == pytest.approx(220000.0)
+
+
+class TestOrderPairs:
+    """Tests for FIFO trade pair construction."""
+
+    def test_open_entry_is_retained_with_blank_exit(self) -> None:
+        """One-way filled entries remain visible in history with open exit fields."""
+        buy_order = Order(
+            symbol="NSE:NIFTY50-INDEX",
+            quantity=50,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            limit_price=22000.0,
+            tag="ema_crossover",
+            order_id="BUY-001",
+            fill_price=22000.0,
+            fill_quantity=50,
+        )
+
+        pairs = _build_trade_pairs([buy_order], usd_inr_rate=83.0)
+
+        assert len(pairs) == 1
+        pair = pairs[0]
+        assert pair.symbol == "NSE:NIFTY50-INDEX"
+        assert pair.side == "LONG"
+        assert pair.quantity == 50
+        assert pair.entry_price == pytest.approx(22000.0)
+        assert pair.exit_price is None
+        assert pair.exit_time is None
+        assert pair.exit_order_id is None
+        assert pair.pnl == pytest.approx(0.0)
+        assert pair.pnl_inr == pytest.approx(0.0)
+        assert pair.strategy_tag == "ema_crossover"
+
+    def test_closed_pair_and_open_remainder_are_both_returned(self) -> None:
+        """Partial exits produce a closed row plus an open remainder row."""
+        buy_order = Order(
+            symbol="NSE:NIFTY50-INDEX",
+            quantity=50,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            limit_price=22000.0,
+            order_id="BUY-001",
+            fill_price=22000.0,
+            fill_quantity=50,
+        )
+        sell_order = Order(
+            symbol="NSE:NIFTY50-INDEX",
+            quantity=20,
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            limit_price=22100.0,
+            order_id="SELL-001",
+            fill_price=22100.0,
+            fill_quantity=20,
+        )
+
+        pairs = _build_trade_pairs([buy_order, sell_order], usd_inr_rate=83.0)
+
+        assert len(pairs) == 2
+        closed = next(pair for pair in pairs if pair.exit_time is not None)
+        open_leg = next(pair for pair in pairs if pair.exit_time is None)
+
+        assert closed.quantity == 20
+        assert closed.exit_price == pytest.approx(22100.0)
+        assert closed.pnl == pytest.approx(2000.0)
+
+        assert open_leg.quantity == 30
+        assert open_leg.entry_price == pytest.approx(22000.0)
+        assert open_leg.exit_price is None
+        assert open_leg.pnl_inr == pytest.approx(0.0)
 
 
 # =========================================================================

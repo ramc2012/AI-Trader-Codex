@@ -256,6 +256,32 @@ docker system df
 
 ## Production Deployment
 
+### AWS (EC2 + ECR + RDS + ElastiCache)
+
+This repository now includes AWS-ready deployment assets:
+
+- `docker-compose.aws.yml` — production compose stack using prebuilt images.
+- `scripts/aws/env.aws.example` — environment template for AWS deployment.
+- `scripts/aws/deploy_ec2.sh` — pull + deploy script for EC2 hosts.
+
+#### Recommended AWS architecture
+
+- **Compute**: EC2 Auto Scaling Group or ECS/Fargate
+- **Containers**: ECR (backend + frontend images)
+- **Database**: Amazon RDS PostgreSQL/Timescale-compatible setup
+- **Cache/Broker**: ElastiCache Redis
+- **Ingress/TLS**: ALB + ACM certificate
+
+#### Quick deploy on EC2
+
+```bash
+cp scripts/aws/env.aws.example .env.aws
+# edit .env.aws with real values
+bash scripts/aws/deploy_ec2.sh
+```
+
+The script logs into ECR, pulls the latest images, and applies `docker-compose.aws.yml`.
+
 ### Security Checklist
 
 - [ ] Change all default passwords

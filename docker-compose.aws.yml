@@ -1,0 +1,72 @@
+version: "3.9"
+
+services:
+  backend:
+    image: ${BACKEND_IMAGE:?Set BACKEND_IMAGE to your ECR backend image}
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      APP_LOG_LEVEL: "INFO"
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY}
+      DB_HOST: ${DB_HOST:?Set DB_HOST}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:?Set DB_NAME}
+      DB_USER: ${DB_USER:?Set DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      REDIS_HOST: ${REDIS_HOST:?Set REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_STATUS_INTERVAL_MINUTES: ${TELEGRAM_STATUS_INTERVAL_MINUTES:-30}
+      USD_INR_REFERENCE_RATE: ${USD_INR_REFERENCE_RATE:-83.0}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      AGENT_AUTO_START: ${AGENT_AUTO_START:-false}
+      AGENT_SCAN_INTERVAL: ${AGENT_SCAN_INTERVAL:-30}
+      AGENT_DEFAULT_TIMEFRAME: ${AGENT_DEFAULT_TIMEFRAME:-5}
+      AGENT_EXECUTION_TIMEFRAMES: ${AGENT_EXECUTION_TIMEFRAMES:-3,5,15}
+      AGENT_REFERENCE_TIMEFRAMES: ${AGENT_REFERENCE_TIMEFRAMES:-60,D}
+      AGENT_DEFAULT_SYMBOLS: ${AGENT_DEFAULT_SYMBOLS:-NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX,NSE:NIFTYMIDCAP50-INDEX,BSE:SENSEX-INDEX}
+      AGENT_US_SYMBOLS: ${AGENT_US_SYMBOLS:-US:AAPL,US:AMZN,US:JPM,US:XOM,US:UNH,US:CAT,US:PG,US:LIN,US:NEE,US:DIS}
+      AGENT_CRYPTO_SYMBOLS: ${AGENT_CRYPTO_SYMBOLS:-CRYPTO:BTCUSDT,CRYPTO:ETHUSDT,CRYPTO:BNBUSDT,CRYPTO:SOLUSDT,CRYPTO:XRPUSDT,CRYPTO:ADAUSDT,CRYPTO:DOGEUSDT,CRYPTO:AVAXUSDT,CRYPTO:DOTUSDT,CRYPTO:LINKUSDT}
+      AGENT_TRADE_NSE_WHEN_OPEN: ${AGENT_TRADE_NSE_WHEN_OPEN:-true}
+      AGENT_TRADE_US_WHEN_OPEN: ${AGENT_TRADE_US_WHEN_OPEN:-true}
+      AGENT_TRADE_US_OPTIONS: ${AGENT_TRADE_US_OPTIONS:-true}
+      AGENT_TRADE_CRYPTO_24X7: ${AGENT_TRADE_CRYPTO_24X7:-true}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      ALPHAVANTAGE_API_KEY: ${ALPHAVANTAGE_API_KEY:-}
+      FYERS_APP_ID: ${FYERS_APP_ID:-}
+      FYERS_SECRET_KEY: ${FYERS_SECRET_KEY:-}
+      FYERS_REDIRECT_URI: ${FYERS_REDIRECT_URI:-https://trade.fyers.in/api-login/redirect-uri/index.html}
+      FYERS_REDIRECT_FRONTEND_URL: ${FYERS_REDIRECT_FRONTEND_URL:-https://your-domain/settings}
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?Set FRONTEND_IMAGE to your ECR frontend image}
+    restart: unless-stopped
+    environment:
+      API_HOST: backend
+      NEXT_PUBLIC_API_URL: /api/v1
+      NEXT_PUBLIC_WS_URL: wss://${PUBLIC_DOMAIN}/api/v1
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "80:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000', (r) => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

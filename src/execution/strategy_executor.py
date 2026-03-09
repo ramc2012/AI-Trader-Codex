@@ -8,7 +8,7 @@ start/stop/pause lifecycle and per-strategy tracking.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +47,7 @@ class StrategyState:
     total_pnl: float = 0.0
     last_signal_time: Optional[datetime] = None
     last_error: Optional[str] = None
+    last_symbol_signal_time: Dict[str, datetime] | None = None
 
 
 class StrategyExecutor:
@@ -167,17 +168,24 @@ class StrategyExecutor:
 
         for name, strategy in self._strategies.items():
             state = self._strategy_states[name]
+            if state.last_symbol_signal_time is None:
+                state.last_symbol_signal_time = {}
             if not state.enabled:
                 continue
 
             try:
                 signals = strategy.generate_signals(data)
-                state.signals_generated += len(signals)
+                new_signals = self._filter_new_signals(state, symbol, signals)
+                state.signals_generated += len(new_signals)
 
-                if signals:
-                    state.last_signal_time = datetime.now()
+                if new_signals:
+                    latest_ts = self._signal_timestamp(new_signals[-1])
+                    if latest_ts is not None:
+                        state.last_signal_time = latest_ts
+                    else:
+                        state.last_signal_time = datetime.now()
 
-                for signal in signals:
+                for signal in new_signals:
                     result: Dict[str, Any] = {
                         "strategy": name,
                         "signal": signal,
@@ -194,6 +202,59 @@ class StrategyExecutor:
                 )
 
         return results
+
+    def _filter_new_signals(
+        self,
+        state: StrategyState,
+        symbol: str,
+        signals: List[Any],
+    ) -> List[Any]:
+        """Return only signals newer than last processed timestamp."""
+        if not signals:
+            return []
+        if not symbol:
+            return signals
+
+        ts_signals: list[tuple[datetime | None, Any]] = [
+            (self._signal_timestamp(s), s) for s in signals
+        ]
+        last_ts = state.last_symbol_signal_time.get(symbol or "__global__")
+        if last_ts is not None:
+            last_ts = self._normalize_timestamp(last_ts)
+        if last_ts is None:
+            newest = max((ts for ts, _ in ts_signals if ts is not None), default=None)
+            if newest is not None:
+                state.last_symbol_signal_time[symbol or "__global__"] = newest
+            return signals[-1:]  # First run: act only on latest signal
+
+        filtered = [sig for ts, sig in ts_signals if ts is None or ts > last_ts]
+        newest_filtered = max(
+            (self._signal_timestamp(s) for s in filtered if self._signal_timestamp(s) is not None),
+            default=None,
+        )
+        if newest_filtered is not None:
+            state.last_symbol_signal_time[symbol or "__global__"] = newest_filtered
+        return filtered
+
+    @staticmethod
+    def _signal_timestamp(signal: Any) -> datetime | None:
+        ts = getattr(signal, "timestamp", None)
+        if isinstance(ts, datetime):
+            return StrategyExecutor._normalize_timestamp(ts)
+        if isinstance(ts, str):
+            try:
+                parsed = datetime.fromisoformat(ts)
+                return StrategyExecutor._normalize_timestamp(parsed)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _normalize_timestamp(ts: datetime) -> datetime:
+        """Normalize timestamps so comparisons never mix aware/naive values."""
+        if ts.tzinfo is None or ts.tzinfo.utcoffset(ts) is None:
+            return ts
+        return ts.astimezone(timezone.utc).replace(tzinfo=None)
 
     def start(self) -> None:
         """Start the executor (transition to RUNNING state)."""

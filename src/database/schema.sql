@@ -73,14 +73,22 @@ CREATE TABLE IF NOT EXISTS option_chain (
     expiry          DATE            NOT NULL,
     strike          NUMERIC(12, 2)  NOT NULL,
     option_type     TEXT            NOT NULL,  -- 'CE' or 'PE'
+    symbol          TEXT,
     ltp             NUMERIC(12, 2),
     oi              BIGINT          DEFAULT 0,
+    prev_oi         BIGINT          DEFAULT 0,
+    oich            BIGINT          DEFAULT 0,
     volume          BIGINT          DEFAULT 0,
     iv              NUMERIC(8, 4),
     delta           NUMERIC(8, 6),
     gamma           NUMERIC(10, 8),
     theta           NUMERIC(10, 6),
-    vega            NUMERIC(10, 6)
+    vega            NUMERIC(10, 6),
+    source_ts       TIMESTAMPTZ,
+    source_latency_ms INT           DEFAULT 0,
+    integrity_score NUMERIC(6, 4)   DEFAULT 0,
+    is_stale        BOOLEAN         DEFAULT FALSE,
+    is_partial      BOOLEAN         DEFAULT FALSE
 );
 
 SELECT create_hypertable(
@@ -90,6 +98,9 @@ SELECT create_hypertable(
     chunk_time_interval => INTERVAL '1 day'
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_option_chain_unique
+    ON option_chain (timestamp, underlying, expiry, strike, option_type);
+
 CREATE INDEX IF NOT EXISTS idx_optchain_underlying_expiry
     ON option_chain (underlying, expiry, timestamp DESC);
 
@@ -97,7 +108,36 @@ CREATE INDEX IF NOT EXISTS idx_optchain_strike
     ON option_chain (underlying, strike, option_type, timestamp DESC);
 
 -- ---------------------------------------------------------------------------
--- 4. Trade log (every order placed by the system)
+-- 4. Option OHLC candles
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS option_ohlc (
+    symbol          TEXT            NOT NULL,
+    timeframe       TEXT            NOT NULL,
+    timestamp       TIMESTAMPTZ     NOT NULL,
+    open            NUMERIC(12, 2)  NOT NULL,
+    high            NUMERIC(12, 2)  NOT NULL,
+    low             NUMERIC(12, 2)  NOT NULL,
+    close           NUMERIC(12, 2)  NOT NULL,
+    volume          BIGINT          NOT NULL DEFAULT 0,
+    underlying      TEXT,
+    expiry          DATE,
+    strike          NUMERIC(12, 2),
+    option_type     TEXT,
+    PRIMARY KEY (symbol, timeframe, timestamp)
+);
+
+SELECT create_hypertable(
+    'option_ohlc',
+    'timestamp',
+    if_not_exists => TRUE,
+    chunk_time_interval => INTERVAL '1 day'
+);
+
+CREATE INDEX IF NOT EXISTS idx_option_ohlc_symbol_tf_time
+    ON option_ohlc (symbol, timeframe, timestamp DESC);
+
+-- ---------------------------------------------------------------------------
+-- 5. Trade log (every order placed by the system)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS trade_log (
     id              BIGSERIAL       PRIMARY KEY,
@@ -122,7 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_trade_log_symbol
     ON trade_log (symbol, timestamp DESC);
 
 -- ---------------------------------------------------------------------------
--- 5. Compression policies (reduce storage for older data)
+-- 6. Compression policies (reduce storage for older data)
 -- ---------------------------------------------------------------------------
 -- Compress index_ohlc chunks older than 30 days
 ALTER TABLE index_ohlc SET (
@@ -142,6 +182,32 @@ ALTER TABLE tick_data SET (
 
 SELECT add_compression_policy('tick_data', INTERVAL '3 days', if_not_exists => TRUE);
 
+-- Continuous aggregate for older tick history (1-minute buckets)
+CREATE MATERIALIZED VIEW IF NOT EXISTS tick_data_1m
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket(INTERVAL '1 minute', timestamp) AS bucket,
+    symbol,
+    AVG(ltp) AS avg_ltp,
+    MIN(ltp) AS low_ltp,
+    MAX(ltp) AS high_ltp,
+    SUM(volume) AS volume,
+    COUNT(*) AS ticks
+FROM tick_data
+GROUP BY bucket, symbol
+WITH NO DATA;
+
+CREATE INDEX IF NOT EXISTS idx_tick_data_1m_symbol_time
+    ON tick_data_1m (symbol, bucket DESC);
+
+SELECT add_continuous_aggregate_policy(
+    'tick_data_1m',
+    start_offset => INTERVAL '30 days',
+    end_offset => INTERVAL '1 minute',
+    schedule_interval => INTERVAL '5 minutes',
+    if_not_exists => TRUE
+);
+
 -- Compress option_chain chunks older than 14 days
 ALTER TABLE option_chain SET (
     timescaledb.compress,
@@ -151,13 +217,28 @@ ALTER TABLE option_chain SET (
 
 SELECT add_compression_policy('option_chain', INTERVAL '14 days', if_not_exists => TRUE);
 
+-- Compress option_ohlc chunks older than 14 days
+ALTER TABLE option_ohlc SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'symbol, timeframe',
+    timescaledb.compress_orderby = 'timestamp'
+);
+
+SELECT add_compression_policy('option_ohlc', INTERVAL '14 days', if_not_exists => TRUE);
+
 -- ---------------------------------------------------------------------------
--- 6. Data retention policies
+-- 7. Data retention policies
 -- ---------------------------------------------------------------------------
--- Drop tick data older than 7 days
-SELECT add_retention_policy('tick_data', INTERVAL '7 days', if_not_exists => TRUE);
+-- Keep raw tick data for at least 10 days
+SELECT add_retention_policy('tick_data', INTERVAL '10 days', if_not_exists => TRUE);
+
+-- Keep aggregated 1-minute tick buckets for a longer horizon
+SELECT add_retention_policy('tick_data_1m', INTERVAL '180 days', if_not_exists => TRUE);
 
 -- Drop option chain data older than 90 days
 SELECT add_retention_policy('option_chain', INTERVAL '90 days', if_not_exists => TRUE);
+
+-- Drop option OHLC data older than 180 days
+SELECT add_retention_policy('option_ohlc', INTERVAL '180 days', if_not_exists => TRUE);
 
 -- index_ohlc: no retention — keep forever (compression handles storage)

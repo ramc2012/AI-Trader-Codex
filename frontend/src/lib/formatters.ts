@@ -33,6 +33,22 @@ export function formatINRFull(value: number): string {
 }
 
 /**
+ * Format number in selected currency (INR/USD currently).
+ */
+export function formatCurrency(value: number, currency: string = 'INR'): string {
+  const code = (currency || 'INR').toUpperCase();
+  const locale = code === 'USD' ? 'en-US' : 'en-IN';
+  const sign = value < 0 ? '-' : '';
+  const absValue = Math.abs(value);
+  return `${sign}${absValue.toLocaleString(locale, {
+    style: 'currency',
+    currency: code === 'USD' ? 'USD' : 'INR',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+/**
  * Format a number as a percentage.
  */
 export function formatPercent(value: number, decimals = 2): string {

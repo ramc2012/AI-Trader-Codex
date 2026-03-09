@@ -13,7 +13,8 @@ class TestSettings:
         assert settings.app_env == Environment.DEVELOPMENT
         assert settings.trading_mode == TradingMode.PAPER
         assert settings.max_daily_loss_pct == 2.0
-        assert settings.max_open_positions == 3
+        assert settings.max_concentration_pct == 30.0
+        assert settings.max_open_positions == 6
 
     def test_database_url(self) -> None:
         settings = Settings(

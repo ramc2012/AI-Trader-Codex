@@ -7,10 +7,15 @@ validate_trade() before execution.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.config.settings import get_settings
+from src.config.market_hours import IST
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -35,9 +40,9 @@ class RiskConfig:
     max_daily_loss: float = 5000.0
     max_daily_loss_pct: float = 0.02
     max_position_size: float = 100000.0
-    max_open_positions: int = 5
+    max_open_positions: int = 6
     max_concentration_pct: float = 0.30
-    max_risk_per_trade_pct: float = 0.02
+    max_risk_per_trade_pct: float = 0.005
     capital: float = 250000.0
     circuit_breaker_enabled: bool = True
     time_based_exit_minutes: int = 30
@@ -94,11 +99,31 @@ class RiskManager:
         config: RiskConfig with risk limits. Uses defaults if None.
     """
 
-    def __init__(self, config: Optional[RiskConfig] = None) -> None:
+    def __init__(self, config: Optional[RiskConfig] = None, state_path: Path | str | None = None) -> None:
         self.config = config or RiskConfig()
-        self.daily_state = DailyRiskState()
+        self.daily_state = DailyRiskState(date=self._current_trade_date())
         self.emergency_stop = False
         self._position_values: Dict[str, float] = {}  # symbol -> position notional value
+        if state_path is not None:
+            self._state_path: Path | None = Path(state_path)
+        elif os.environ.get("PYTEST_CURRENT_TEST"):
+            self._state_path = None
+        else:
+            self._state_path = get_settings().data_path / "risk_manager_state.json"
+        self._load_state()
+
+    @staticmethod
+    def _current_trade_date() -> date:
+        return datetime.now(tz=IST).date()
+
+    def _rollover_if_new_day(self) -> None:
+        today = self._current_trade_date()
+        if self.daily_state.date == today:
+            return
+        open_positions = sum(1 for value in self._position_values.values() if value > 0)
+        self.daily_state = DailyRiskState(date=today, open_positions=open_positions)
+        self._persist_state()
+        logger.info("daily_risk_state_auto_rollover", date=str(today), open_positions=open_positions)
 
     def validate_trade(
         self,
@@ -129,6 +154,8 @@ class RiskManager:
         Returns:
             TradeValidation with is_valid, reason, and risk_score.
         """
+        self._rollover_if_new_day()
+
         # 1. Emergency stop
         if self.emergency_stop:
             logger.warning("trade_rejected_emergency_stop", symbol=symbol)
@@ -269,6 +296,7 @@ class RiskManager:
             pnl: Profit/loss amount (positive = profit, negative = loss).
             is_realized: True for closed trade PnL, False for unrealized mark-to-market.
         """
+        self._rollover_if_new_day()
         if is_realized:
             self.daily_state.realized_pnl += pnl
         else:
@@ -283,6 +311,7 @@ class RiskManager:
         )
 
         self.check_circuit_breaker()
+        self._persist_state()
 
     def check_circuit_breaker(self) -> bool:
         """Check if circuit breaker should trigger.
@@ -293,6 +322,7 @@ class RiskManager:
         Returns:
             True if the circuit breaker was triggered (or already triggered).
         """
+        self._rollover_if_new_day()
         if self.daily_state.circuit_breaker_triggered:
             return True
 
@@ -322,12 +352,20 @@ class RiskManager:
             reason: Human-readable reason for the emergency stop.
         """
         self.emergency_stop = True
+        self._persist_state()
         logger.critical("emergency_stop_activated", reason=reason)
+
+    def clear_emergency_stop(self, reason: str = "manual_reset") -> None:
+        """Clear a previously activated emergency stop."""
+        self.emergency_stop = False
+        self._persist_state()
+        logger.warning("emergency_stop_cleared", reason=reason)
 
     def reset_daily_state(self) -> None:
         """Reset daily state. Call at the start of each trading day."""
-        self.daily_state = DailyRiskState()
+        self.daily_state = DailyRiskState(date=self._current_trade_date())
         self._position_values.clear()
+        self._persist_state()
         # Note: emergency_stop is NOT reset here -- must be explicitly cleared.
         logger.info("daily_risk_state_reset")
 
@@ -337,6 +375,7 @@ class RiskManager:
         Returns:
             Remaining loss budget before circuit breaker triggers.
         """
+        self._rollover_if_new_day()
         max_loss_abs = self.config.max_daily_loss
         max_loss_pct_abs = self.config.capital * self.config.max_daily_loss_pct
         effective_max_loss = min(max_loss_abs, max_loss_pct_abs)
@@ -352,6 +391,7 @@ class RiskManager:
         Returns:
             Dict with all current risk state fields.
         """
+        self._rollover_if_new_day()
         max_loss_abs = self.config.max_daily_loss
         max_loss_pct_abs = self.config.capital * self.config.max_daily_loss_pct
         effective_max_loss = min(max_loss_abs, max_loss_pct_abs)
@@ -382,6 +422,7 @@ class RiskManager:
         Args:
             pnl: Trade profit/loss (positive = win, negative = loss).
         """
+        self._rollover_if_new_day()
         self.daily_state.total_trades += 1
 
         if pnl > 0:
@@ -401,6 +442,7 @@ class RiskManager:
                 else 0.0
             ),
         )
+        self._persist_state()
 
     def add_position(self, symbol: str, position_value: float) -> None:
         """Track an opened position for concentration checks.
@@ -409,10 +451,13 @@ class RiskManager:
             symbol: Trading symbol.
             position_value: Notional value of the position.
         """
-        self._position_values[symbol] = (
-            self._position_values.get(symbol, 0.0) + position_value
-        )
-        self.daily_state.open_positions += 1
+        self._rollover_if_new_day()
+        existing = self._position_values.get(symbol, 0.0)
+        self._position_values[symbol] = existing + position_value
+        # Count open positions by symbol, not by trade count.
+        if existing <= 0:
+            self.daily_state.open_positions += 1
+        self._persist_state()
 
     def remove_position(self, symbol: str, position_value: float) -> None:
         """Remove a closed position from tracking.
@@ -421,11 +466,100 @@ class RiskManager:
             symbol: Trading symbol.
             position_value: Notional value being removed.
         """
+        self._rollover_if_new_day()
         current = self._position_values.get(symbol, 0.0)
+        if current <= 0:
+            return
         remaining = current - position_value
         if remaining <= 0:
             self._position_values.pop(symbol, None)
+            self.daily_state.open_positions = max(0, self.daily_state.open_positions - 1)
         else:
             self._position_values[symbol] = remaining
+        self._persist_state()
 
-        self.daily_state.open_positions = max(0, self.daily_state.open_positions - 1)
+    def sync_position_value(self, symbol: str, position_value: float) -> None:
+        """Set absolute tracked value for a symbol and reconcile open-position count.
+
+        This helper keeps concentration and open-position accounting accurate when
+        positions are scaled in/out or flipped in a single trade event.
+        """
+        self._rollover_if_new_day()
+        current = self._position_values.get(symbol, 0.0)
+        if position_value <= 0:
+            if current > 0:
+                self._position_values.pop(symbol, None)
+                self.daily_state.open_positions = max(0, self.daily_state.open_positions - 1)
+                self._persist_state()
+            return
+
+        self._position_values[symbol] = position_value
+        if current <= 0:
+            self.daily_state.open_positions += 1
+        self._persist_state()
+
+    def _persist_state(self) -> None:
+        """Persist risk state so kill-switch and counters survive restarts."""
+        if self._state_path is None:
+            return
+        try:
+            payload = {
+                "daily_state": {
+                    "date": self.daily_state.date.isoformat(),
+                    "realized_pnl": float(self.daily_state.realized_pnl),
+                    "unrealized_pnl": float(self.daily_state.unrealized_pnl),
+                    "total_trades": int(self.daily_state.total_trades),
+                    "winning_trades": int(self.daily_state.winning_trades),
+                    "losing_trades": int(self.daily_state.losing_trades),
+                    "circuit_breaker_triggered": bool(self.daily_state.circuit_breaker_triggered),
+                    "open_positions": int(self.daily_state.open_positions),
+                },
+                "emergency_stop": bool(self.emergency_stop),
+                "position_values": {
+                    str(symbol): float(value) for symbol, value in self._position_values.items()
+                },
+            }
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._state_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            tmp_path.replace(self._state_path)
+        except Exception as exc:
+            logger.warning("risk_manager_persist_failed", error=str(exc))
+
+    def _load_state(self) -> None:
+        """Restore risk state from disk when available."""
+        if self._state_path is None or not self._state_path.exists():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+            raw_daily = payload.get("daily_state") or {}
+            state_date_raw = str(raw_daily.get("date") or self._current_trade_date().isoformat())
+            try:
+                state_date = date.fromisoformat(state_date_raw)
+            except ValueError:
+                state_date = self._current_trade_date()
+
+            self.daily_state = DailyRiskState(
+                date=state_date,
+                realized_pnl=float(raw_daily.get("realized_pnl", 0.0) or 0.0),
+                unrealized_pnl=float(raw_daily.get("unrealized_pnl", 0.0) or 0.0),
+                total_trades=int(raw_daily.get("total_trades", 0) or 0),
+                winning_trades=int(raw_daily.get("winning_trades", 0) or 0),
+                losing_trades=int(raw_daily.get("losing_trades", 0) or 0),
+                circuit_breaker_triggered=bool(raw_daily.get("circuit_breaker_triggered", False)),
+                open_positions=int(raw_daily.get("open_positions", 0) or 0),
+            )
+            self.emergency_stop = bool(payload.get("emergency_stop", False))
+            self._position_values = {
+                str(symbol): float(value or 0.0)
+                for symbol, value in (payload.get("position_values") or {}).items()
+            }
+            self._rollover_if_new_day()
+            logger.info(
+                "risk_manager_state_loaded",
+                date=str(self.daily_state.date),
+                emergency_stop=self.emergency_stop,
+                open_positions=self.daily_state.open_positions,
+            )
+        except Exception as exc:
+            logger.warning("risk_manager_state_load_failed", error=str(exc))

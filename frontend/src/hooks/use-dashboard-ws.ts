@@ -3,7 +3,20 @@
 import { useCallback, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useWebSocket } from './use-websocket';
-import type { DashboardWSPayload, EquitySnapshot } from '@/types/api';
+import type { DashboardWSPayload, EquitySnapshot, PortfolioSummary } from '@/types/api';
+
+function isCurrencyAwarePortfolio(value: unknown): value is PortfolioSummary {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Partial<PortfolioSummary>;
+  return (
+    typeof candidate.position_count === 'number' &&
+    typeof candidate.total_pnl === 'number' &&
+    typeof candidate.total_pnl_inr === 'number' &&
+    typeof candidate.total_market_value_inr === 'number'
+  );
+}
 
 export function useDashboardWS() {
   const queryClient = useQueryClient();
@@ -16,7 +29,7 @@ export function useDashboardWS() {
 
       // Inject WebSocket data directly into React Query cache
       // This makes stat cards update instantly without waiting for polling
-      if (payload.portfolio) {
+      if (isCurrencyAwarePortfolio(payload.portfolio)) {
         queryClient.setQueryData(['portfolio'], payload.portfolio);
       }
       if (payload.risk) {

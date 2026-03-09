@@ -1,5 +1,6 @@
 """Tests for the StrategyExecutor class."""
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -226,6 +227,27 @@ class TestProcessData:
         states = executor.get_strategy_states()
         assert states["alpha"].last_signal_time is None
         assert states["alpha"].signals_generated == 0
+
+    def test_process_data_normalizes_mixed_timezone_signal_timestamps(self) -> None:
+        """Mixed tz-aware/naive signal timestamps should not break dedupe logic."""
+        executor = StrategyExecutor()
+        strategy = _MockStrategy(
+            [
+                MagicMock(timestamp=datetime(2026, 3, 4, 7, 30, tzinfo=timezone.utc)),
+                MagicMock(timestamp=datetime(2026, 3, 4, 13, 5, 0)),
+            ]
+        )
+        executor.register_strategy("alpha", strategy)
+
+        first = executor.process_data(data=None, symbol="NSE:NIFTY50-INDEX")
+        assert len(first) == 1  # first run keeps latest signal only
+
+        strategy._signals = [
+            MagicMock(timestamp=datetime(2026, 3, 4, 8, 0, tzinfo=timezone.utc)),
+            MagicMock(timestamp=datetime(2026, 3, 4, 13, 40, tzinfo=timezone.utc)),
+        ]
+        second = executor.process_data(data=None, symbol="NSE:NIFTY50-INDEX")
+        assert len(second) == 1
 
 
 # =============================================================================

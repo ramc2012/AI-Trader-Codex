@@ -15,6 +15,33 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Terminal-style monospace for data-heavy elements */
+.font-mono,
+table td,
+.data-cell {
+  font-feature-settings: "tnum";
+  font-variant-numeric: tabular-nums;
+}
+
+/* Snappy transitions everywhere */
+* {
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* Loading skeleton pulse */
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 0.15; }
+  50% { opacity: 0.3; }
+}
+
+.skeleton {
+  animation: skeleton-pulse 1.2s ease-in-out infinite;
+  background: #1e293b;
+  border-radius: 4px;
 }
 
 /* Custom scrollbar for dark theme */
@@ -70,4 +97,23 @@ body {
 /* Smooth value transitions */
 .value-flash {
   transition: background-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+/* Live tick flash — green for uptick, red for downtick */
+@keyframes flash-up-anim {
+  0%   { background-color: rgba(16, 185, 129, 0.25); }
+  100% { background-color: transparent; }
+}
+
+@keyframes flash-down-anim {
+  0%   { background-color: rgba(239, 68, 68, 0.25); }
+  100% { background-color: transparent; }
+}
+
+.flash-up {
+  animation: flash-up-anim 0.6s ease-out;
+}
+
+.flash-down {
+  animation: flash-down-anim 0.6s ease-out;
 }

@@ -1,4 +1,4 @@
-"""Volatility indicators: Bollinger Bands, ATR."""
+"""Volatility indicators: Bollinger Bands, ATR, Keltner, Donchian, StdDev."""
 
 from __future__ import annotations
 
@@ -107,3 +107,79 @@ class ATR(Indicator):
 
     def __repr__(self) -> str:
         return f"<ATR(period={self.period})>"
+
+
+class KeltnerChannels(Indicator):
+    """Keltner channels using EMA +/- multiplier*ATR."""
+
+    name = "KeltnerChannels"
+
+    def __init__(self, period: int = 20, atr_period: int = 10, multiplier: float = 2.0) -> None:
+        if period < 1 or atr_period < 1:
+            raise ValueError("periods must be >= 1")
+        if multiplier <= 0:
+            raise ValueError("multiplier must be > 0")
+        self.period = period
+        self.atr_period = atr_period
+        self.multiplier = multiplier
+
+    def calculate(self, data: pd.DataFrame) -> pd.DataFrame:
+        typical = (data["high"] + data["low"] + data["close"]) / 3.0
+        middle = typical.ewm(span=self.period, adjust=False).mean()
+        atr = ATR(period=self.atr_period).calculate(
+            data["close"],
+            high=data["high"],
+            low=data["low"],
+        )
+        upper = middle + (self.multiplier * atr)
+        lower = middle - (self.multiplier * atr)
+        return pd.DataFrame(
+            {
+                "upper": upper,
+                "middle": middle,
+                "lower": lower,
+            },
+            index=data.index,
+        )
+
+
+class DonchianChannels(Indicator):
+    """Donchian channels based on rolling high/low."""
+
+    name = "DonchianChannels"
+
+    def __init__(self, period: int = 20) -> None:
+        if period < 1:
+            raise ValueError("period must be >= 1")
+        self.period = period
+
+    def calculate(self, data: pd.DataFrame) -> pd.DataFrame:
+        upper = data["high"].rolling(window=self.period, min_periods=self.period).max()
+        lower = data["low"].rolling(window=self.period, min_periods=self.period).min()
+        middle = (upper + lower) / 2.0
+        width = (upper - lower) / middle.replace(0, np.nan)
+        return pd.DataFrame(
+            {
+                "upper": upper,
+                "middle": middle,
+                "lower": lower,
+                "width": width,
+            },
+            index=data.index,
+        )
+
+
+class RollingStdDev(Indicator):
+    """Rolling standard deviation of returns."""
+
+    name = "RollingStdDev"
+
+    def __init__(self, period: int = 20) -> None:
+        if period < 1:
+            raise ValueError("period must be >= 1")
+        self.period = period
+
+    def calculate(self, data: pd.Series) -> pd.Series:
+        returns = data.pct_change()
+        std = returns.rolling(window=self.period, min_periods=self.period).std()
+        return pd.Series(std, index=data.index, name=f"stddev_{self.period}")

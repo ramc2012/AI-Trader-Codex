@@ -10,15 +10,25 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.20",
+    "@types/react-plotly.js": "^2.6.4",
+    "ag-grid-community": "^35.1.0",
+    "ag-grid-react": "^35.1.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "echarts": "^5.6.0",
+    "echarts-for-react": "^3.0.6",
+    "echarts-gl": "^2.0.9",
+    "framer-motion": "^12.34.3",
     "lightweight-charts": "^5.1.0",
     "lucide-react": "^0.563.0",
     "next": "16.1.6",
+    "plotly.js": "^3.4.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "react-plotly.js": "^2.6.0",
     "recharts": "^3.7.0",
-    "tailwind-merge": "^3.4.0"
+    "tailwind-merge": "^3.4.0",
+    "technicalindicators": "^3.1.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

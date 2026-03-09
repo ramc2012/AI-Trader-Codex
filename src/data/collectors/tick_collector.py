@@ -41,6 +41,7 @@ class Tick:
     high: float | None = None
     low: float | None = None
     close: float | None = None
+    cumulative_volume: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -54,6 +55,7 @@ class Tick:
             "high": self.high,
             "low": self.low,
             "close": self.close,
+            "cumulative_volume": self.cumulative_volume,
         }
 
 
@@ -195,6 +197,10 @@ class TickCollector:
         self._aggregators: dict[str, CandleAggregator] = {
             s: CandleAggregator(symbol=s) for s in self._symbols
         }
+        # Track previous cumulative-volume / price to derive clean tick deltas.
+        self._last_cumulative_volume: dict[str, int] = {}
+        self._last_ltp: dict[str, float] = {}
+        self._max_single_tick_jump_pct = 0.12
         self._last_flush_time: float = 0.0
         self.stats = TickCollectorStats()
 
@@ -206,6 +212,10 @@ class TickCollector:
         """Start the WebSocket connection and begin streaming.
 
         This is a blocking call — run in a thread or use start_async().
+
+        Loops internally so that normal Fyers periodic close messages
+        (code 200 "Connection Closed") do not exit the task.  The asyncio
+        task will only finish when self._running is set to False by stop().
         """
         from fyers_apiv3.FyersWebsocket.data_ws import FyersDataSocket
 
@@ -219,20 +229,48 @@ class TickCollector:
             batch_interval=self._batch_interval,
         )
 
-        self._ws = FyersDataSocket(
-            access_token=self._access_token,
-            write_to_file=False,
-            litemode=False,
-            reconnect=True,
-            on_message=self._handle_message,
-            on_error=self._handle_error,
-            on_connect=self._handle_connect,
-            on_close=self._handle_close,
-        )
+        # Fyers WS closes every few seconds with SSL EOF — this is normal behaviour
+        # from the Fyers server side. Our outer loop reconnects immediately so the
+        # gap in tick data is at most 2–3 s (hidden by the 6 s frontend debounce).
+        #
+        # subscribe() is called inside _handle_connect so that it is re-sent on
+        # every reconnect rather than only on the very first connection attempt.
+        _session_start = time.monotonic()
 
-        self._ws.connect()
-        self._ws.subscribe(symbols=self._symbols)
-        self._ws.keep_running()
+        while self._running:
+            _session_start = time.monotonic()
+            try:
+                self._ws = FyersDataSocket(
+                    access_token=self._access_token,
+                    write_to_file=False,
+                    litemode=False,
+                    reconnect=False,  # We manage reconnects in the outer loop
+                    on_message=self._handle_message,
+                    on_error=self._handle_error,
+                    on_connect=self._handle_connect,
+                    on_close=self._handle_close,
+                )
+
+                self._ws.connect()
+                # NOTE: subscribe() is called inside _handle_connect to ensure the
+                # subscription is always sent on a live connection.
+                self._ws.keep_running()  # blocks until connection closes
+
+            except Exception as exc:
+                logger.warning("tick_collector_ws_error", error=str(exc))
+
+            if self._running:
+                uptime = time.monotonic() - _session_start
+                # Use a short delay so ticks resume quickly.
+                # Only back off longer when the connection died in < 1 s to avoid
+                # hammering Fyers on auth / configuration errors.
+                delay = 10 if uptime < 1 else 2
+                logger.info(
+                    "tick_collector_reconnecting",
+                    uptime_s=round(uptime, 1),
+                    delay=delay,
+                )
+                time.sleep(delay)
 
     async def start_async(self) -> None:
         """Start the collector in an async context (runs blocking WS in thread)."""
@@ -312,13 +350,26 @@ class TickCollector:
         logger.error("ws_error", error=str(error))
 
     def _handle_connect(self) -> None:
-        """Handle successful WebSocket connection."""
+        """Handle successful WebSocket connection and send subscriptions."""
         logger.info("ws_connected", symbols=self._symbols)
+        if self._ws is not None:
+            try:
+                self._ws.subscribe(symbols=self._symbols)
+            except Exception as exc:
+                logger.warning("ws_subscribe_error", error=str(exc))
 
-    def _handle_close(self) -> None:
-        """Handle WebSocket disconnection."""
+    def _handle_close(self, message: Any = None) -> None:
+        """Handle WebSocket disconnection.
+
+        The Fyers SDK may call this with a close-reason message argument;
+        we accept but ignore it so the signature always matches.
+        """
         self.stats.reconnections += 1
-        logger.warning("ws_disconnected", reconnections=self.stats.reconnections)
+        logger.warning(
+            "ws_disconnected",
+            reconnections=self.stats.reconnections,
+            reason=str(message) if message else None,
+        )
 
     # =========================================================================
     # Tick Parsing & Validation
@@ -343,10 +394,26 @@ class TickCollector:
             self.stats.ticks_invalid += 1
             return None
 
-        if ltp <= 0:
+        ltp_float = float(ltp)
+        if ltp_float <= 0:
             self.stats.ticks_invalid += 1
             logger.debug("invalid_tick_ltp", symbol=symbol, ltp=ltp)
             return None
+
+        prev_ltp = self._last_ltp.get(symbol)
+        if prev_ltp and prev_ltp > 0:
+            change_pct = abs(ltp_float - prev_ltp) / prev_ltp
+            if change_pct > self._max_single_tick_jump_pct:
+                self.stats.ticks_invalid += 1
+                logger.warning(
+                    "tick_outlier_filtered",
+                    symbol=symbol,
+                    ltp=ltp_float,
+                    previous_ltp=prev_ltp,
+                    jump_pct=round(change_pct * 100, 2),
+                )
+                return None
+        self._last_ltp[symbol] = ltp_float
 
         ts_raw = message.get("timestamp")
         if isinstance(ts_raw, (int, float)):
@@ -354,17 +421,29 @@ class TickCollector:
         else:
             timestamp = datetime.now(tz=IST)
 
+        # Fyers vol_traded_today is cumulative; convert to per-tick delta volume.
+        cumulative_volume = int(float(message.get("vol_traded_today", 0)))
+        prev_cumulative = self._last_cumulative_volume.get(symbol)
+        if prev_cumulative is None:
+            delta_volume = 0
+        else:
+            delta_volume = cumulative_volume - prev_cumulative
+            if delta_volume < 0:
+                delta_volume = 0
+        self._last_cumulative_volume[symbol] = cumulative_volume
+
         return Tick(
             symbol=symbol,
             timestamp=timestamp,
-            ltp=float(ltp),
+            ltp=ltp_float,
             bid=message.get("bid"),
             ask=message.get("ask"),
-            volume=int(message.get("vol_traded_today", 0)),
+            volume=delta_volume,
             open=message.get("open_price"),
             high=message.get("high_price"),
             low=message.get("low_price"),
             close=message.get("prev_close_price"),
+            cumulative_volume=cumulative_volume,
         )
 
     # =========================================================================

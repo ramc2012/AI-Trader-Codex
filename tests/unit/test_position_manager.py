@@ -365,3 +365,29 @@ class TestPositionManagerQueries:
         assert trade["pnl"] == pytest.approx(200.0)
         assert trade["strategy_tag"] == "test"
         assert "closed_at" in trade
+
+    def test_format_position_summary_orders_by_pnl_and_caps_output(self) -> None:
+        """format_position_summary returns a compact ranked snapshot."""
+        pm = PositionManager()
+        pm.open_position("NSE:NIFTY50-INDEX", 10, PositionSide.LONG, 100.0)
+        pm.open_position("NSE:BANKNIFTY-INDEX", 5, PositionSide.SHORT, 200.0)
+        pm.open_position("CRYPTO:BTCUSDT", 1, PositionSide.LONG, 300.0)
+        pm.update_prices({
+            "NSE:NIFTY50-INDEX": 110.0,   # +100
+            "NSE:BANKNIFTY-INDEX": 230.0,  # -150
+            "CRYPTO:BTCUSDT": 320.0,       # +20
+        })
+
+        summary = pm.format_position_summary(max_items=2)
+
+        lines = summary.splitlines()
+        assert lines[0].startswith("• BANKNIFTY SHORT x5")
+        assert "P&L -150.00" in lines[0]
+        assert lines[1].startswith("• NIFTY50 LONG x10")
+        assert "P&L +100.00" in lines[1]
+        assert lines[2] == "• +1 more position(s)"
+
+    def test_format_position_summary_handles_no_positions(self) -> None:
+        """format_position_summary reports an empty portfolio cleanly."""
+        pm = PositionManager()
+        assert pm.format_position_summary() == "• None"

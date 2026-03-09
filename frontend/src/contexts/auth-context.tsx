@@ -1,13 +1,16 @@
 'use client';
 
 import { createContext, useContext, useMemo, type ReactNode } from 'react';
-import { useAuthStatus } from '@/hooks/use-auth';
+import { useAuthStatus, useTokenStatus } from '@/hooks/use-auth';
+import type { TokenStatus } from '@/types/api';
 
 interface AuthContextValue {
   isAuthenticated: boolean;
   isLoading: boolean;
   profile: Record<string, unknown> | null;
   appConfigured: boolean;
+  tokenStatus: TokenStatus | null;
+  isAutoRefreshing: boolean;
 }
 
 const AuthContext = createContext<AuthContextValue>({
@@ -15,19 +18,26 @@ const AuthContext = createContext<AuthContextValue>({
   isLoading: true,
   profile: null,
   appConfigured: false,
+  tokenStatus: null,
+  isAutoRefreshing: false,
 });
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const { data, isLoading } = useAuthStatus();
+  const appConfigured = data?.app_configured ?? false;
+  const { data: tokenStatus } = useTokenStatus(appConfigured);
+  const isInitialLoading = isLoading && data === undefined;
 
   const value: AuthContextValue = useMemo(
     () => ({
       isAuthenticated: data?.authenticated ?? false,
-      isLoading,
+      isLoading: isInitialLoading,
       profile: data?.profile ?? null,
-      appConfigured: data?.app_configured ?? false,
+      appConfigured,
+      tokenStatus: tokenStatus ?? null,
+      isAutoRefreshing: false,
     }),
-    [data?.authenticated, data?.profile, data?.app_configured, isLoading]
+    [data?.authenticated, data?.profile, appConfigured, isInitialLoading, tokenStatus]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

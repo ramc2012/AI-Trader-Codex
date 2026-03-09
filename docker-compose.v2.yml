@@ -1,0 +1,155 @@
+# Dedicated V2 stack so it can run alongside older deployments.
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    restart: unless-stopped
+    ports:
+      - "${DB_HOST_PORT:-5545}:5432"
+    environment:
+      POSTGRES_DB: ${DB_NAME_V2:-nifty_trader_v2}
+      POSTGRES_USER: ${DB_USER_V2:-trader}
+      POSTGRES_PASSWORD: ${DB_PASSWORD_V2:-change_me_in_production}
+    volumes:
+      - timescaledb_data_v2:/var/lib/postgresql/data
+      - ./docker/init-db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d nifty_trader_v2"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nifty-v2-network
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "${REDIS_HOST_PORT:-6382}:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data_v2:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nifty-v2-network
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${APP_HOST_PORT:-8201}:8000"
+    environment:
+      DATA_DIR: /app/data
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME_V2:-nifty_trader_v2}
+      DB_USER: ${DB_USER_V2:-trader}
+      DB_PASSWORD: ${DB_PASSWORD_V2:-change_me_in_production}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_PASSWORD: ""
+      APP_ENV: development
+      APP_DEBUG: "false"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: 8000
+      APP_LOG_LEVEL: INFO
+      SECRET_KEY: docker_dev_secret_key_v2
+      TRADING_MODE: paper
+      AGENT_AUTO_START: "false"
+      MAX_DAILY_LOSS_PCT: "2.0"
+      MAX_POSITION_SIZE_PCT: "25.0"
+      MAX_CONCENTRATION_PCT: "60.0"
+      MAX_OPEN_POSITIONS: "6"
+      MAX_TRADE_RISK_PCT: "0.5"
+      AGENT_DEFAULT_TIMEFRAME: "5"
+      AGENT_EXECUTION_TIMEFRAMES: "3,5,15"
+      AGENT_REFERENCE_TIMEFRAMES: "60,D"
+      AGENT_LIBERAL_BOOTSTRAP_ENABLED: "true"
+      AGENT_BOOTSTRAP_CYCLES: "600"
+      AGENT_BOOTSTRAP_SIZE_MULTIPLIER: "2.0"
+      AGENT_BOOTSTRAP_MAX_CONCENTRATION_PCT: "100.0"
+      AGENT_BOOTSTRAP_MAX_OPEN_POSITIONS: "20"
+      AGENT_BOOTSTRAP_RISK_PER_TRADE_PCT: "2.0"
+      AGENT_OPTION_TIME_EXIT_MINUTES: "30"
+      AGENT_OPTION_DEFAULT_STOP_LOSS_PCT: "10.0"
+      AGENT_OPTION_DEFAULT_TARGET_PCT: "18.0"
+      AGENT_REINFORCEMENT_ENABLED: "true"
+      AGENT_REINFORCEMENT_ALPHA: "0.2"
+      AGENT_REINFORCEMENT_SIZE_BOOST_PCT: "60.0"
+      AGENT_DEFAULT_SYMBOLS: "${AGENT_DEFAULT_SYMBOLS:-NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX,NSE:NIFTYMIDCAP50-INDEX,BSE:SENSEX-INDEX,NSE:RELIANCE-EQ,NSE:TCS-EQ,NSE:INFY-EQ,NSE:HDFCBANK-EQ,NSE:ICICIBANK-EQ,NSE:HINDUNILVR-EQ,NSE:SBIN-EQ,NSE:BHARTIARTL-EQ,NSE:ITC-EQ,NSE:KOTAKBANK-EQ,NSE:LT-EQ,NSE:AXISBANK-EQ,NSE:ASIANPAINT-EQ,NSE:MARUTI-EQ,NSE:BAJFINANCE-EQ,NSE:HCLTECH-EQ,NSE:WIPRO-EQ,NSE:TITAN-EQ,NSE:SUNPHARMA-EQ,NSE:ULTRACEMCO-EQ,NSE:ONGC-EQ,NSE:NTPC-EQ,NSE:POWERGRID-EQ,NSE:NESTLEIND-EQ,NSE:TECHM-EQ,NSE:CIPLA-EQ,NSE:DIVISLAB-EQ,NSE:GRASIM-EQ,NSE:ADANIPORTS-EQ,NSE:BAJAJ-AUTO-EQ,NSE:HEROMOTOCO-EQ,NSE:EICHERMOT-EQ,NSE:APOLLOHOSP-EQ,NSE:TATAMOTORS-EQ,NSE:TATASTEEL-EQ,NSE:JSWSTEEL-EQ,NSE:INDUSINDBK-EQ,NSE:HINDALCO-EQ,NSE:COALINDIA-EQ,NSE:DRREDDY-EQ,NSE:BPCL-EQ,NSE:TATACONSUM-EQ,NSE:BRITANNIA-EQ,NSE:BAJAJFINSV-EQ,NSE:SHREECEM-EQ,NSE:SBILIFE-EQ,NSE:HDFCLIFE-EQ,NSE:ADANIENT-EQ,NSE:LTIM-EQ,NSE:MM-EQ}"
+      AGENT_US_SYMBOLS: "${AGENT_US_SYMBOLS:-US:AAPL,US:AMZN,US:JPM,US:XOM,US:UNH,US:CAT,US:PG,US:LIN,US:NEE,US:DIS}"
+      AGENT_CRYPTO_SYMBOLS: "${AGENT_CRYPTO_SYMBOLS:-CRYPTO:BTCUSDT,CRYPTO:ETHUSDT,CRYPTO:BNBUSDT,CRYPTO:SOLUSDT,CRYPTO:XRPUSDT,CRYPTO:ADAUSDT,CRYPTO:DOGEUSDT,CRYPTO:AVAXUSDT,CRYPTO:DOTUSDT,CRYPTO:LINKUSDT}"
+      AGENT_TRADE_NSE_WHEN_OPEN: "${AGENT_TRADE_NSE_WHEN_OPEN:-true}"
+      AGENT_TRADE_US_WHEN_OPEN: "${AGENT_TRADE_US_WHEN_OPEN:-true}"
+      AGENT_TRADE_US_OPTIONS: "${AGENT_TRADE_US_OPTIONS:-true}"
+      AGENT_TRADE_CRYPTO_24X7: "${AGENT_TRADE_CRYPTO_24X7:-true}"
+      TELEGRAM_STATUS_INTERVAL_MINUTES: "${TELEGRAM_STATUS_INTERVAL_MINUTES:-30}"
+      USD_INR_REFERENCE_RATE: "${USD_INR_REFERENCE_RATE:-83.0}"
+    volumes:
+      - ./.env.docker.v2:/app/.env:ro
+      - backend_data_v2:/app/data
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    networks:
+      - nifty-v2-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        API_HOST: backend
+        NEXT_PUBLIC_API_URL: /api/v1
+        NEXT_PUBLIC_WS_URL: ws://localhost:${APP_HOST_PORT:-8201}/api/v1
+        NEXT_PUBLIC_APP_NAME_BASE: ${NEXT_PUBLIC_APP_NAME_BASE:-AI TRADER}
+        NEXT_PUBLIC_APP_INSTANCE_LABEL: ${NEXT_PUBLIC_APP_INSTANCE_LABEL:-LOCAL}
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_HOST_PORT:-3201}:3000"
+    environment:
+      API_HOST: backend
+      NEXT_PUBLIC_API_URL: /api/v1
+      NEXT_PUBLIC_APP_NAME_BASE: ${NEXT_PUBLIC_APP_NAME_BASE:-AI TRADER}
+      NEXT_PUBLIC_APP_INSTANCE_LABEL: ${NEXT_PUBLIC_APP_INSTANCE_LABEL:-LOCAL}
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"]
+      interval: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    networks:
+      - nifty-v2-network
+
+volumes:
+  timescaledb_data_v2:
+    driver: local
+  redis_data_v2:
+    driver: local
+  backend_data_v2:
+    driver: local
+
+networks:
+  nifty-v2-network:
+    driver: bridge

@@ -21,6 +21,7 @@ from src.database.operations import upsert_ohlc_candles
 from src.integrations.fyers_client import FyersClient
 from src.utils.exceptions import DataFetchError
 from src.utils.logger import get_logger
+from src.watchlist.options_data_service import OptionsDataService
 
 logger = get_logger(__name__)
 
@@ -49,6 +50,7 @@ class DataOrchestrator:
         self.db_session = db_session
         self.max_concurrent_jobs = max_concurrent_jobs
         self.max_retries = max_retries
+        self._options_service = OptionsDataService(fyers_client)
 
         # Job tracking
         self._jobs: Dict[str, DataJob] = {}
@@ -236,14 +238,33 @@ class DataOrchestrator:
         Args:
             job: Option chain DataJob instance
         """
-        # Placeholder for option chain collection
-        # Implementation will depend on OptionChainCollector API
-        logger.warning(
-            "option_chain_collection_not_implemented",
-            job_id=job.job_id,
+        expiry_param = job.params.get("expiry_date")
+        expiry_ts: int | None = None
+        if expiry_param is not None:
+            try:
+                expiry_ts = int(expiry_param)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "option_chain_job_invalid_expiry",
+                    job_id=job.job_id,
+                    expiry=expiry_param,
+                )
+
+        chain_payload = await asyncio.to_thread(
+            self._options_service.get_canonical_chain,
+            job.symbol,
+            12,
+            expiry_ts,
+            1,
         )
-        await asyncio.sleep(1)  # Simulate work
-        job.records_collected = 0
+        rows = await self._options_service.persist_canonical_chain(self.db_session, chain_payload)
+        job.records_collected = rows
+        logger.info(
+            "option_chain_job_completed",
+            job_id=job.job_id,
+            symbol=job.symbol,
+            rows=rows,
+        )
 
     # ========================================================================
     # Queue Processing

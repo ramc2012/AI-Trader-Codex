@@ -7,11 +7,16 @@ and short positions with partial close and position flip semantics.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.config.settings import get_settings
+from src.config.market_hours import IST
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -83,10 +88,17 @@ class PositionManager:
     and flipping. Tracks both realized and unrealized P&L.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, state_path: Path | str | None = None) -> None:
         self._positions: Dict[str, Position] = {}
         self._closed_positions: List[Dict[str, Any]] = []
         self._total_realized_pnl: float = 0.0
+        if state_path is not None:
+            self._state_path: Path | None = Path(state_path)
+        elif os.environ.get("PYTEST_CURRENT_TEST"):
+            self._state_path = None
+        else:
+            self._state_path = get_settings().data_path / "position_manager_state.json"
+        self._load_state()
         logger.info("position_manager_initialized")
 
     def open_position(
@@ -134,6 +146,7 @@ class PositionManager:
                     new_qty=total_qty,
                     new_avg=new_avg,
                 )
+                self._persist_state()
                 return existing
             else:
                 # Opposite direction: reduce or flip
@@ -152,7 +165,7 @@ class PositionManager:
                             "entry_price": existing.avg_price,
                             "exit_price": price,
                             "pnl": pnl,
-                            "closed_at": datetime.now(),
+                            "closed_at": datetime.now(tz=IST),
                             "strategy_tag": existing.strategy_tag,
                         }
                     )
@@ -163,6 +176,7 @@ class PositionManager:
                         remaining_qty=existing.quantity,
                         pnl=pnl,
                     )
+                    self._persist_state()
                     return existing
                 elif quantity == existing.quantity:
                     # Full close
@@ -178,7 +192,7 @@ class PositionManager:
                             "entry_price": existing.avg_price,
                             "exit_price": price,
                             "pnl": pnl,
-                            "closed_at": datetime.now(),
+                            "closed_at": datetime.now(tz=IST),
                             "strategy_tag": existing.strategy_tag,
                         }
                     )
@@ -188,6 +202,7 @@ class PositionManager:
                         symbol=symbol,
                         pnl=pnl,
                     )
+                    self._persist_state()
                     return Position(
                         symbol=symbol,
                         quantity=0,
@@ -212,7 +227,7 @@ class PositionManager:
                             "entry_price": existing.avg_price,
                             "exit_price": price,
                             "pnl": close_pnl,
-                            "closed_at": datetime.now(),
+                            "closed_at": datetime.now(tz=IST),
                             "strategy_tag": existing.strategy_tag,
                         }
                     )
@@ -223,7 +238,7 @@ class PositionManager:
                         side=side,
                         avg_price=price,
                         current_price=price,
-                        entry_time=datetime.now(),
+                        entry_time=datetime.now(tz=IST),
                         strategy_tag=strategy_tag,
                         order_ids=[order_id] if order_id else [],
                     )
@@ -235,6 +250,7 @@ class PositionManager:
                         new_qty=remaining_qty,
                         close_pnl=close_pnl,
                     )
+                    self._persist_state()
                     return new_pos
         else:
             # New position
@@ -244,7 +260,7 @@ class PositionManager:
                 side=side,
                 avg_price=price,
                 current_price=price,
-                entry_time=datetime.now(),
+                entry_time=datetime.now(tz=IST),
                 strategy_tag=strategy_tag,
                 order_ids=[order_id] if order_id else [],
             )
@@ -256,6 +272,7 @@ class PositionManager:
                 quantity=quantity,
                 price=price,
             )
+            self._persist_state()
             return pos
 
     def close_position(
@@ -295,7 +312,7 @@ class PositionManager:
                 "entry_price": pos.avg_price,
                 "exit_price": price,
                 "pnl": pnl,
-                "closed_at": datetime.now(),
+                "closed_at": datetime.now(tz=IST),
                 "strategy_tag": pos.strategy_tag,
             }
         )
@@ -316,6 +333,7 @@ class PositionManager:
                 remaining_qty=pos.quantity,
                 pnl=pnl,
             )
+        self._persist_state()
 
         return pnl
 
@@ -331,6 +349,7 @@ class PositionManager:
         """
         if symbol in self._positions:
             self._positions[symbol].current_price = price
+            self._persist_state()
             return self._positions[symbol]
         return None
 
@@ -412,6 +431,13 @@ class PositionManager:
             "total_pnl": self.total_pnl,
             "positions": {
                 s: {
+                    # Canonical keys used by API/agent.
+                    "quantity": p.quantity,
+                    "avg_price": p.avg_price,
+                    "current_price": p.current_price,
+                    "unrealized_pnl": p.unrealized_pnl,
+                    "unrealized_pnl_pct": p.unrealized_pnl_pct,
+                    # Backward-compatible aliases retained for existing callers.
                     "qty": p.quantity,
                     "side": p.side.value,
                     "avg": p.avg_price,
@@ -421,6 +447,30 @@ class PositionManager:
                 for s, p in self._positions.items()
             },
         }
+
+    def format_position_summary(self, max_items: int = 5) -> str:
+        """Return a compact multi-line summary for Telegram/status views."""
+        positions = sorted(
+            self._positions.values(),
+            key=lambda position: (abs(position.unrealized_pnl), position.symbol),
+            reverse=True,
+        )
+        if not positions:
+            return "• None"
+
+        capped = max(int(max_items), 1)
+        lines: list[str] = []
+        for position in positions[:capped]:
+            symbol = position.symbol.split(":")[-1].split("-")[0]
+            lines.append(
+                f"• {symbol} {position.side.value.upper()} x{position.quantity} "
+                f"avg {position.avg_price:,.2f} P&L {position.unrealized_pnl:+,.2f}"
+            )
+
+        remaining = len(positions) - capped
+        if remaining > 0:
+            lines.append(f"• +{remaining} more position(s)")
+        return "\n".join(lines)
 
     def get_closed_trades(self) -> List[Dict[str, Any]]:
         """Get history of all closed trades.
@@ -450,3 +500,86 @@ class PositionManager:
         elif side == PositionSide.SHORT:
             return (entry - exit_price) * qty
         return 0.0
+
+    def _persist_state(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            payload = {
+                "total_realized_pnl": float(self._total_realized_pnl),
+                "positions": [self._serialize_position(pos) for pos in self.get_all_positions()],
+                "closed_positions": [self._serialize_closed_trade(trade) for trade in self._closed_positions],
+            }
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._state_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            tmp_path.replace(self._state_path)
+        except Exception as exc:
+            logger.warning("position_manager_persist_failed", error=str(exc))
+
+    def _load_state(self) -> None:
+        if self._state_path is None or not self._state_path.exists():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+            self._total_realized_pnl = float(payload.get("total_realized_pnl", 0.0) or 0.0)
+            self._positions = {}
+            for raw in payload.get("positions", []):
+                position = self._deserialize_position(raw)
+                self._positions[position.symbol] = position
+            self._closed_positions = [
+                self._deserialize_closed_trade(raw)
+                for raw in payload.get("closed_positions", [])
+            ]
+            logger.info(
+                "position_manager_state_loaded",
+                positions=len(self._positions),
+                closed=len(self._closed_positions),
+            )
+        except Exception as exc:
+            logger.warning("position_manager_state_load_failed", error=str(exc))
+
+    @staticmethod
+    def _serialize_position(position: Position) -> dict[str, Any]:
+        return {
+            "symbol": position.symbol,
+            "quantity": int(position.quantity),
+            "side": position.side.value,
+            "avg_price": float(position.avg_price),
+            "current_price": float(position.current_price),
+            "entry_time": position.entry_time.isoformat() if position.entry_time else None,
+            "strategy_tag": position.strategy_tag,
+            "order_ids": list(position.order_ids),
+        }
+
+    @staticmethod
+    def _deserialize_position(payload: dict[str, Any]) -> Position:
+        return Position(
+            symbol=str(payload.get("symbol") or ""),
+            quantity=int(payload.get("quantity") or 0),
+            side=PositionSide(str(payload.get("side") or PositionSide.FLAT.value)),
+            avg_price=float(payload.get("avg_price") or 0.0),
+            current_price=float(payload.get("current_price") or 0.0),
+            entry_time=(
+                datetime.fromisoformat(str(payload["entry_time"]))
+                if payload.get("entry_time")
+                else None
+            ),
+            strategy_tag=str(payload.get("strategy_tag") or ""),
+            order_ids=[str(order_id) for order_id in payload.get("order_ids", [])],
+        )
+
+    @staticmethod
+    def _serialize_closed_trade(payload: dict[str, Any]) -> dict[str, Any]:
+        closed_at = payload.get("closed_at")
+        return {
+            **payload,
+            "closed_at": closed_at.isoformat() if isinstance(closed_at, datetime) else closed_at,
+        }
+
+    @staticmethod
+    def _deserialize_closed_trade(payload: dict[str, Any]) -> dict[str, Any]:
+        restored = dict(payload)
+        if restored.get("closed_at"):
+            restored["closed_at"] = datetime.fromisoformat(str(restored["closed_at"]))
+        return restored

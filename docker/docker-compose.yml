@@ -82,12 +82,28 @@ services:
       # Trading
       TRADING_MODE: ${TRADING_MODE:-paper}
       MAX_DAILY_LOSS_PCT: ${MAX_DAILY_LOSS_PCT:-2.0}
-      MAX_POSITION_SIZE_PCT: ${MAX_POSITION_SIZE_PCT:-5.0}
+      MAX_POSITION_SIZE_PCT: ${MAX_POSITION_SIZE_PCT:-25.0}
       MAX_OPEN_POSITIONS: ${MAX_OPEN_POSITIONS:-3}
-      # Fyers API (optional — pass from host .env)
-      FYERS_APP_ID: ${FYERS_APP_ID:-}
-      FYERS_SECRET_KEY: ${FYERS_SECRET_KEY:-}
-      FYERS_REDIRECT_URI: ${FYERS_REDIRECT_URI:-http://localhost:8000/api/v1/auth/callback}
+      # NOTE: FYERS_APP_ID / FYERS_SECRET_KEY are intentionally NOT set here.
+      # Injecting them as empty OS env vars would permanently override the
+      # /app/data/.env file written by the Settings page (OS vars beat file vars
+      # in pydantic-settings).  Credentials are entered via the UI and stored
+      # in the persistent volume at /app/data/.env.
+      FYERS_REDIRECT_URI: ${FYERS_REDIRECT_URI:-https://trade.fyers.in/api-login/redirect-uri/index.html}
+      # Telegram (leave empty to disable)
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # AI Agent
+      AGENT_AUTO_START: ${AGENT_AUTO_START:-false}
+      AGENT_SCAN_INTERVAL: ${AGENT_SCAN_INTERVAL:-30}
+      AGENT_DEFAULT_TIMEFRAME: ${AGENT_DEFAULT_TIMEFRAME:-5}
+      AGENT_EXECUTION_TIMEFRAMES: ${AGENT_EXECUTION_TIMEFRAMES:-3,5,15}
+      AGENT_REFERENCE_TIMEFRAMES: ${AGENT_REFERENCE_TIMEFRAMES:-60,D}
+      AGENT_DEFAULT_SYMBOLS: ${AGENT_DEFAULT_SYMBOLS:-NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX,NSE:NIFTYMIDCAP50-INDEX,BSE:SENSEX-INDEX}
+      # Persistent data directory — credentials + token file survive container restarts
+      DATA_DIR: /app/data
+    volumes:
+      - nifty_data:/app/data   # .env (Fyers credentials) + .fyers_token.json persist here
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -109,6 +125,9 @@ services:
     build:
       context: ../frontend
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_APP_NAME_BASE: ${NEXT_PUBLIC_APP_NAME_BASE:-AI TRADER}
+        NEXT_PUBLIC_APP_INSTANCE_LABEL: ${NEXT_PUBLIC_APP_INSTANCE_LABEL:-LOCAL}
     container_name: nifty-frontend
     restart: unless-stopped
     ports:
@@ -119,6 +138,8 @@ services:
       # Public URLs for browser-side WebSocket connections (uses host port)
       NEXT_PUBLIC_API_URL: http://localhost:${APP_PORT:-8080}/api/v1
       NEXT_PUBLIC_WS_URL: ws://localhost:${APP_PORT:-8080}/api/v1
+      NEXT_PUBLIC_APP_NAME_BASE: ${NEXT_PUBLIC_APP_NAME_BASE:-AI TRADER}
+      NEXT_PUBLIC_APP_INSTANCE_LABEL: ${NEXT_PUBLIC_APP_INSTANCE_LABEL:-LOCAL}
     depends_on:
       backend:
         condition: service_healthy
@@ -136,6 +157,8 @@ volumes:
     driver: local
   redis_data:
     driver: local
+  nifty_data:
+    driver: local   # persists Fyers credentials (.env) and token (.fyers_token.json)
 
 networks:
   nifty-network:

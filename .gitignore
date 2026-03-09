@@ -4,6 +4,8 @@
 .env.production
 *.pem
 *.key
+.fyers_token*.json
+tmp/
 
 # Python
 __pycache__/
@@ -73,3 +75,5 @@ frontend/dist/
 # Misc
 *.bak
 *.tmp
+*.backup-before-refresh
+.claude/settings.local.json

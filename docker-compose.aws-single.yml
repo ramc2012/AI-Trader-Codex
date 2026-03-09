@@ -1,0 +1,117 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-nifty_trader}
+      POSTGRES_USER: ${DB_USER:-trader}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-trader} -d ${DB_NAME:-nifty_trader}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ${BACKEND_IMAGE:?Set BACKEND_IMAGE}
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /app/data
+      APP_ENV: production
+      APP_DEBUG: "false"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      APP_LOG_LEVEL: "INFO"
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY}
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-nifty_trader}
+      DB_USER: ${DB_USER:-trader}
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: ${REDIS_DB:-0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_STATUS_INTERVAL_MINUTES: ${TELEGRAM_STATUS_INTERVAL_MINUTES:-30}
+      USD_INR_REFERENCE_RATE: ${USD_INR_REFERENCE_RATE:-83.0}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      AGENT_AUTO_START: ${AGENT_AUTO_START:-false}
+      AGENT_SCAN_INTERVAL: ${AGENT_SCAN_INTERVAL:-30}
+      AGENT_DEFAULT_TIMEFRAME: ${AGENT_DEFAULT_TIMEFRAME:-5}
+      AGENT_EXECUTION_TIMEFRAMES: ${AGENT_EXECUTION_TIMEFRAMES:-3,5,15}
+      AGENT_REFERENCE_TIMEFRAMES: ${AGENT_REFERENCE_TIMEFRAMES:-60,D}
+      AGENT_DEFAULT_SYMBOLS: ${AGENT_DEFAULT_SYMBOLS:-NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX,NSE:NIFTYMIDCAP50-INDEX,BSE:SENSEX-INDEX,NSE:RELIANCE-EQ,NSE:TCS-EQ,NSE:INFY-EQ,NSE:HDFCBANK-EQ,NSE:ICICIBANK-EQ,NSE:HINDUNILVR-EQ,NSE:SBIN-EQ,NSE:BHARTIARTL-EQ,NSE:ITC-EQ,NSE:KOTAKBANK-EQ,NSE:LT-EQ,NSE:AXISBANK-EQ,NSE:ASIANPAINT-EQ,NSE:MARUTI-EQ,NSE:BAJFINANCE-EQ,NSE:HCLTECH-EQ,NSE:WIPRO-EQ,NSE:TITAN-EQ,NSE:SUNPHARMA-EQ,NSE:ULTRACEMCO-EQ,NSE:ONGC-EQ,NSE:NTPC-EQ,NSE:POWERGRID-EQ,NSE:NESTLEIND-EQ,NSE:TECHM-EQ,NSE:CIPLA-EQ,NSE:DIVISLAB-EQ,NSE:GRASIM-EQ,NSE:ADANIPORTS-EQ,NSE:BAJAJ-AUTO-EQ,NSE:HEROMOTOCO-EQ,NSE:EICHERMOT-EQ,NSE:APOLLOHOSP-EQ,NSE:TATAMOTORS-EQ,NSE:TATASTEEL-EQ,NSE:JSWSTEEL-EQ,NSE:INDUSINDBK-EQ,NSE:HINDALCO-EQ,NSE:COALINDIA-EQ,NSE:DRREDDY-EQ,NSE:BPCL-EQ,NSE:TATACONSUM-EQ,NSE:BRITANNIA-EQ,NSE:BAJAJFINSV-EQ,NSE:SHREECEM-EQ,NSE:SBILIFE-EQ,NSE:HDFCLIFE-EQ,NSE:ADANIENT-EQ,NSE:LTIM-EQ,NSE:MM-EQ}
+      AGENT_US_SYMBOLS: ${AGENT_US_SYMBOLS:-US:SPY,US:QQQ,US:DIA,US:IWM,US:AAPL,US:AMZN,US:JPM,US:XOM,US:UNH,US:CAT}
+      AGENT_CRYPTO_SYMBOLS: ${AGENT_CRYPTO_SYMBOLS:-CRYPTO:BTCUSDT,CRYPTO:ETHUSDT,CRYPTO:BNBUSDT,CRYPTO:SOLUSDT,CRYPTO:XRPUSDT,CRYPTO:ADAUSDT,CRYPTO:DOGEUSDT,CRYPTO:AVAXUSDT,CRYPTO:DOTUSDT,CRYPTO:LINKUSDT}
+      AGENT_TRADE_NSE_WHEN_OPEN: ${AGENT_TRADE_NSE_WHEN_OPEN:-true}
+      AGENT_TRADE_US_WHEN_OPEN: ${AGENT_TRADE_US_WHEN_OPEN:-true}
+      AGENT_TRADE_US_OPTIONS: ${AGENT_TRADE_US_OPTIONS:-true}
+      AGENT_TRADE_CRYPTO_24X7: ${AGENT_TRADE_CRYPTO_24X7:-true}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      ALPHAVANTAGE_API_KEY: ${ALPHAVANTAGE_API_KEY:-}
+      FYERS_APP_ID: ${FYERS_APP_ID:-}
+      FYERS_SECRET_KEY: ${FYERS_SECRET_KEY:-}
+      FYERS_REDIRECT_URI: ${FYERS_REDIRECT_URI:-https://trade.fyers.in/api-login/redirect-uri/index.html}
+      FYERS_REDIRECT_FRONTEND_URL: ${FYERS_REDIRECT_FRONTEND_URL:-http://${PUBLIC_HOST}/settings}
+    volumes:
+      - ./backend_data:/app/data
+    expose:
+      - "8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?Set FRONTEND_IMAGE}
+    restart: unless-stopped
+    environment:
+      API_HOST: backend
+      NEXT_PUBLIC_API_URL: /api/v1
+      NEXT_PUBLIC_WS_URL: ws://${PUBLIC_HOST}/api/v1
+      NEXT_PUBLIC_APP_NAME_BASE: ${NEXT_PUBLIC_APP_NAME_BASE:-AI TRADER}
+      NEXT_PUBLIC_APP_INSTANCE_LABEL: ${NEXT_PUBLIC_APP_INSTANCE_LABEL:-AWS}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-80}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000', (r) => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  timescaledb_data:
+    driver: local
+  redis_data:
+    driver: local

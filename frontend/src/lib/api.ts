@@ -9,7 +9,16 @@ export async function apiFetch<T>(
     ...options,
   });
   if (!res.ok) {
-    throw new Error(`API error: ${res.status} ${res.statusText}`);
+    let detail = '';
+    try {
+      const payload = await res.clone().json() as { detail?: string; message?: string };
+      detail = payload.detail || payload.message || '';
+    } catch {
+      detail = '';
+    }
+    throw new Error(
+      detail ? `API error: ${res.status} ${detail}` : `API error: ${res.status} ${res.statusText}`
+    );
   }
   return res.json();
 }

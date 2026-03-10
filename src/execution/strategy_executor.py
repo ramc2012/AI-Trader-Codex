@@ -228,10 +228,9 @@ class StrategyExecutor:
             return signals[-1:]  # First run: act only on latest signal
 
         filtered = [sig for ts, sig in ts_signals if ts is None or ts > last_ts]
-        newest_filtered = max(
-            (self._signal_timestamp(s) for s in filtered if self._signal_timestamp(s) is not None),
-            default=None,
-        )
+        # Reuse pre-computed timestamps from ts_signals to avoid re-computing per filtered signal
+        filtered_ts = [ts for ts, sig in ts_signals if (ts is None or ts > last_ts) and ts is not None]
+        newest_filtered = max(filtered_ts, default=None)
         if newest_filtered is not None:
             state.last_symbol_signal_time[symbol or "__global__"] = newest_filtered
         return filtered

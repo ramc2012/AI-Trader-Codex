@@ -1,6 +1,6 @@
 'use client';
 
-import { type ReactNode, useMemo, useState } from 'react';
+import { Fragment, type ReactNode, useMemo, useState } from 'react';
 import {
   Activity,
   ArrowDownRight,
@@ -124,6 +124,74 @@ function buildMarketTotals(portfolio?: PortfolioSummary) {
       }
       return right.openPositions - left.openPositions;
     });
+}
+
+function marketSectionLabel(market: string): string {
+  const token = String(market || '').toUpperCase();
+  if (token === 'NSE') return 'India / NSE';
+  if (token === 'BSE') return 'India / BSE';
+  if (token === 'US') return 'US';
+  if (token === 'CRYPTO') return 'Crypto';
+  return token || 'Other';
+}
+
+function buildPositionGroups(rows: Position[]) {
+  const groups = new Map<
+    string,
+    {
+      market: string;
+      label: string;
+      live: boolean;
+      currency: string;
+      positions: Position[];
+      positionCount: number;
+      totalQuantity: number;
+      marketValue: number;
+      marketValueInr: number;
+      unrealizedPnl: number;
+      unrealizedPnlInr: number;
+    }
+  >();
+
+  for (const position of rows) {
+    const market = String(position.market || 'OTHER').toUpperCase();
+    const group =
+      groups.get(market) ??
+      {
+        market,
+        label: marketSectionLabel(market),
+        live: false,
+        currency: position.currency ?? 'INR',
+        positions: [],
+        positionCount: 0,
+        totalQuantity: 0,
+        marketValue: 0,
+        marketValueInr: 0,
+        unrealizedPnl: 0,
+        unrealizedPnlInr: 0,
+      };
+
+    group.live = group.live || !!position.market_open;
+    group.positions.push(position);
+    group.positionCount += 1;
+    group.totalQuantity += Number(position.quantity ?? 0);
+    group.marketValue += Number(position.market_value ?? 0);
+    group.marketValueInr += Number(position.market_value_inr ?? position.market_value ?? 0);
+    group.unrealizedPnl += Number(position.unrealized_pnl ?? 0);
+    group.unrealizedPnlInr += Number(position.unrealized_pnl_inr ?? position.unrealized_pnl ?? 0);
+    groups.set(market, group);
+  }
+
+  return [...groups.values()].sort((left, right) => {
+    if (left.live !== right.live) {
+      return left.live ? -1 : 1;
+    }
+    const marketDelta = marketPriority(left.market) - marketPriority(right.market);
+    if (marketDelta !== 0) {
+      return marketDelta;
+    }
+    return right.positionCount - left.positionCount;
+  });
 }
 
 function buildTradeStats(rows: TradePair[]) {
@@ -434,6 +502,7 @@ export default function PositionsPage() {
   const { data: orderPairs, isLoading: historyLoading, error: historyError } = useOrderPairs();
 
   const sortedPositions = useMemo(() => sortPositions(positions ?? []), [positions]);
+  const positionGroups = useMemo(() => buildPositionGroups(sortedPositions), [sortedPositions]);
   const marketTotals = useMemo(() => buildMarketTotals(portfolio), [portfolio]);
   const historyRows = useMemo(
     () => [...(orderPairs ?? [])].sort((left, right) => tradeActivityTime(right) - tradeActivityTime(left)),
@@ -566,136 +635,209 @@ export default function PositionsPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {sortedPositions.map((position) => {
-                        const pnlInr = position.unrealized_pnl_inr ?? position.unrealized_pnl;
-                        const movePct = positionMovePct(position);
-                        const hasPlan =
-                          position.stop_loss !== null &&
-                          position.stop_loss !== undefined &&
-                          position.target !== null &&
-                          position.target !== undefined;
-                        const progress = Math.min(Math.max(position.progress_to_target_pct ?? 0, 4), 100);
-
-                        return (
-                          <tr
-                            key={`${position.symbol}-${position.side}-${position.entry_time ?? 'open'}`}
-                            onClick={() => setSelectedPosition(position)}
-                            className={cn(
-                              'cursor-pointer border-b border-slate-800/80 text-slate-300 transition-colors hover:bg-slate-800/35',
-                              position.market_open ? 'bg-emerald-500/[0.03]' : ''
-                            )}
-                          >
-                            <td className="py-3 pr-4">
-                              <div className="font-medium text-slate-100">{position.symbol}</div>
-                              <div className="mt-1 flex items-center gap-2 text-xs text-slate-500">
-                                <MarketBadge market={position.market} live={position.market_open} />
-                                <span>{position.entry_time ? formatDateTime(position.entry_time) : '--'}</span>
-                              </div>
-                            </td>
-                            <td className="py-3 pr-4">
-                              <SideBadge side={position.side} />
-                            </td>
-                            <td className="py-3 pr-4 text-right">{formatNumber(position.quantity)}</td>
-                            <td className="py-3 pr-4 text-right">
-                              {formatCurrency(position.avg_price, position.currency ?? 'INR')}
-                            </td>
-                            <td className="py-3 pr-4 text-right">
-                              <div>{formatCurrency(position.current_price, position.currency ?? 'INR')}</div>
-                              <div className="mt-1 text-xs text-slate-500">
-                                {formatCurrency(position.market_value_inr ?? position.market_value, 'INR')}
-                              </div>
-                            </td>
-                            <td className="py-3 pr-4 text-right">
-                              <div className={cn('inline-flex items-center gap-1', movePct >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
-                                {movePct >= 0 ? (
-                                  <ArrowUpRight className="h-3.5 w-3.5" />
-                                ) : (
-                                  <ArrowDownRight className="h-3.5 w-3.5" />
-                                )}
-                                <span>{formatPercent(movePct, 2)}</span>
-                              </div>
-                            </td>
-                            <td className="py-3 pr-4 text-right">
-                              <div className={cn('font-medium', pnlInr >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
-                                {formatCurrency(pnlInr, 'INR')}
-                              </div>
-                              <div className="mt-1 text-xs text-slate-500">
-                                {formatPercent(position.unrealized_pnl_pct, 2)}
-                              </div>
-                            </td>
-                            <td className="py-3 pr-4">
-                              {hasPlan ? (
-                                <div className="space-y-1 text-xs">
-                                  <div className="text-slate-200">
-                                    {formatCurrency(position.stop_loss ?? 0, position.currency ?? 'INR')}
-                                  </div>
-                                  <div className="text-slate-500">
-                                    {position.distance_to_stop_pct !== null && position.distance_to_stop_pct !== undefined
-                                      ? formatPercent(position.distance_to_stop_pct, 2)
-                                      : '--'}
-                                  </div>
-                                </div>
-                              ) : (
-                                <span className="text-xs text-slate-500">--</span>
-                              )}
-                            </td>
-                            <td className="py-3 pr-4">
-                              {hasPlan ? (
-                                <div className="space-y-1 text-xs">
-                                  <div className="text-slate-200">
-                                    {formatCurrency(position.target ?? 0, position.currency ?? 'INR')}
-                                  </div>
-                                  <div className="text-slate-500">
-                                    {position.distance_to_target_pct !== null &&
-                                    position.distance_to_target_pct !== undefined
-                                      ? formatPercent(position.distance_to_target_pct, 2)
-                                      : '--'}
-                                  </div>
-                                </div>
-                              ) : (
-                                <span className="text-xs text-slate-500">--</span>
-                              )}
-                            </td>
-                            <td className="py-3 pr-4">
-                              <div className="min-w-[120px]">
-                                <div className="flex items-center gap-1 text-xs text-slate-400">
-                                  <Clock3 className="h-3.5 w-3.5" />
-                                  <span>{position.time_exit_at ? `T-${formatTimeLeft(position.time_left_seconds)}` : '--'}</span>
-                                </div>
-                                {hasPlan ? (
-                                  <>
-                                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
-                                      <div
-                                        className={cn(
-                                          'h-full rounded-full',
-                                          (position.progress_to_target_pct ?? 0) >= 70
-                                            ? 'bg-emerald-400'
-                                            : (position.progress_to_target_pct ?? 0) >= 35
-                                              ? 'bg-amber-400'
-                                              : 'bg-sky-400'
-                                        )}
-                                        style={{ width: `${progress}%` }}
-                                      />
+                      {positionGroups.map((group) => (
+                        <Fragment key={group.market}>
+                          <tr>
+                            <td colSpan={12} className="px-0 pt-4 pb-2">
+                              <div className="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3">
+                                <div className="flex items-center gap-3">
+                                  <MarketBadge market={group.market} live={group.live} />
+                                  <div>
+                                    <div className="text-sm font-semibold text-slate-100">{group.label}</div>
+                                    <div className="text-xs text-slate-500">
+                                      {formatNumber(group.positionCount)} open positions
                                     </div>
-                                    <div className="mt-1 text-[11px] text-slate-500">
-                                      {position.progress_to_target_pct !== null &&
-                                      position.progress_to_target_pct !== undefined
-                                        ? `${formatNumber(position.progress_to_target_pct, 0)}%`
-                                        : '--'}
-                                    </div>
-                                  </>
-                                ) : (
-                                  <div className="mt-1 text-[11px] text-slate-500">No plan</div>
-                                )}
+                                  </div>
+                                </div>
+                                <div className="text-right text-xs text-slate-500">
+                                  <div>Qty {formatNumber(group.totalQuantity)}</div>
+                                  <div>Value {formatCurrency(group.marketValueInr, 'INR')}</div>
+                                </div>
                               </div>
-                            </td>
-                            <td className="py-3 pr-4 text-xs text-slate-400">{position.strategy_tag || 'Manual'}</td>
-                            <td className="py-3 text-xs text-slate-500">
-                              {position.order_ids?.length ? position.order_ids.join(', ') : '--'}
                             </td>
                           </tr>
-                        );
-                      })}
+                          {group.positions.map((position) => {
+                            const pnlInr = position.unrealized_pnl_inr ?? position.unrealized_pnl;
+                            const movePct = positionMovePct(position);
+                            const hasPlan =
+                              position.stop_loss !== null &&
+                              position.stop_loss !== undefined &&
+                              position.target !== null &&
+                              position.target !== undefined;
+                            const progress = Math.min(Math.max(position.progress_to_target_pct ?? 0, 4), 100);
+
+                            return (
+                              <tr
+                                key={`${position.symbol}-${position.side}-${position.entry_time ?? 'open'}`}
+                                onClick={() => setSelectedPosition(position)}
+                                className={cn(
+                                  'cursor-pointer border-b border-slate-800/80 text-slate-300 transition-colors hover:bg-slate-800/35',
+                                  position.market_open ? 'bg-emerald-500/[0.03]' : ''
+                                )}
+                              >
+                                <td className="py-3 pr-4">
+                                  <div className="font-medium text-slate-100">{position.symbol}</div>
+                                  <div className="mt-1 flex items-center gap-2 text-xs text-slate-500">
+                                    <MarketBadge market={position.market} live={position.market_open} />
+                                    <span>{position.entry_time ? formatDateTime(position.entry_time) : '--'}</span>
+                                  </div>
+                                </td>
+                                <td className="py-3 pr-4">
+                                  <SideBadge side={position.side} />
+                                </td>
+                                <td className="py-3 pr-4 text-right">{formatNumber(position.quantity)}</td>
+                                <td className="py-3 pr-4 text-right">
+                                  {formatCurrency(position.avg_price, position.currency ?? 'INR')}
+                                </td>
+                                <td className="py-3 pr-4 text-right">
+                                  <div>{formatCurrency(position.current_price, position.currency ?? 'INR')}</div>
+                                  <div className="mt-1 text-xs text-slate-500">
+                                    {formatCurrency(position.market_value_inr ?? position.market_value, 'INR')}
+                                  </div>
+                                </td>
+                                <td className="py-3 pr-4 text-right">
+                                  <div
+                                    className={cn(
+                                      'inline-flex items-center gap-1',
+                                      movePct >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                                    )}
+                                  >
+                                    {movePct >= 0 ? (
+                                      <ArrowUpRight className="h-3.5 w-3.5" />
+                                    ) : (
+                                      <ArrowDownRight className="h-3.5 w-3.5" />
+                                    )}
+                                    <span>{formatPercent(movePct, 2)}</span>
+                                  </div>
+                                </td>
+                                <td className="py-3 pr-4 text-right">
+                                  <div className={cn('font-medium', pnlInr >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                                    {formatCurrency(pnlInr, 'INR')}
+                                  </div>
+                                  <div className="mt-1 text-xs text-slate-500">
+                                    {formatPercent(position.unrealized_pnl_pct, 2)}
+                                  </div>
+                                </td>
+                                <td className="py-3 pr-4">
+                                  {hasPlan ? (
+                                    <div className="space-y-1 text-xs">
+                                      <div className="text-slate-200">
+                                        {formatCurrency(position.stop_loss ?? 0, position.currency ?? 'INR')}
+                                      </div>
+                                      <div className="text-slate-500">
+                                        {position.distance_to_stop_pct !== null && position.distance_to_stop_pct !== undefined
+                                          ? formatPercent(position.distance_to_stop_pct, 2)
+                                          : '--'}
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <span className="text-xs text-slate-500">--</span>
+                                  )}
+                                </td>
+                                <td className="py-3 pr-4">
+                                  {hasPlan ? (
+                                    <div className="space-y-1 text-xs">
+                                      <div className="text-slate-200">
+                                        {formatCurrency(position.target ?? 0, position.currency ?? 'INR')}
+                                      </div>
+                                      <div className="text-slate-500">
+                                        {position.distance_to_target_pct !== null &&
+                                        position.distance_to_target_pct !== undefined
+                                          ? formatPercent(position.distance_to_target_pct, 2)
+                                          : '--'}
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <span className="text-xs text-slate-500">--</span>
+                                  )}
+                                </td>
+                                <td className="py-3 pr-4">
+                                  <div className="min-w-[120px]">
+                                    <div className="flex items-center gap-1 text-xs text-slate-400">
+                                      <Clock3 className="h-3.5 w-3.5" />
+                                      <span>{position.time_exit_at ? `T-${formatTimeLeft(position.time_left_seconds)}` : '--'}</span>
+                                    </div>
+                                    {hasPlan ? (
+                                      <>
+                                        <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-800">
+                                          <div
+                                            className={cn(
+                                              'h-full rounded-full',
+                                              (position.progress_to_target_pct ?? 0) >= 70
+                                                ? 'bg-emerald-400'
+                                                : (position.progress_to_target_pct ?? 0) >= 35
+                                                  ? 'bg-amber-400'
+                                                  : 'bg-sky-400'
+                                            )}
+                                            style={{ width: `${progress}%` }}
+                                          />
+                                        </div>
+                                        <div className="mt-1 text-[11px] text-slate-500">
+                                          {position.progress_to_target_pct !== null &&
+                                          position.progress_to_target_pct !== undefined
+                                            ? `${formatNumber(position.progress_to_target_pct, 0)}%`
+                                            : '--'}
+                                        </div>
+                                      </>
+                                    ) : (
+                                      <div className="mt-1 text-[11px] text-slate-500">No plan</div>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="py-3 pr-4 text-xs text-slate-400">{position.strategy_tag || 'Manual'}</td>
+                                <td className="py-3 text-xs text-slate-500">
+                                  {position.order_ids?.length ? position.order_ids.join(', ') : '--'}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                          <tr>
+                            <td colSpan={12} className="px-0 pt-2 pb-4">
+                              <div className="grid grid-cols-1 gap-3 rounded-2xl border border-slate-800/80 bg-slate-950/65 px-4 py-3 sm:grid-cols-2 xl:grid-cols-4">
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Subtotal</div>
+                                  <div className="mt-1 text-sm font-medium text-slate-100">
+                                    {formatNumber(group.positionCount)} positions
+                                  </div>
+                                </div>
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Total Qty</div>
+                                  <div className="mt-1 text-sm font-medium text-slate-100">
+                                    {formatNumber(group.totalQuantity)}
+                                  </div>
+                                </div>
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Market Value</div>
+                                  <div className="mt-1 text-sm font-medium text-slate-100">
+                                    {formatCurrency(group.marketValue, group.currency)}
+                                  </div>
+                                  {group.currency !== 'INR' && (
+                                    <div className="mt-1 text-xs text-slate-500">
+                                      {formatCurrency(group.marketValueInr, 'INR')}
+                                    </div>
+                                  )}
+                                </div>
+                                <div>
+                                  <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">U/P&amp;L</div>
+                                  <div
+                                    className={cn(
+                                      'mt-1 text-sm font-medium',
+                                      group.unrealizedPnlInr >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                                    )}
+                                  >
+                                    {formatCurrency(group.unrealizedPnl, group.currency)}
+                                  </div>
+                                  {group.currency !== 'INR' && (
+                                    <div className="mt-1 text-xs text-slate-500">
+                                      {formatCurrency(group.unrealizedPnlInr, 'INR')}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        </Fragment>
+                      ))}
                     </tbody>
                   </table>
                 </div>

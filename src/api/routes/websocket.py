@@ -120,8 +120,10 @@ async def dashboard_ws(websocket: WebSocket) -> None:
             await dashboard_manager.send_json(websocket, payload)
             await asyncio.sleep(1.0)
     except WebSocketDisconnect:
-        dashboard_manager.disconnect(websocket)
+        pass
     except Exception:
+        logger.exception("dashboard_ws_error")
+    finally:
         dashboard_manager.disconnect(websocket)
 
 
@@ -151,9 +153,10 @@ async def tick_ws(websocket: WebSocket, symbol: str) -> None:
                 }
             await tick_manager.send_json(websocket, payload)
     except WebSocketDisconnect:
-        runtime.broker.unsubscribe(topic, queue)
-        tick_manager.disconnect(websocket)
+        pass
     except Exception:
+        logger.exception("tick_ws_error", symbol=symbol)
+    finally:
         runtime.broker.unsubscribe(topic, queue)
         tick_manager.disconnect(websocket)
 
@@ -207,8 +210,10 @@ async def options_chain_ws(websocket: WebSocket, underlying: str) -> None:
                     )
             await asyncio.sleep(2.0)
     except WebSocketDisconnect:
-        options_manager.disconnect(websocket)
+        pass
     except Exception:
+        logger.exception("options_chain_ws_error", underlying=resolved_underlying)
+    finally:
         options_manager.disconnect(websocket)
 
 
@@ -274,8 +279,10 @@ async def charts_ws(websocket: WebSocket, instrument: str) -> None:
                     )
             await asyncio.sleep(2.0)
     except WebSocketDisconnect:
-        charts_manager.disconnect(websocket)
+        pass
     except Exception:
+        logger.exception("charts_ws_error", instrument=instrument)
+    finally:
         charts_manager.disconnect(websocket)
 
 
@@ -350,9 +357,10 @@ async def agent_ws(websocket: WebSocket) -> None:
                     "timestamp": datetime.now(tz=IST).isoformat(),
                 })
     except WebSocketDisconnect:
-        event_bus.unsubscribe(queue)
-        agent_manager.disconnect(websocket)
+        pass
     except Exception:
+        logger.exception("agent_ws_error")
+    finally:
         event_bus.unsubscribe(queue)
         agent_manager.disconnect(websocket)
 
@@ -376,6 +384,7 @@ def _build_dashboard_payload() -> Dict[str, Any]:
             usd_inr_rate=float(settings.usd_inr_reference_rate),
         )
     except Exception:
+        logger.warning("dashboard_portfolio_build_failed", exc_info=True)
         portfolio = {
             "position_count": 0,
             "total_market_value": 0.0,
@@ -397,6 +406,7 @@ def _build_dashboard_payload() -> Dict[str, Any]:
         rm = get_risk_manager()
         risk = rm.get_risk_summary()
     except Exception:
+        logger.warning("dashboard_risk_build_failed", exc_info=True)
         risk = {
             "circuit_breaker_triggered": False,
             "emergency_stop": False,
@@ -407,6 +417,7 @@ def _build_dashboard_payload() -> Dict[str, Any]:
         am = get_alert_manager()
         alert_counts = am.get_alert_counts()
     except Exception:
+        logger.warning("dashboard_alerts_build_failed", exc_info=True)
         alert_counts = {
             "info": 0,
             "warning": 0,

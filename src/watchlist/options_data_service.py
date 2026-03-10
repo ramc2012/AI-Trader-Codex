@@ -133,14 +133,19 @@ class OptionsDataService:
             if ts:
                 expiry_map[ts] = str(row.get("date", ""))
 
+        now_ts = int(fetched_at.timestamp())
         target_expiries: list[int] = []
         if expiry_ts:
             target_expiries = [expiry_ts]
         else:
-            for row in expiry_rows[:include_expiries]:
+            valid_count = 0
+            for row in expiry_rows:
                 ts = _safe_int(row.get("expiry"))
-                if ts:
+                if ts and ts > now_ts:  # Only include future (non-expired) expirations
                     target_expiries.append(ts)
+                    valid_count += 1
+                    if valid_count >= include_expiries:
+                        break
 
         if not target_expiries:
             logger.warning("option_chain_no_expiries", underlying=underlying)

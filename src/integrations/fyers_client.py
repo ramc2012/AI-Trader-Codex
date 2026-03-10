@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -222,6 +224,8 @@ class FyersClient:
             data["refresh_token_expires_at"] = self._refresh_token_expires_at
 
         self._token_path.write_text(json.dumps(data, indent=2))
+        # Restrict token file to owner read/write only (security hardening)
+        os.chmod(self._token_path, stat.S_IRUSR | stat.S_IWUSR)
         logger.debug("token_saved", path=str(self._token_path), has_refresh=bool(self._refresh_token))
 
     def _load_token(self) -> None:

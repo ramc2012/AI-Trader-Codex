@@ -11,7 +11,7 @@ import {
   Wifi,
   WifiOff,
 } from 'lucide-react';
-import { AreaChart, Area, XAxis, YAxis, ResponsiveContainer, Tooltip } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, Tooltip } from 'recharts';
 import { useQuery } from '@tanstack/react-query';
 import { usePortfolio } from '@/hooks/use-portfolio';
 import { useRiskSummary } from '@/hooks/use-risk-summary';
@@ -20,6 +20,7 @@ import { useAlertCounts } from '@/hooks/use-alerts';
 import { useDashboardWS } from '@/hooks/use-dashboard-ws';
 import { apiFetch } from '@/lib/api';
 import { formatINR, formatPercent } from '@/lib/formatters';
+import { buildEquityChartData, equityChartWidth } from '@/lib/equity-chart';
 import { cn } from '@/lib/utils';
 import { Skeleton } from '@/components/ui/skeleton';
 import type { EquitySnapshot } from '@/types/api';
@@ -33,10 +34,13 @@ function useValueChange(value: string) {
 
   useEffect(() => {
     if (prevRef.current !== value && prevRef.current !== '') {
-      setChanged(true);
       prevRef.current = value;
-      const timer = setTimeout(() => setChanged(false), 600);
-      return () => clearTimeout(timer);
+      const startTimer = setTimeout(() => setChanged(true), 0);
+      const resetTimer = setTimeout(() => setChanged(false), 600);
+      return () => {
+        clearTimeout(startTimer);
+        clearTimeout(resetTimer);
+      };
     }
     prevRef.current = value;
   }, [value]);
@@ -93,6 +97,7 @@ function StatCard({
 }
 
 export default function DashboardPage() {
+  const [equityPeriod, setEquityPeriod] = useState<'daily' | 'week' | 'month' | 'year'>('daily');
   const { data: portfolio, isLoading: portfolioLoading } = usePortfolio();
   const { data: risk, isLoading: riskLoading } = useRiskSummary();
   const { data: strategies, isLoading: strategiesLoading } = useStrategies();
@@ -103,8 +108,8 @@ export default function DashboardPage() {
 
   // Fetch equity curve from API (or use live WS snapshots)
   const { data: equityCurveApi } = useQuery<EquitySnapshot[]>({
-    queryKey: ['equity-curve'],
-    queryFn: () => apiFetch<EquitySnapshot[]>('/portfolio/equity-curve'),
+    queryKey: ['equity-curve', equityPeriod],
+    queryFn: () => apiFetch<EquitySnapshot[]>(`/portfolio/equity-curve?period=${encodeURIComponent(equityPeriod)}`),
     refetchInterval: 10000,
   });
   const { data: equityCurveLive } = useQuery<EquitySnapshot[]>({
@@ -113,27 +118,12 @@ export default function DashboardPage() {
   });
 
   // Use live data if available, else API data, else empty
-  const equityCurveData = (equityCurveLive && equityCurveLive.length > 1)
-    ? equityCurveLive.map((s) => ({
-        time: new Date(s.time).toLocaleTimeString('en-IN', {
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false,
-          timeZone: 'Asia/Kolkata',
-        }),
-        value: s.value,
-      }))
-    : (equityCurveApi ?? []).map((s) => ({
-        time: new Date(s.time).toLocaleTimeString('en-IN', {
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false,
-          timeZone: 'Asia/Kolkata',
-        }),
-        value: s.value,
-      }));
+  const equityCurveData = buildEquityChartData(equityCurveApi, equityCurveLive, equityPeriod);
+  const chartWidth = equityChartWidth(equityCurveData.length);
 
   const totalPnl = portfolio?.total_pnl_inr ?? portfolio?.total_pnl ?? 0;
+  const totalAllocatedCapital = portfolio?.total_allocated_capital_inr ?? 0;
+  const totalPnlPct = portfolio?.total_pnl_pct_on_allocated ?? 0;
   const pnlColor = totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400';
   const PnlIcon = totalPnl >= 0 ? TrendingUp : TrendingDown;
 
@@ -183,19 +173,19 @@ export default function DashboardPage() {
       {/* Stat cards grid */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
         <StatCard
-          title="Portfolio Value"
-          value={formatINR(portfolio?.total_market_value_inr ?? portfolio?.total_market_value ?? 0)}
-          subtitle={`${portfolio?.position_count ?? 0} positions`}
+          title="Allocated Capital"
+          value={formatINR(totalAllocatedCapital)}
+          subtitle={`${portfolio?.position_count ?? 0} positions across all markets`}
           icon={Briefcase}
           isLoading={portfolioLoading}
         />
 
         <StatCard
-          title="Daily P&L"
+          title="Total P&L"
           value={formatINR(totalPnl)}
           subtitle={
             portfolio
-              ? `Realized: ${formatINR(portfolio.total_realized_pnl_inr ?? portfolio.total_realized_pnl)} | Unrealized: ${formatINR(portfolio.total_unrealized_pnl_inr ?? portfolio.total_unrealized_pnl)}`
+              ? `${formatPercent(totalPnlPct)} on capital | Realized ${formatINR(portfolio.total_realized_pnl_inr ?? portfolio.total_realized_pnl)}`
               : undefined
           }
           icon={PnlIcon}
@@ -206,7 +196,7 @@ export default function DashboardPage() {
         <StatCard
           title="Open Positions"
           value={String(risk?.open_positions ?? 0)}
-          subtitle={`Max: ${risk?.max_open_positions ?? 0}`}
+          subtitle="Currently open trade groups across active markets"
           icon={Briefcase}
           isLoading={riskLoading}
         />
@@ -241,19 +231,37 @@ export default function DashboardPage() {
       {/* Equity curve */}
       <div className="rounded-xl border border-slate-800 bg-slate-900 p-5">
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-medium text-slate-400">
-            Equity Curve
-          </h3>
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-medium text-slate-400">
+              Equity Curve
+            </h3>
+            <div className="flex items-center gap-1 rounded-lg border border-slate-800 bg-slate-950/70 p-1">
+              {(['daily', 'week', 'month', 'year'] as const).map((period) => (
+                <button
+                  key={period}
+                  type="button"
+                  onClick={() => setEquityPeriod(period)}
+                  className={cn(
+                    'rounded px-2 py-1 text-[11px] uppercase tracking-[0.12em]',
+                    equityPeriod === period
+                      ? 'bg-emerald-500/10 text-emerald-200'
+                      : 'text-slate-400 hover:text-slate-200'
+                  )}
+                >
+                  {period}
+                </button>
+              ))}
+            </div>
+          </div>
           {equityCurveLive && equityCurveLive.length > 1 && (
             <span className="text-xs text-emerald-500">
               {equityCurveLive.length} live snapshots
             </span>
           )}
         </div>
-        <div className="h-64">
+        <div className="h-64 overflow-x-auto">
           {equityCurveData.length > 0 ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={equityCurveData}>
+            <AreaChart width={chartWidth} height={256} data={equityCurveData}>
                 <defs>
                   <linearGradient id="equityGradient" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
@@ -261,7 +269,7 @@ export default function DashboardPage() {
                   </linearGradient>
                 </defs>
                 <XAxis
-                  dataKey="time"
+                  dataKey="label"
                   stroke="#475569"
                   fontSize={12}
                   tickLine={false}
@@ -281,6 +289,18 @@ export default function DashboardPage() {
                     borderRadius: '8px',
                     color: '#f1f5f9',
                   }}
+                  labelFormatter={(_, payload) =>
+                    payload?.[0]?.payload?.isoTime
+                      ? new Date(String(payload[0].payload.isoTime)).toLocaleString('en-IN', {
+                          day: '2-digit',
+                          month: 'short',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          hour12: false,
+                          timeZone: 'Asia/Kolkata',
+                        })
+                      : ''
+                  }
                   formatter={(val) => [formatINR(Number(val)), 'Value']}
                 />
                 <Area
@@ -291,13 +311,60 @@ export default function DashboardPage() {
                   fill="url(#equityGradient)"
                   isAnimationActive={false}
                 />
-              </AreaChart>
-            </ResponsiveContainer>
+            </AreaChart>
           ) : (
             <div className="flex h-full items-center justify-center text-sm text-slate-500">
               Equity data will appear once trading begins
             </div>
           )}
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-slate-800 bg-slate-900 p-5">
+        <div className="mb-4">
+          <h3 className="text-sm font-medium text-slate-400">Market Overview</h3>
+        </div>
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+          {Object.entries(portfolio?.market_breakdown ?? {}).map(([market, row]) => (
+            <div key={market} className="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-semibold text-slate-100">{row.label ?? market}</div>
+                <div className="text-xs text-slate-500">{row.open_positions ?? 0} open</div>
+              </div>
+              <div className="mt-3 text-[11px] uppercase tracking-[0.18em] text-slate-500">Exposure</div>
+              <div className="mt-1 text-lg font-semibold text-slate-100">
+                {row.currency === 'USD'
+                  ? `${row.currency_symbol}${Number(row.market_value ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2, minimumFractionDigits: 2 })}`
+                  : formatINR(Number(row.market_value_inr ?? 0))}
+              </div>
+              <div className="mt-3 text-[11px] uppercase tracking-[0.18em] text-slate-500">Net P&L</div>
+              <div className={cn('mt-1 text-sm font-medium', Number(row.net_pnl_inr ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                {row.currency === 'USD'
+                  ? `${row.currency_symbol}${Number(row.net_pnl ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2, minimumFractionDigits: 2 })}`
+                  : formatINR(Number(row.net_pnl_inr ?? 0))}
+              </div>
+              <div className="mt-3 grid grid-cols-3 gap-2 text-xs text-slate-400">
+                <div>
+                  <div className="text-slate-500">Allocated</div>
+                  <div className="mt-1 text-slate-200">
+                    {row.currency === 'USD'
+                      ? `${row.currency_symbol}${Number(row.allocated_capital ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`
+                      : formatINR(Number(row.allocated_capital_inr ?? 0))}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-slate-500">Used</div>
+                  <div className="mt-1 text-slate-200">{formatPercent(Number(row.capital_used_pct ?? 0), 1)}</div>
+                </div>
+                <div>
+                  <div className="text-slate-500">P&L %</div>
+                  <div className={cn('mt-1', Number(row.pnl_pct_on_allocated ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                    {formatPercent(Number(row.pnl_pct_on_allocated ?? 0), 2)}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
         </div>
       </div>
     </div>

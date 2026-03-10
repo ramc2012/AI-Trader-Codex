@@ -14,7 +14,7 @@ import { useSignals } from '@/hooks/use-signals';
 import { useStrategies } from '@/hooks/use-strategies';
 import { formatDateTime, formatINR } from '@/lib/formatters';
 import { cn } from '@/lib/utils';
-import type { AgentInspectorStrategy, AgentStrategySettingField } from '@/types/api';
+import type { AgentInspectorStrategy, AgentStrategySettingField, PerformanceStats } from '@/types/api';
 
 function formatNumber(value: unknown, digits = 2): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -215,7 +215,10 @@ function StrategySettingsForm({
 function StrategyCard({
   name,
   summary,
-  stats,
+  overallStats,
+  marketStats,
+  instrumentStatsMap,
+  selectedSymbol,
   inspector,
   onToggle,
   togglePending,
@@ -224,26 +227,31 @@ function StrategyCard({
 }: {
   name: string;
   summary?: { enabled: boolean; signals: number; trades: number; pnl: number };
-  stats?: {
-    signals: number;
-    entries: number;
-    closed_trades: number;
-    wins: number;
-    losses: number;
-    win_rate_pct: number;
-    realized_pnl_inr: number;
-    unrealized_pnl_inr: number;
-    net_pnl_inr: number;
-    open_positions: number;
-  };
+  overallStats?: PerformanceStats;
+  marketStats?: Record<string, PerformanceStats>;
+  instrumentStatsMap?: Record<string, PerformanceStats>;
+  selectedSymbol: string;
   inspector?: AgentInspectorStrategy;
   onToggle: (name: string, enabled: boolean) => void;
   togglePending: boolean;
   savePending: boolean;
   onSaveSettings: (strategyName: string, values: Record<string, unknown>) => void;
 }) {
+  const [statsTab, setStatsTab] = useState<'market' | 'instrument'>('market');
+  const [selectedInstrumentStat, setSelectedInstrumentStat] = useState('');
   const enabled = inspector?.enabled ?? summary?.enabled ?? false;
   const latestSignal = inspector?.latest_signal;
+  const instrumentStatSymbols = Object.keys(instrumentStatsMap ?? {}).sort((a, b) => a.localeCompare(b));
+  const activeInstrumentKey = (() => {
+    if (selectedInstrumentStat && instrumentStatSymbols.includes(selectedInstrumentStat)) {
+      return selectedInstrumentStat;
+    }
+    if (selectedSymbol && instrumentStatSymbols.includes(selectedSymbol)) {
+      return selectedSymbol;
+    }
+    return instrumentStatSymbols[0] ?? '';
+  })();
+  const activeInstrumentStats = activeInstrumentKey ? instrumentStatsMap?.[activeInstrumentKey] : undefined;
   const signalTone =
     latestSignal?.signal_type === 'BUY'
       ? 'text-emerald-300'
@@ -309,24 +317,24 @@ function StrategyCard({
         <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3">
           <div className="text-xs text-slate-500">Signals</div>
           <div className="mt-1 text-lg font-semibold text-slate-200">{summary?.signals ?? 0}</div>
-          <div className="mt-1 text-xs text-slate-500">Agent entries {stats?.entries ?? 0}</div>
+          <div className="mt-1 text-xs text-slate-500">Agent entries {overallStats?.entries ?? 0}</div>
         </div>
         <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3">
           <div className="text-xs text-slate-500">Trades</div>
           <div className="mt-1 text-lg font-semibold text-slate-200">{summary?.trades ?? 0}</div>
-          <div className="mt-1 text-xs text-slate-500">Closed {stats?.closed_trades ?? 0}</div>
+          <div className="mt-1 text-xs text-slate-500">Closed {overallStats?.closed_trades ?? 0}</div>
         </div>
         <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3">
           <div className="text-xs text-slate-500">Net P&L</div>
           <div
             className={cn(
               'mt-1 text-lg font-semibold',
-              (stats?.net_pnl_inr ?? summary?.pnl ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300',
+              (overallStats?.net_pnl_inr ?? summary?.pnl ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300',
             )}
           >
-            {stats ? formatINR(stats.net_pnl_inr) : formatINR(summary?.pnl ?? 0)}
+            {overallStats ? formatINR(overallStats.net_pnl_inr) : formatINR(summary?.pnl ?? 0)}
           </div>
-          <div className="mt-1 text-xs text-slate-500">Open positions {stats?.open_positions ?? 0}</div>
+          <div className="mt-1 text-xs text-slate-500">Open positions {overallStats?.open_positions ?? 0}</div>
         </div>
         <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-4 py-3">
           <div className="text-xs text-slate-500">Latest Signal</div>
@@ -373,25 +381,186 @@ function StrategyCard({
 
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
         <DataGrid title="Runtime Parameters" value={inspector?.params ?? {}} />
-        <DataGrid
-          title="Trade Stats"
-          value={
-            stats
-              ? {
-                  signals: stats.signals,
-                  entries: stats.entries,
-                  closed_trades: stats.closed_trades,
-                  wins: stats.wins,
-                  losses: stats.losses,
-                  win_rate_pct: stats.win_rate_pct,
-                  realized_pnl_inr: stats.realized_pnl_inr,
-                  unrealized_pnl_inr: stats.unrealized_pnl_inr,
-                  net_pnl_inr: stats.net_pnl_inr,
-                  open_positions: stats.open_positions,
-                }
-              : {}
-          }
-        />
+        <section className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-200">Strategy Statistics</h3>
+              <p className="mt-1 text-xs text-slate-500">
+                Separate market-wide performance from the selected instrument so symbol inspector data stays honest.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setStatsTab('market')}
+                className={cn(
+                  'rounded-lg border px-3 py-1.5 text-xs transition',
+                  statsTab === 'market'
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                    : 'border-slate-700 bg-slate-950/60 text-slate-400'
+                )}
+              >
+                By Market
+              </button>
+              <button
+                type="button"
+                onClick={() => setStatsTab('instrument')}
+                className={cn(
+                  'rounded-lg border px-3 py-1.5 text-xs transition',
+                  statsTab === 'instrument'
+                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                    : 'border-slate-700 bg-slate-950/60 text-slate-400'
+                )}
+              >
+                Instrument Focus
+              </button>
+            </div>
+          </div>
+
+          {statsTab === 'market' ? (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[720px] text-left text-sm">
+                <thead>
+                  <tr className="border-b border-slate-800 text-[11px] uppercase tracking-[0.18em] text-slate-500">
+                    <th className="pb-3 pr-3 font-medium">Market</th>
+                    <th className="pb-3 pr-3 text-right font-medium">Entries</th>
+                    <th className="pb-3 pr-3 text-right font-medium">Closed</th>
+                    <th className="pb-3 pr-3 text-right font-medium">Open</th>
+                    <th className="pb-3 pr-3 text-right font-medium">Net</th>
+                    <th className="pb-3 pr-3 text-right font-medium">P/L %</th>
+                    <th className="pb-3 text-right font-medium">Used %</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(marketStats ?? {}).map(([market, row]) => (
+                    <tr key={market} className="border-b border-slate-800/80 text-slate-300">
+                      <td className="py-3 pr-3">
+                        <div className="font-medium text-slate-100">{market}</div>
+                        <div className="text-xs text-slate-500">
+                          {row.currency_symbol}{formatNumber(row.allocated_capital, 0)} allocated
+                        </div>
+                      </td>
+                      <td className="py-3 pr-3 text-right">{formatNumber(row.entries)}</td>
+                      <td className="py-3 pr-3 text-right">{formatNumber(row.closed_trades)}</td>
+                      <td className="py-3 pr-3 text-right">{formatNumber(row.open_positions)}</td>
+                      <td className={cn('py-3 pr-3 text-right', row.net_pnl_inr >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                        {row.currency === 'USD'
+                          ? `${row.currency_symbol}${formatNumber(row.net_pnl, 2)}`
+                          : formatINR(row.net_pnl_inr)}
+                      </td>
+                      <td className={cn('py-3 pr-3 text-right', row.pnl_pct_on_allocated >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                        {formatNumber(row.pnl_pct_on_allocated, 2)}%
+                      </td>
+                      <td className="py-3 text-right">{formatNumber(row.capital_used_pct, 2)}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : activeInstrumentStats ? (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs text-slate-500">Selected Instrument</div>
+                  <div className="mt-1 text-sm font-medium text-slate-100">{activeInstrumentKey}</div>
+                </div>
+                <label className="min-w-[260px] max-w-full">
+                  <span className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Instrument</span>
+                  <select
+                    value={activeInstrumentKey}
+                    onChange={(event) => setSelectedInstrumentStat(event.target.value)}
+                    className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-emerald-400"
+                  >
+                    {instrumentStatSymbols.map((symbol) => (
+                      <option key={symbol} value={symbol}>
+                        {symbol}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                {[
+                  ['Entries', formatNumber(activeInstrumentStats.entries)],
+                  ['Closed Trades', formatNumber(activeInstrumentStats.closed_trades)],
+                  ['Open Positions', formatNumber(activeInstrumentStats.open_positions)],
+                  ['Net P&L', activeInstrumentStats.currency === 'USD' ? `${activeInstrumentStats.currency_symbol}${formatNumber(activeInstrumentStats.net_pnl, 2)}` : formatINR(activeInstrumentStats.net_pnl_inr)],
+                  ['P/L % On Allocation', `${formatNumber(activeInstrumentStats.pnl_pct_on_allocated, 2)}%`],
+                  ['Capital Used', activeInstrumentStats.currency === 'USD' ? `${activeInstrumentStats.currency_symbol}${formatNumber(activeInstrumentStats.capital_used, 2)}` : formatINR(activeInstrumentStats.capital_used_inr)],
+                  ['Capital Used %', `${formatNumber(activeInstrumentStats.capital_used_pct, 2)}%`],
+                  ['Win Rate', `${formatNumber(activeInstrumentStats.win_rate_pct, 2)}%`],
+                  ['Signals', formatNumber(activeInstrumentStats.signals)],
+                ].map(([label, value]) => (
+                  <div key={label} className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">{label}</div>
+                    <div className="mt-1 font-mono text-xs text-slate-200">{value}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[860px] text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-[11px] uppercase tracking-[0.18em] text-slate-500">
+                      <th className="pb-3 pr-3 font-medium">Instrument</th>
+                      <th className="pb-3 pr-3 text-right font-medium">Entries</th>
+                      <th className="pb-3 pr-3 text-right font-medium">Closed</th>
+                      <th className="pb-3 pr-3 text-right font-medium">Open</th>
+                      <th className="pb-3 pr-3 text-right font-medium">Net</th>
+                      <th className="pb-3 pr-3 text-right font-medium">P/L %</th>
+                      <th className="pb-3 text-right font-medium">Used %</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {instrumentStatSymbols
+                      .slice()
+                      .sort((left, right) =>
+                        (instrumentStatsMap?.[right]?.net_pnl_inr ?? 0) - (instrumentStatsMap?.[left]?.net_pnl_inr ?? 0)
+                      )
+                      .map((symbol) => {
+                        const row = instrumentStatsMap?.[symbol];
+                        if (!row) {
+                          return null;
+                        }
+                        return (
+                          <tr
+                            key={symbol}
+                            className={cn(
+                              'cursor-pointer border-b border-slate-800/80 text-slate-300',
+                              symbol === activeInstrumentKey && 'bg-emerald-500/5'
+                            )}
+                            onClick={() => setSelectedInstrumentStat(symbol)}
+                          >
+                            <td className="py-3 pr-3">
+                              <div className="font-medium text-slate-100">{symbol}</div>
+                              <div className="text-xs text-slate-500">{row.currency_symbol}{formatNumber(row.allocated_capital, 0)} allocated</div>
+                            </td>
+                            <td className="py-3 pr-3 text-right">{formatNumber(row.entries)}</td>
+                            <td className="py-3 pr-3 text-right">{formatNumber(row.closed_trades)}</td>
+                            <td className="py-3 pr-3 text-right">{formatNumber(row.open_positions)}</td>
+                            <td className={cn('py-3 pr-3 text-right', row.net_pnl_inr >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                              {row.currency === 'USD'
+                                ? `${row.currency_symbol}${formatNumber(row.net_pnl, 2)}`
+                                : formatINR(row.net_pnl_inr)}
+                            </td>
+                            <td className={cn('py-3 pr-3 text-right', row.pnl_pct_on_allocated >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                              {formatNumber(row.pnl_pct_on_allocated, 2)}%
+                            </td>
+                            <td className="py-3 text-right">{formatNumber(row.capital_used_pct, 2)}%</td>
+                          </tr>
+                        );
+                      })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-dashed border-slate-800 px-3 py-6 text-center text-sm text-slate-500">
+              No strategy statistics exist yet for {selectedSymbol}. This strategy has not traded any tracked instrument.
+            </div>
+          )}
+        </section>
       </div>
 
       {latestSignal?.metadata && Object.keys(latestSignal.metadata).length > 0 ? (
@@ -620,7 +789,10 @@ export default function StrategiesPage() {
                 key={name}
                 name={name}
                 summary={executor?.strategies?.[name]}
-                stats={status?.strategy_stats?.[name]}
+                overallStats={status?.strategy_stats?.[name]}
+                marketStats={status?.strategy_market_stats?.[name]}
+                instrumentStatsMap={status?.strategy_instrument_stats?.[name]}
+                selectedSymbol={symbol}
                 inspector={inspectorByName[name]}
                 onToggle={(strategyName, enabled) =>
                   toggleStrategy.mutate({ strategy: strategyName, enabled })

@@ -109,7 +109,7 @@ export default function PortfolioSummaryPage() {
   const { data, isLoading, isFetching, error, refetch } = usePortfolioInstruments(period);
   const { data: equityCurve } = useQuery<EquitySnapshot[]>({
     queryKey: ['portfolio', 'equity-curve', period],
-    queryFn: () => apiFetch<EquitySnapshot[]>('/portfolio/equity-curve'),
+    queryFn: () => apiFetch<EquitySnapshot[]>(`/portfolio/equity-curve?period=${encodeURIComponent(period)}`),
     refetchInterval: 5000,
     staleTime: 2500,
   });
@@ -121,18 +121,13 @@ export default function PortfolioSummaryPage() {
     [rows]
   );
 
-  const totals = useMemo(() => {
-    const totalWins = rows.reduce((sum, row) => sum + row.wins, 0);
-    const totalTrades = rows.reduce((sum, row) => sum + row.trades, 0);
-    return {
-      trades: totalTrades,
-      instruments: rows.length,
-      winRate: totalTrades ? (totalWins / totalTrades) * 100 : 0,
-      net: data?.total_net_pnl_inr ?? 0,
-      realized: data?.total_realized_pnl_inr ?? 0,
-      unrealized: data?.total_unrealized_pnl_inr ?? 0,
-    };
-  }, [data, rows]);
+  const liveTotals = useMemo(() => ({
+    net: portfolio?.total_pnl_inr ?? portfolio?.total_pnl ?? 0,
+    realized: portfolio?.total_realized_pnl_inr ?? portfolio?.total_realized_pnl ?? 0,
+    unrealized: portfolio?.total_unrealized_pnl_inr ?? portfolio?.total_unrealized_pnl ?? 0,
+    allocated: portfolio?.total_allocated_capital_inr ?? 0,
+    pnlPct: portfolio?.total_pnl_pct_on_allocated ?? 0,
+  }), [portfolio]);
 
   const equityStats = useMemo(() => {
     const points = equityCurve ?? [];
@@ -149,15 +144,20 @@ export default function PortfolioSummaryPage() {
 
   const marketCards = useMemo(() => {
     const breakdown = portfolio?.market_breakdown ?? {};
-    const totalValue = Math.max(portfolio?.total_market_value_inr ?? 0, 1);
     return Object.entries(breakdown)
       .map(([market, row]) => ({
         market,
-        label: market === 'CRYPTO' ? 'Crypto' : market === 'US' ? 'US' : 'India',
+        label: String(row.label ?? (market === 'CRYPTO' ? 'Crypto' : market === 'US' ? 'US' : 'India')),
+        currency: String(row.currency ?? 'INR'),
+        currencySymbol: String(row.currency_symbol ?? (row.currency === 'USD' ? '$' : '₹')),
         openPositions: Number(row.open_positions ?? 0),
         netPnl: Number(row.net_pnl_inr ?? 0),
+        netPnlNative: Number(row.net_pnl ?? 0),
+        allocated: Number(row.allocated_capital ?? 0),
         value: Number(row.market_value_inr ?? 0),
-        exposurePct: (Number(row.market_value_inr ?? 0) / totalValue) * 100,
+        valueNative: Number(row.market_value ?? 0),
+        exposurePct: Number(row.capital_used_pct ?? 0),
+        pnlPct: Number(row.pnl_pct_on_allocated ?? 0),
       }))
       .sort((left, right) => right.value - left.value);
   }, [portfolio]);
@@ -226,10 +226,10 @@ export default function PortfolioSummaryPage() {
       </div>
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <MiniCard label="Net P&L" value={formatCurrency(totals.net, 'INR')} tone={totals.net >= 0 ? 'positive' : 'negative'} />
-        <MiniCard label="Realized" value={formatCurrency(totals.realized, 'INR')} tone={totals.realized >= 0 ? 'positive' : 'negative'} />
-        <MiniCard label="Unrealized" value={formatCurrency(totals.unrealized, 'INR')} tone={totals.unrealized >= 0 ? 'positive' : 'negative'} />
-        <MiniCard label="Win Rate" value={formatPercent(totals.winRate, 1)} tone={totals.winRate >= 50 ? 'positive' : 'negative'} />
+        <MiniCard label="Live Net P&L" value={formatCurrency(liveTotals.net, 'INR')} tone={liveTotals.net >= 0 ? 'positive' : 'negative'} />
+        <MiniCard label="Realized" value={formatCurrency(liveTotals.realized, 'INR')} tone={liveTotals.realized >= 0 ? 'positive' : 'negative'} />
+        <MiniCard label="Unrealized" value={formatCurrency(liveTotals.unrealized, 'INR')} tone={liveTotals.unrealized >= 0 ? 'positive' : 'negative'} />
+        <MiniCard label="P&L On Capital" value={formatPercent(liveTotals.pnlPct, 2)} tone={liveTotals.pnlPct >= 0 ? 'positive' : 'negative'} />
       </div>
 
       {activeTab === 'analytics' ? (
@@ -280,13 +280,22 @@ export default function PortfolioSummaryPage() {
                     <div className="text-sm font-semibold text-slate-100">{item.label}</div>
                     <div className="text-xs text-slate-500">{item.openPositions} open</div>
                   </div>
-                  <div className="mt-3 text-lg font-semibold text-slate-100">{formatCurrency(item.value, 'INR')}</div>
+                  <div className="mt-3 text-lg font-semibold text-slate-100">
+                    {formatCurrency(item.valueNative, item.currency)}
+                  </div>
+                  <div className="mt-1 text-xs text-slate-500">
+                    INR {formatCurrency(item.value, 'INR')} · Alloc {item.currencySymbol}{formatNumber(item.allocated, 0)}
+                  </div>
                   <div className={cn('mt-1 text-sm', item.netPnl >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
-                    {formatCurrency(item.netPnl, 'INR')}
+                    {item.currency === 'USD'
+                      ? `${item.currencySymbol}${formatNumber(item.netPnlNative, 2)}`
+                      : formatCurrency(item.netPnl, 'INR')}
                   </div>
                   <div className="mt-3 space-y-2">
                     <BarMeter value={item.exposurePct} tone={item.netPnl >= 0 ? 'emerald' : 'rose'} />
-                    <div className="text-xs text-slate-500">Exposure {formatPercent(item.exposurePct, 1)}</div>
+                    <div className="text-xs text-slate-500">
+                      Used {formatPercent(item.exposurePct, 1)} · P/L {formatPercent(item.pnlPct, 2)}
+                    </div>
                   </div>
                 </div>
               ))}

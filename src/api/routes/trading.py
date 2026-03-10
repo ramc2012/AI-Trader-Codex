@@ -188,7 +188,7 @@ async def list_positions(
             usd_inr_rate,
         )
         market = classify_market(position.symbol)
-        plan = trading_agent._option_exit_plans.get(position.symbol)
+        plan = trading_agent._display_exit_plan(position.symbol)
         exit_metrics = _position_exit_metrics(position, plan, now)
         out.append(
             PositionResponse(
@@ -226,12 +226,14 @@ async def list_positions(
 @router.get("/portfolio", response_model=PortfolioSummaryResponse)
 def portfolio_summary(
     pm: PositionManager = Depends(get_position_manager),
+    trading_agent: TradingAgent = Depends(get_trading_agent),
 ) -> PortfolioSummaryResponse:
     """Get aggregated portfolio summary with total P&L."""
     settings = get_settings()
     summary = _build_currency_aware_portfolio(
         pm=pm,
         usd_inr_rate=float(settings.usd_inr_reference_rate),
+        capital_allocations=trading_agent.get_capital_allocations(),
     )
     return PortfolioSummaryResponse(**summary)
 
@@ -289,6 +291,7 @@ def portfolio_by_instrument(
         symbol = pair.symbol
         row = rows[symbol]
         row["symbol"] = symbol
+        row["market"] = classify_market(symbol)
         row["currency"] = pair.currency
         row["currency_symbol"] = pair.currency_symbol
         row["fx_to_inr"] = float(pair.fx_to_inr)
@@ -325,6 +328,7 @@ def portfolio_by_instrument(
         )
         row = rows[position.symbol]
         row["symbol"] = position.symbol
+        row["market"] = classify_market(position.symbol)
         row["currency"] = currency
         row["currency_symbol"] = currency_symbol
         row["fx_to_inr"] = fx_to_inr
@@ -339,6 +343,7 @@ def portfolio_by_instrument(
         hold_samples = row.pop("_hold_samples", [])
         avg_hold = (sum(hold_samples) / len(hold_samples)) if hold_samples else 0.0
         row["avg_hold_minutes"] = round(float(avg_hold), 2)
+        row["net_pnl"] = round(float(row["realized_pnl"]) + float(row["unrealized_pnl"]), 2)
         row["net_pnl_inr"] = round(
             float(row["realized_pnl_inr"]) + float(row["unrealized_pnl_inr"]),
             2,
@@ -439,35 +444,17 @@ def list_closed_trades(
 @router.get("/portfolio/equity-curve")
 def get_equity_curve(
     pm: PositionManager = Depends(get_position_manager),
+    trading_agent: TradingAgent = Depends(get_trading_agent),
+    period: str = Query(default="daily", description="One of: daily, week, month, year"),
 ) -> List[Dict[str, Any]]:
-    """Get equity curve data points.
-
-    Returns accumulated portfolio value snapshots. If no snapshots
-    exist yet (no trading activity), returns initial capital as a
-    baseline single data point.
-    """
-    # Check if PositionManager has equity snapshots
-    snapshots = getattr(pm, "_equity_snapshots", [])
-
-    if snapshots:
-        return snapshots
-
-    # No snapshots yet - return initial capital baseline
+    """Get a realized-plus-live equity curve filtered to the selected period."""
     settings = get_settings()
-    portfolio = _build_currency_aware_portfolio(
+    return _build_equity_curve(
         pm=pm,
         usd_inr_rate=float(settings.usd_inr_reference_rate),
+        initial_capital_inr=trading_agent.total_allocated_capital_inr(),
+        period=period,
     )
-    capital = portfolio.get("total_market_value_inr", 1000000)
-    if capital == 0:
-        capital = 1000000  # Default when no positions
-
-    return [
-        {
-            "time": datetime.now(tz=IST).isoformat(),
-            "value": capital,
-        }
-    ]
 
 
 # =========================================================================
@@ -586,10 +573,49 @@ def _position_exit_metrics(position: Any, plan: Any, now: datetime) -> Dict[str,
 def _build_currency_aware_portfolio(
     pm: PositionManager,
     usd_inr_rate: float,
+    capital_allocations: Dict[str, Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     summary = pm.get_portfolio_summary()
     positions = pm.get_all_positions()
     closed_trades = pm.get_closed_trades()
+    capital_allocations = capital_allocations or {
+        "NSE": {
+            "market": "NSE",
+            "label": "India",
+            "currency": "INR",
+            "currency_symbol": "₹",
+            "fx_to_inr": 1.0,
+            "allocated_capital": 250000.0,
+            "allocated_capital_inr": 250000.0,
+            "max_instrument_pct": 25.0,
+            "max_instrument_capital": 62500.0,
+            "max_instrument_capital_inr": 62500.0,
+        },
+        "US": {
+            "market": "US",
+            "label": "US",
+            "currency": "USD",
+            "currency_symbol": "$",
+            "fx_to_inr": usd_inr_rate,
+            "allocated_capital": 250000.0,
+            "allocated_capital_inr": 250000.0 * usd_inr_rate,
+            "max_instrument_pct": 20.0,
+            "max_instrument_capital": 50000.0,
+            "max_instrument_capital_inr": 50000.0 * usd_inr_rate,
+        },
+        "CRYPTO": {
+            "market": "CRYPTO",
+            "label": "Crypto",
+            "currency": "USD",
+            "currency_symbol": "$",
+            "fx_to_inr": usd_inr_rate,
+            "allocated_capital": 250000.0,
+            "allocated_capital_inr": 250000.0 * usd_inr_rate,
+            "max_instrument_pct": 20.0,
+            "max_instrument_capital": 50000.0,
+            "max_instrument_capital_inr": 50000.0 * usd_inr_rate,
+        },
+    }
 
     breakdown: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {
@@ -605,12 +631,28 @@ def _build_currency_aware_portfolio(
     )
     market_breakdown: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {
+            "market": "NSE",
+            "label": "India",
+            "currency": "INR",
+            "currency_symbol": "₹",
+            "fx_to_inr": 1.0,
+            "allocated_capital": 0.0,
+            "allocated_capital_inr": 0.0,
+            "max_instrument_pct": 0.0,
+            "max_instrument_capital": 0.0,
+            "max_instrument_capital_inr": 0.0,
             "open_positions": 0,
             "closed_trades": 0,
+            "market_value": 0.0,
             "market_value_inr": 0.0,
+            "unrealized_pnl": 0.0,
             "unrealized_pnl_inr": 0.0,
+            "realized_pnl": 0.0,
             "realized_pnl_inr": 0.0,
+            "net_pnl": 0.0,
             "net_pnl_inr": 0.0,
+            "capital_used_pct": 0.0,
+            "pnl_pct_on_allocated": 0.0,
         }
     )
 
@@ -629,8 +671,12 @@ def _build_currency_aware_portfolio(
 
         market = classify_market(position.symbol)
         market_row = market_breakdown[market]
+        allocation = capital_allocations.get(market, capital_allocations["NSE"])
+        market_row.update({key: value for key, value in allocation.items() if key in market_row})
         market_row["open_positions"] += 1
+        market_row["market_value"] += float(position.market_value)
         market_row["market_value_inr"] += float(position.market_value) * fx_to_inr
+        market_row["unrealized_pnl"] += float(position.unrealized_pnl)
         market_row["unrealized_pnl_inr"] += float(position.unrealized_pnl) * fx_to_inr
 
     for trade in closed_trades:
@@ -648,7 +694,10 @@ def _build_currency_aware_portfolio(
 
         market = classify_market(symbol)
         market_row = market_breakdown[market]
+        allocation = capital_allocations.get(market, capital_allocations["NSE"])
+        market_row.update({key: value for key, value in allocation.items() if key in market_row})
         market_row["closed_trades"] += 1
+        market_row["realized_pnl"] += pnl
         market_row["realized_pnl_inr"] += pnl * fx_to_inr
 
     positions_map = summary.get("positions", {})
@@ -670,6 +719,9 @@ def _build_currency_aware_portfolio(
     total_market_value_inr = sum(float(v["market_value_inr"]) for v in breakdown.values())
     total_unrealized_pnl_inr = sum(float(v["unrealized_pnl_inr"]) for v in breakdown.values())
     total_realized_pnl_inr = sum(float(v["realized_pnl_inr"]) for v in breakdown.values())
+    total_allocated_capital_inr = sum(
+        float(value.get("allocated_capital_inr", 0.0)) for value in capital_allocations.values()
+    )
 
     summary["currency_breakdown"] = {
         key: {
@@ -682,14 +734,30 @@ def _build_currency_aware_portfolio(
     summary["total_unrealized_pnl_inr"] = round(total_unrealized_pnl_inr, 2)
     summary["total_realized_pnl_inr"] = round(total_realized_pnl_inr, 2)
     summary["total_pnl_inr"] = round(total_realized_pnl_inr + total_unrealized_pnl_inr, 2)
+    summary["total_allocated_capital_inr"] = round(total_allocated_capital_inr, 2)
+    summary["total_pnl_pct_on_allocated"] = round(
+        (summary["total_pnl_inr"] / total_allocated_capital_inr) * 100.0,
+        2,
+    ) if total_allocated_capital_inr > 0 else 0.0
     summary["market_breakdown"] = {}
     for base_market in ("NSE", "US", "CRYPTO"):
         market_breakdown[base_market]
     for market, bucket in market_breakdown.items():
         row = dict(bucket)
+        allocation = capital_allocations.get(market, capital_allocations["NSE"])
+        row.update(allocation)
+        row["net_pnl"] = float(row.get("realized_pnl", 0.0)) + float(row.get("unrealized_pnl", 0.0))
         row["net_pnl_inr"] = float(row.get("realized_pnl_inr", 0.0)) + float(
             row.get("unrealized_pnl_inr", 0.0)
         )
+        allocated_capital = float(row.get("allocated_capital", 0.0) or 0.0)
+        allocated_capital_inr = float(row.get("allocated_capital_inr", 0.0) or 0.0)
+        row["capital_used_pct"] = (
+            (float(row.get("market_value_inr", 0.0)) / allocated_capital_inr) * 100.0
+        ) if allocated_capital_inr > 0 else 0.0
+        row["pnl_pct_on_allocated"] = (
+            (float(row.get("net_pnl_inr", 0.0)) / allocated_capital_inr) * 100.0
+        ) if allocated_capital_inr > 0 else 0.0
         summary["market_breakdown"][market] = {
             key: round(float(value), 2) if isinstance(value, (float, int)) else value
             for key, value in row.items()
@@ -697,6 +765,64 @@ def _build_currency_aware_portfolio(
     summary["base_currency"] = "INR"
     summary["usd_inr_rate"] = float(usd_inr_rate)
     return summary
+
+
+def _build_equity_curve(
+    pm: PositionManager,
+    usd_inr_rate: float,
+    initial_capital_inr: float,
+    period: str,
+) -> List[Dict[str, Any]]:
+    from_time, to_time, _ = _period_bounds(period)
+    trades = sorted(
+        pm.get_closed_trades(),
+        key=lambda trade: _to_ist_dt(trade.get("closed_at")),
+    )
+    realized_before = 0.0
+    points: List[Dict[str, Any]] = []
+
+    for trade in trades:
+        closed_at = trade.get("closed_at")
+        if not closed_at:
+            continue
+        ts = _to_ist_dt(closed_at)
+        _, _, fx_to_inr = parse_currency_context(str(trade.get("symbol") or ""), usd_inr_rate=usd_inr_rate)
+        pnl_inr = float(trade.get("pnl") or 0.0) * float(fx_to_inr)
+        if ts < from_time:
+            realized_before += pnl_inr
+
+    running_value = float(initial_capital_inr) + realized_before
+    points.append({"time": from_time.isoformat(), "value": round(running_value, 2)})
+
+    for trade in trades:
+        closed_at = trade.get("closed_at")
+        if not closed_at:
+            continue
+        ts = _to_ist_dt(closed_at)
+        if ts < from_time or ts > to_time:
+            continue
+        _, _, fx_to_inr = parse_currency_context(str(trade.get("symbol") or ""), usd_inr_rate=usd_inr_rate)
+        pnl_inr = float(trade.get("pnl") or 0.0) * float(fx_to_inr)
+        running_value += pnl_inr
+        points.append({"time": ts.isoformat(), "value": round(running_value, 2)})
+
+    current_unrealized_inr = 0.0
+    for position in pm.get_all_positions():
+        _, _, fx_to_inr = parse_currency_context(position.symbol, usd_inr_rate=usd_inr_rate)
+        current_unrealized_inr += float(position.unrealized_pnl) * float(fx_to_inr)
+
+    final_value = running_value + current_unrealized_inr
+    final_time = min(datetime.now(tz=IST), to_time)
+    if not points or points[-1]["time"] != final_time.isoformat():
+        points.append({"time": final_time.isoformat(), "value": round(final_value, 2)})
+
+    deduped: List[Dict[str, Any]] = []
+    for point in points:
+        if deduped and deduped[-1]["time"] == point["time"]:
+            deduped[-1] = point
+        else:
+            deduped.append(point)
+    return deduped
 
 
 def _build_trade_pairs(

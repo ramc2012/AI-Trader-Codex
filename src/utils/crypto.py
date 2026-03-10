@@ -5,18 +5,31 @@ symmetric encryption with a machine-specific key.
 """
 
 import hashlib
-import os
 from pathlib import Path
-from typing import Optional
 
 from cryptography.fernet import Fernet
 
+from src.config.settings import get_settings
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Key file location (should be in .gitignore)
-_KEY_FILE = Path(".crypto_key")
+_LEGACY_KEY_FILE = Path(".crypto_key")
+
+
+def _key_file_path() -> Path:
+    path = get_settings().crypto_key_path
+    if path != _LEGACY_KEY_FILE and not path.exists() and _LEGACY_KEY_FILE.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_LEGACY_KEY_FILE.read_bytes())
+        path.chmod(0o600)
+        _LEGACY_KEY_FILE.unlink()
+        logger.info(
+            "crypto_key_migrated",
+            from_path=str(_LEGACY_KEY_FILE),
+            to_path=str(path),
+        )
+    return path
 
 
 def _get_or_create_key() -> bytes:
@@ -28,9 +41,10 @@ def _get_or_create_key() -> bytes:
     Returns:
         Encryption key bytes
     """
-    if _KEY_FILE.exists():
+    key_file = _key_file_path()
+    if key_file.exists():
         try:
-            key = _KEY_FILE.read_bytes()
+            key = key_file.read_bytes()
             # Validate it's a proper Fernet key
             Fernet(key)
             return key
@@ -39,9 +53,10 @@ def _get_or_create_key() -> bytes:
     
     # Generate new key
     key = Fernet.generate_key()
-    _KEY_FILE.write_bytes(key)
-    _KEY_FILE.chmod(0o600)  # Owner read/write only
-    logger.info("new_encryption_key_generated", path=str(_KEY_FILE))
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    key_file.write_bytes(key)
+    key_file.chmod(0o600)  # Owner read/write only
+    logger.info("new_encryption_key_generated", path=str(key_file))
     return key
 
 

@@ -38,6 +38,7 @@ from src.database.operations import (
 )
 from src.integrations.fyers_client import FyersClient
 from src.utils.logger import get_logger
+from src.utils.us_market_data import parse_nasdaq_chart_timestamp, parse_nasdaq_historical_date
 
 router = APIRouter(tags=["Market Data"])
 logger = get_logger(__name__)
@@ -370,7 +371,9 @@ async def _fetch_us_ohlc_nasdaq(symbol: str, timeframe: str, limit: int) -> list
                 if not isinstance(row, dict):
                     continue
                 try:
-                    timestamp = datetime.strptime(str(row.get("date")), "%m/%d/%Y").replace(tzinfo=IST)
+                    timestamp = parse_nasdaq_historical_date(row.get("date"))
+                    if timestamp is None:
+                        continue
                     candles.append(
                         CandleResponse(
                             timestamp=timestamp,
@@ -394,16 +397,18 @@ async def _fetch_us_ohlc_nasdaq(symbol: str, timeframe: str, limit: int) -> list
         payload = res.json()
     data = payload.get("data", {}) if isinstance(payload, dict) else {}
     chart_rows = data.get("chart", []) if isinstance(data, dict) else []
+    time_as_of = data.get("timeAsOf") if isinstance(data, dict) else None
     points: list[tuple[datetime, float]] = []
     for row in chart_rows:
         if not isinstance(row, dict):
             continue
-        ts_raw = row.get("x")
         px_raw = row.get("y")
         try:
-            ts = datetime.fromtimestamp(int(ts_raw) / 1000.0, tz=timezone.utc).astimezone(IST)
+            ts = parse_nasdaq_chart_timestamp(row, time_as_of=time_as_of)
             price = float(px_raw)
         except (TypeError, ValueError):
+            continue
+        if ts is None:
             continue
         if price <= 0:
             continue
@@ -423,16 +428,16 @@ async def _fetch_us_ohlc(symbol: str, timeframe: str, limit: int) -> list[Candle
         rows = await _fetch_us_ohlc_finnhub(ticker=ticker, timeframe=timeframe, limit=limit)
     if rows and not _us_intraday_rows_stale(rows, timeframe):
         return rows
+    rows = await _fetch_us_ohlc_alphavantage(ticker=ticker, timeframe=timeframe, limit=limit)
+    if rows and not _us_intraday_rows_stale(rows, timeframe):
+        return rows
     rows = await _fetch_us_ohlc_yahoo(ticker=ticker, timeframe=timeframe, limit=limit)
     if rows and not _us_intraday_rows_stale(rows, timeframe):
         return rows
     rows = await _fetch_us_ohlc_nasdaq(symbol=symbol, timeframe=timeframe, limit=limit)
-    if rows:
-        return rows
-    rows = await _fetch_us_ohlc_finnhub(ticker=ticker, timeframe=timeframe, limit=limit)
     if rows and not _us_intraday_rows_stale(rows, timeframe):
         return rows
-    rows = await _fetch_us_ohlc_alphavantage(ticker=ticker, timeframe=timeframe, limit=limit)
+    rows = await _fetch_us_ohlc_finnhub(ticker=ticker, timeframe=timeframe, limit=limit)
     if rows and not _us_intraday_rows_stale(rows, timeframe):
         return rows
     rows = await _fetch_us_ohlc_nasdaq(symbol=symbol, timeframe=timeframe, limit=limit)

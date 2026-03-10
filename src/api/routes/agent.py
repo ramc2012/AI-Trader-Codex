@@ -37,6 +37,7 @@ from src.api.dependencies import (
     reset_trading_agent,
 )
 from src.api.schemas import AgentConfigRequest, AgentEventResponse, AgentStatusResponse
+from src.config.settings import get_settings
 from src.database.operations import get_ohlc_candles
 from src.utils.logger import get_logger
 from src.config.constants import DEFAULT_AGENT_NSE_SYMBOLS
@@ -44,6 +45,34 @@ from src.config.constants import DEFAULT_AGENT_NSE_SYMBOLS
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["AI Agent"])
+
+
+def _total_allocated_capital_inr(body: AgentConfigRequest) -> float:
+    usd_inr_rate = float(get_settings().usd_inr_reference_rate)
+    return round(
+        float(body.india_capital) + (float(body.us_capital) + float(body.crypto_capital)) * usd_inr_rate,
+        2,
+    )
+
+
+def _sync_risk_manager_config(body: AgentConfigRequest) -> None:
+    risk_manager = get_risk_manager()
+    usd_inr_rate = float(get_settings().usd_inr_reference_rate)
+    total_capital_inr = _total_allocated_capital_inr(body)
+    india_cap_inr = float(body.india_capital)
+    us_cap_inr = float(body.us_capital) * usd_inr_rate
+    crypto_cap_inr = float(body.crypto_capital) * usd_inr_rate
+    max_position_size_inr = max(
+        india_cap_inr * (float(body.india_max_instrument_pct) / 100.0),
+        us_cap_inr * (float(body.us_max_instrument_pct) / 100.0),
+        crypto_cap_inr * (float(body.crypto_max_instrument_pct) / 100.0),
+        1.0,
+    )
+    risk_manager.config.capital = total_capital_inr
+    risk_manager.config.max_daily_loss_pct = max(float(body.max_daily_loss_pct), 0.0) / 100.0
+    risk_manager.config.max_daily_loss = total_capital_inr * risk_manager.config.max_daily_loss_pct
+    risk_manager.config.max_position_size = max_position_size_inr
+    risk_manager.config.max_concentration_pct = max_position_size_inr / max(total_capital_inr, 1.0)
 
 
 def _json_safe(value: Any) -> Any:
@@ -840,7 +869,7 @@ async def _close_all_positions_for_kill_switch(reason: str) -> Dict[str, Any]:
             short_name=position.symbol.split(":")[-1].split("-")[0],
             current_price=mark,
             reason=reason,
-            plan=agent._option_exit_plans.get(position.symbol),
+            plan=agent._display_exit_plan(position.symbol),
         )
         risk_manager.sync_position_value(position.symbol, 0.0)
         closed_positions.append(
@@ -869,6 +898,7 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
             "emergency_stop": True,
         }
 
+    total_capital_inr = _total_allocated_capital_inr(body)
     config = AgentConfig(
         symbols=body.symbols,
         us_symbols=body.us_symbols,
@@ -880,7 +910,13 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
         strategies=body.strategies,
         scan_interval_seconds=body.scan_interval_seconds,
         paper_mode=body.paper_mode,
-        capital=body.capital,
+        capital=total_capital_inr,
+        india_capital=body.india_capital,
+        us_capital=body.us_capital,
+        crypto_capital=body.crypto_capital,
+        india_max_instrument_pct=body.india_max_instrument_pct,
+        us_max_instrument_pct=body.us_max_instrument_pct,
+        crypto_max_instrument_pct=body.crypto_max_instrument_pct,
         max_daily_loss_pct=body.max_daily_loss_pct,
         timeframe=body.timeframe,
         execution_timeframes=body.execution_timeframes,
@@ -897,6 +933,8 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
         reinforcement_enabled=body.reinforcement_enabled,
         reinforcement_alpha=body.reinforcement_alpha,
         reinforcement_size_boost_pct=body.reinforcement_size_boost_pct,
+        strategy_capital_bucket_enabled=body.strategy_capital_bucket_enabled,
+        strategy_max_concurrent_positions=body.strategy_max_concurrent_positions,
         telegram_status_interval_minutes=body.telegram_status_interval_minutes,
     )
 
@@ -905,7 +943,7 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
     if invalid:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown strategies: {invalid}. Available: {list(STRATEGY_REGISTRY.keys())}",
+        detail=f"Unknown strategies: {invalid}. Available: {list(STRATEGY_REGISTRY.keys())}",
         )
 
     # Resolve existing singleton first, then replace if configuration differs.
@@ -915,7 +953,10 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
 
     if agent.config != config or agent.state in (AgentState.STOPPED, AgentState.ERROR):
         reset_trading_agent()
+        _sync_risk_manager_config(body)
         agent = get_trading_agent(config)
+    else:
+        _sync_risk_manager_config(body)
 
     # Start Telegram notifier
     notifier = get_telegram_notifier()

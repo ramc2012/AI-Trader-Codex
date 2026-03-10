@@ -20,6 +20,7 @@ from src.config.market_hours import IST
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+MULTI_STRATEGY_TAG = "MULTI"
 
 
 class PositionSide(Enum):
@@ -28,6 +29,17 @@ class PositionSide(Enum):
     LONG = "long"
     SHORT = "short"
     FLAT = "flat"
+
+
+@dataclass
+class PositionLot:
+    """One strategy-owned slice inside a consolidated symbol position."""
+
+    quantity: int
+    entry_price: float
+    entry_time: Optional[datetime] = None
+    strategy_tag: str = ""
+    order_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -53,6 +65,7 @@ class Position:
     entry_time: Optional[datetime] = None
     strategy_tag: str = ""
     order_ids: List[str] = field(default_factory=list)
+    lots: List[PositionLot] = field(default_factory=list)
 
     @property
     def unrealized_pnl(self) -> float:
@@ -101,6 +114,103 @@ class PositionManager:
         self._load_state()
         logger.info("position_manager_initialized")
 
+    @staticmethod
+    def _lot_order_key(lot: PositionLot) -> datetime:
+        if lot.entry_time is None:
+            return datetime.min.replace(tzinfo=IST)
+        if lot.entry_time.tzinfo is None:
+            return lot.entry_time.replace(tzinfo=IST)
+        return lot.entry_time.astimezone(IST)
+
+    @classmethod
+    def _normalized_lots(cls, position: Position) -> List[PositionLot]:
+        if position.lots:
+            lots = [lot for lot in position.lots if int(lot.quantity) > 0]
+            return sorted(lots, key=cls._lot_order_key)
+        if position.quantity <= 0:
+            return []
+        return [
+            PositionLot(
+                quantity=int(position.quantity),
+                entry_price=float(position.avg_price),
+                entry_time=position.entry_time,
+                strategy_tag=str(position.strategy_tag or ""),
+                order_ids=list(position.order_ids),
+            )
+        ]
+
+    @staticmethod
+    def _collapse_strategy_tag(lots: List[PositionLot]) -> str:
+        tags = {str(lot.strategy_tag or "").strip() for lot in lots if int(lot.quantity) > 0}
+        tags.discard("")
+        if not tags:
+            return ""
+        if len(tags) == 1:
+            return next(iter(tags))
+        return MULTI_STRATEGY_TAG
+
+    @staticmethod
+    def _merge_order_ids(lots: List[PositionLot]) -> List[str]:
+        merged: List[str] = []
+        seen: set[str] = set()
+        for lot in lots:
+            for order_id in lot.order_ids:
+                token = str(order_id or "").strip()
+                if not token or token in seen:
+                    continue
+                seen.add(token)
+                merged.append(token)
+        return merged
+
+    @classmethod
+    def _recalculate_position(cls, position: Position) -> None:
+        lots = cls._normalized_lots(position)
+        position.lots = lots
+        if not lots:
+            position.quantity = 0
+            position.avg_price = 0.0
+            position.entry_time = None
+            position.strategy_tag = ""
+            position.order_ids = []
+            return
+
+        total_qty = sum(int(lot.quantity) for lot in lots)
+        weighted_cost = sum(float(lot.entry_price) * int(lot.quantity) for lot in lots)
+        position.quantity = int(total_qty)
+        position.avg_price = weighted_cost / max(total_qty, 1)
+        entry_times = [cls._lot_order_key(lot) for lot in lots]
+        position.entry_time = min(entry_times) if entry_times else None
+        position.strategy_tag = cls._collapse_strategy_tag(lots)
+        position.order_ids = cls._merge_order_ids(lots)
+
+    @classmethod
+    def _build_position_view(
+        cls,
+        symbol: str,
+        side: PositionSide,
+        current_price: float,
+        lots: List[PositionLot],
+    ) -> Position:
+        view = Position(
+            symbol=symbol,
+            quantity=0,
+            side=side,
+            avg_price=0.0,
+            current_price=current_price,
+            lots=[
+                PositionLot(
+                    quantity=int(lot.quantity),
+                    entry_price=float(lot.entry_price),
+                    entry_time=lot.entry_time,
+                    strategy_tag=str(lot.strategy_tag or ""),
+                    order_ids=list(lot.order_ids),
+                )
+                for lot in lots
+            ],
+        )
+        cls._recalculate_position(view)
+        return view
+
     def open_position(
         self,
         symbol: str,
@@ -128,81 +238,38 @@ class PositionManager:
         """
         if symbol in self._positions:
             existing = self._positions[symbol]
+            existing.lots = self._normalized_lots(existing)
 
             if existing.side == side:
-                # Average up/down
-                total_qty = existing.quantity + quantity
-                new_avg = (
-                    existing.avg_price * existing.quantity + price * quantity
-                ) / total_qty
-                existing.avg_price = new_avg
-                existing.quantity = total_qty
-                if order_id:
-                    existing.order_ids.append(order_id)
+                existing.lots.append(
+                    PositionLot(
+                        quantity=int(quantity),
+                        entry_price=float(price),
+                        entry_time=datetime.now(tz=IST),
+                        strategy_tag=str(strategy_tag or ""),
+                        order_ids=[order_id] if order_id else [],
+                    )
+                )
+                existing.current_price = price
+                self._recalculate_position(existing)
                 logger.info(
                     "position_averaged",
                     symbol=symbol,
                     side=side.value,
-                    new_qty=total_qty,
-                    new_avg=new_avg,
+                    new_qty=existing.quantity,
+                    new_avg=existing.avg_price,
                 )
                 self._persist_state()
                 return existing
             else:
-                # Opposite direction: reduce or flip
                 if quantity < existing.quantity:
-                    # Partial close
-                    pnl = self._calc_pnl(
-                        existing.side, existing.avg_price, price, quantity
-                    )
-                    self._total_realized_pnl += pnl
-                    existing.quantity -= quantity
-                    self._closed_positions.append(
-                        {
-                            "symbol": symbol,
-                            "side": existing.side.value,
-                            "quantity": quantity,
-                            "entry_price": existing.avg_price,
-                            "exit_price": price,
-                            "pnl": pnl,
-                            "closed_at": datetime.now(tz=IST),
-                            "strategy_tag": existing.strategy_tag,
-                        }
-                    )
-                    logger.info(
-                        "position_partially_closed",
-                        symbol=symbol,
-                        closed_qty=quantity,
-                        remaining_qty=existing.quantity,
-                        pnl=pnl,
-                    )
-                    self._persist_state()
-                    return existing
+                    self.close_position(symbol, price, quantity=quantity)
+                    remaining = self.get_position(symbol)
+                    if remaining is not None:
+                        return remaining
+                    return Position(symbol=symbol, quantity=0, side=PositionSide.FLAT, avg_price=0.0, current_price=price)
                 elif quantity == existing.quantity:
-                    # Full close
-                    pnl = self._calc_pnl(
-                        existing.side, existing.avg_price, price, quantity
-                    )
-                    self._total_realized_pnl += pnl
-                    self._closed_positions.append(
-                        {
-                            "symbol": symbol,
-                            "side": existing.side.value,
-                            "quantity": quantity,
-                            "entry_price": existing.avg_price,
-                            "exit_price": price,
-                            "pnl": pnl,
-                            "closed_at": datetime.now(tz=IST),
-                            "strategy_tag": existing.strategy_tag,
-                        }
-                    )
-                    del self._positions[symbol]
-                    logger.info(
-                        "position_closed",
-                        symbol=symbol,
-                        pnl=pnl,
-                    )
-                    self._persist_state()
+                    self.close_position(symbol, price, quantity=quantity)
                     return Position(
                         symbol=symbol,
                         quantity=0,
@@ -211,27 +278,9 @@ class PositionManager:
                         current_price=price,
                     )
                 else:
-                    # Flip: close existing and open new in opposite direction
-                    close_pnl = self._calc_pnl(
-                        existing.side,
-                        existing.avg_price,
-                        price,
-                        existing.quantity,
-                    )
-                    self._total_realized_pnl += close_pnl
-                    self._closed_positions.append(
-                        {
-                            "symbol": symbol,
-                            "side": existing.side.value,
-                            "quantity": existing.quantity,
-                            "entry_price": existing.avg_price,
-                            "exit_price": price,
-                            "pnl": close_pnl,
-                            "closed_at": datetime.now(tz=IST),
-                            "strategy_tag": existing.strategy_tag,
-                        }
-                    )
-                    remaining_qty = quantity - existing.quantity
+                    existing_qty = int(existing.quantity)
+                    close_pnl = self.close_position(symbol, price, quantity=existing_qty)
+                    remaining_qty = quantity - existing_qty
                     new_pos = Position(
                         symbol=symbol,
                         quantity=remaining_qty,
@@ -241,7 +290,17 @@ class PositionManager:
                         entry_time=datetime.now(tz=IST),
                         strategy_tag=strategy_tag,
                         order_ids=[order_id] if order_id else [],
+                        lots=[
+                            PositionLot(
+                                quantity=int(remaining_qty),
+                                entry_price=float(price),
+                                entry_time=datetime.now(tz=IST),
+                                strategy_tag=str(strategy_tag or ""),
+                                order_ids=[order_id] if order_id else [],
+                            )
+                        ],
                     )
+                    self._recalculate_position(new_pos)
                     self._positions[symbol] = new_pos
                     logger.info(
                         "position_flipped",
@@ -263,7 +322,17 @@ class PositionManager:
                 entry_time=datetime.now(tz=IST),
                 strategy_tag=strategy_tag,
                 order_ids=[order_id] if order_id else [],
+                lots=[
+                    PositionLot(
+                        quantity=int(quantity),
+                        entry_price=float(price),
+                        entry_time=datetime.now(tz=IST),
+                        strategy_tag=str(strategy_tag or ""),
+                        order_ids=[order_id] if order_id else [],
+                    )
+                ],
             )
+            self._recalculate_position(pos)
             self._positions[symbol] = pos
             logger.info(
                 "position_opened",
@@ -276,7 +345,11 @@ class PositionManager:
             return pos
 
     def close_position(
-        self, symbol: str, price: float, quantity: Optional[int] = None
+        self,
+        symbol: str,
+        price: float,
+        quantity: Optional[int] = None,
+        strategy_tag: Optional[str] = None,
     ) -> float:
         """Close a position (fully or partially).
 
@@ -295,47 +368,82 @@ class PositionManager:
             raise ValueError(f"No position found for {symbol}")
 
         pos = self._positions[symbol]
-        close_qty = quantity if quantity is not None else pos.quantity
+        pos.lots = self._normalized_lots(pos)
 
-        if close_qty > pos.quantity:
+        eligible_qty = sum(
+            int(lot.quantity)
+            for lot in pos.lots
+            if strategy_tag is None or lot.strategy_tag == strategy_tag
+        )
+        close_qty = quantity if quantity is not None else eligible_qty
+
+        if eligible_qty <= 0 or close_qty <= 0:
+            raise ValueError(f"No position quantity found for {symbol}")
+
+        if close_qty > eligible_qty:
             raise ValueError(
-                f"Cannot close {close_qty} units; only {pos.quantity} held"
+                f"Cannot close {close_qty} units; only {eligible_qty} held"
             )
 
-        pnl = self._calc_pnl(pos.side, pos.avg_price, price, close_qty)
-        self._total_realized_pnl += pnl
-        self._closed_positions.append(
-            {
-                "symbol": symbol,
-                "side": pos.side.value,
-                "quantity": close_qty,
-                "entry_price": pos.avg_price,
-                "exit_price": price,
-                "pnl": pnl,
-                "closed_at": datetime.now(tz=IST),
-                "strategy_tag": pos.strategy_tag,
-            }
-        )
+        realized = 0.0
+        remaining = int(close_qty)
+        kept_lots: List[PositionLot] = []
+        closed_at = datetime.now(tz=IST)
+        for lot in pos.lots:
+            if remaining <= 0 or (strategy_tag is not None and lot.strategy_tag != strategy_tag):
+                kept_lots.append(lot)
+                continue
 
-        if close_qty == pos.quantity:
+            matched = min(int(lot.quantity), remaining)
+            if matched > 0:
+                pnl = self._calc_pnl(pos.side, float(lot.entry_price), price, matched)
+                realized += pnl
+                self._closed_positions.append(
+                    {
+                        "symbol": symbol,
+                        "side": pos.side.value,
+                        "quantity": matched,
+                        "entry_price": float(lot.entry_price),
+                        "exit_price": price,
+                        "pnl": pnl,
+                        "closed_at": closed_at,
+                        "strategy_tag": str(lot.strategy_tag or ""),
+                    }
+                )
+                lot.quantity -= matched
+                remaining -= matched
+
+            if int(lot.quantity) > 0:
+                kept_lots.append(lot)
+
+        self._total_realized_pnl += realized
+        pos.lots = kept_lots
+        if not kept_lots:
+            pos.quantity = 0
+            pos.avg_price = 0.0
+            pos.entry_time = None
+            pos.strategy_tag = ""
+            pos.order_ids = []
+        self._recalculate_position(pos)
+
+        if pos.quantity <= 0:
             del self._positions[symbol]
             logger.info(
                 "position_closed",
                 symbol=symbol,
-                pnl=pnl,
+                pnl=realized,
             )
         else:
-            pos.quantity -= close_qty
             logger.info(
                 "position_partially_closed",
                 symbol=symbol,
                 closed_qty=close_qty,
                 remaining_qty=pos.quantity,
-                pnl=pnl,
+                pnl=realized,
             )
         self._persist_state()
 
-        return pnl
+        return realized
 
     def update_price(self, symbol: str, price: float) -> Optional[Position]:
         """Update the current market price for a position.
@@ -390,7 +498,29 @@ class PositionManager:
         Returns:
             List of positions matching the tag.
         """
-        return [p for p in self._positions.values() if p.strategy_tag == tag]
+        return self.get_position_views(strategy_tag=tag)
+
+    def get_position_views(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        strategy_tag: Optional[str] = None,
+    ) -> List[Position]:
+        """Return strategy-scoped views derived from consolidated symbol positions."""
+        views: List[Position] = []
+        for pos in self._positions.values():
+            if symbol is not None and pos.symbol != symbol:
+                continue
+            lots = self._normalized_lots(pos)
+            grouped: Dict[str, List[PositionLot]] = {}
+            for lot in lots:
+                tag = str(lot.strategy_tag or "")
+                if strategy_tag is not None and tag != strategy_tag:
+                    continue
+                grouped.setdefault(tag, []).append(lot)
+            for group_lots in grouped.values():
+                views.append(self._build_position_view(pos.symbol, pos.side, pos.current_price, group_lots))
+        return views
 
     @property
     def total_unrealized_pnl(self) -> float:
@@ -526,6 +656,7 @@ class PositionManager:
             self._positions = {}
             for raw in payload.get("positions", []):
                 position = self._deserialize_position(raw)
+                self._recalculate_position(position)
                 self._positions[position.symbol] = position
             self._closed_positions = [
                 self._deserialize_closed_trade(raw)
@@ -550,11 +681,22 @@ class PositionManager:
             "entry_time": position.entry_time.isoformat() if position.entry_time else None,
             "strategy_tag": position.strategy_tag,
             "order_ids": list(position.order_ids),
+            "lots": [
+                {
+                    "quantity": int(lot.quantity),
+                    "entry_price": float(lot.entry_price),
+                    "entry_time": lot.entry_time.isoformat() if lot.entry_time else None,
+                    "strategy_tag": str(lot.strategy_tag or ""),
+                    "order_ids": list(lot.order_ids),
+                }
+                for lot in PositionManager._normalized_lots(position)
+            ],
         }
 
     @staticmethod
     def _deserialize_position(payload: dict[str, Any]) -> Position:
-        return Position(
+        lots_payload = payload.get("lots") or []
+        position = Position(
             symbol=str(payload.get("symbol") or ""),
             quantity=int(payload.get("quantity") or 0),
             side=PositionSide(str(payload.get("side") or PositionSide.FLAT.value)),
@@ -567,7 +709,23 @@ class PositionManager:
             ),
             strategy_tag=str(payload.get("strategy_tag") or ""),
             order_ids=[str(order_id) for order_id in payload.get("order_ids", [])],
+            lots=[
+                PositionLot(
+                    quantity=int(raw.get("quantity") or 0),
+                    entry_price=float(raw.get("entry_price") or 0.0),
+                    entry_time=(
+                        datetime.fromisoformat(str(raw["entry_time"]))
+                        if raw.get("entry_time")
+                        else None
+                    ),
+                    strategy_tag=str(raw.get("strategy_tag") or ""),
+                    order_ids=[str(order_id) for order_id in raw.get("order_ids", [])],
+                )
+                for raw in lots_payload
+            ],
         )
+        PositionManager._recalculate_position(position)
+        return position
 
     @staticmethod
     def _serialize_closed_trade(payload: dict[str, Any]) -> dict[str, Any]:

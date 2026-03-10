@@ -208,7 +208,12 @@ export default function AIAgentPage() {
   const [scanInterval, setScanInterval] = useState(30);
   const [telegramStatusInterval, setTelegramStatusInterval] = useState(30);
   const [paperMode, setPaperMode] = useState(true);
-  const [capital, setCapital] = useState(250000);
+  const [indiaCapital, setIndiaCapital] = useState(250000);
+  const [usCapital, setUsCapital] = useState(250000);
+  const [cryptoCapital, setCryptoCapital] = useState(250000);
+  const [indiaMaxInstrumentPct, setIndiaMaxInstrumentPct] = useState(25);
+  const [usMaxInstrumentPct, setUsMaxInstrumentPct] = useState(20);
+  const [cryptoMaxInstrumentPct, setCryptoMaxInstrumentPct] = useState(20);
   const [timeframe, setTimeframe] = useState('5');
   const configHydratedRef = useRef(false);
 
@@ -237,6 +242,12 @@ export default function AIAgentPage() {
       setTradeUSOptions(status.trade_us_options ?? true);
       setTradeCrypto24x7(status.trade_crypto_24x7 ?? (status.crypto_symbols ?? []).length > 0);
       setTelegramStatusInterval(status.telegram_status_interval_minutes ?? 30);
+      setIndiaCapital(status.capital_allocations?.NSE?.allocated_capital ?? 250000);
+      setUsCapital(status.capital_allocations?.US?.allocated_capital ?? 250000);
+      setCryptoCapital(status.capital_allocations?.CRYPTO?.allocated_capital ?? 250000);
+      setIndiaMaxInstrumentPct(status.capital_allocations?.NSE?.max_instrument_pct ?? 25);
+      setUsMaxInstrumentPct(status.capital_allocations?.US?.max_instrument_pct ?? 20);
+      setCryptoMaxInstrumentPct(status.capital_allocations?.CRYPTO?.max_instrument_pct ?? 20);
       configHydratedRef.current = true;
     });
     return () => {
@@ -291,7 +302,12 @@ export default function AIAgentPage() {
       strategies,
       scan_interval_seconds: scanInterval,
       paper_mode: paperMode,
-      capital,
+      india_capital: indiaCapital,
+      us_capital: usCapital,
+      crypto_capital: cryptoCapital,
+      india_max_instrument_pct: indiaMaxInstrumentPct,
+      us_max_instrument_pct: usMaxInstrumentPct,
+      crypto_max_instrument_pct: cryptoMaxInstrumentPct,
       max_daily_loss_pct: 2.0,
       timeframe,
       execution_timeframes: DEFAULT_EXECUTION_TIMEFRAMES,
@@ -311,7 +327,12 @@ export default function AIAgentPage() {
     strategies,
     scanInterval,
     paperMode,
-    capital,
+    indiaCapital,
+    usCapital,
+    cryptoCapital,
+    indiaMaxInstrumentPct,
+    usMaxInstrumentPct,
+    cryptoMaxInstrumentPct,
     timeframe,
     telegramStatusInterval,
     startMutation,
@@ -347,6 +368,7 @@ export default function AIAgentPage() {
   const marketPnl = status?.market_pnl_inr ?? Object.fromEntries(
     marketStatRows.map(([market, row]) => [market, Number(row?.net_pnl_inr ?? 0)])
   );
+  const totalAllocatedCapitalInr = status?.total_allocated_capital_inr ?? 0;
 
   // ── Historical simulation state ─────────────────────────
   const [activeTab, setActiveTab] = useState<'live' | 'simulate'>('live');
@@ -593,15 +615,85 @@ export default function AIAgentPage() {
 
             {/* Capital */}
             <div>
-              <label className="text-xs text-slate-400 mb-1 block">Capital (INR)</label>
+              <label className="text-xs text-slate-400 mb-1 block">India Capital (INR)</label>
               <input
                 type="number"
-                value={capital}
-                onChange={(e) => setCapital(Number(e.target.value))}
+                value={indiaCapital}
+                onChange={(e) => setIndiaCapital(Number(e.target.value))}
                 min={10000}
                 disabled={isRunning || isPaused}
                 className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
               />
+            </div>
+
+            <div>
+              <label className="text-xs text-slate-400 mb-1 block">US Capital (USD)</label>
+              <input
+                type="number"
+                value={usCapital}
+                onChange={(e) => setUsCapital(Number(e.target.value))}
+                min={1000}
+                disabled={isRunning || isPaused}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+              />
+            </div>
+
+            <div>
+              <label className="text-xs text-slate-400 mb-1 block">Crypto Capital (USD)</label>
+              <input
+                type="number"
+                value={cryptoCapital}
+                onChange={(e) => setCryptoCapital(Number(e.target.value))}
+                min={1000}
+                disabled={isRunning || isPaused}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+              />
+            </div>
+
+            <div>
+              <label className="text-xs text-slate-400 mb-1 block">India Max / Instrument (%)</label>
+              <input
+                type="number"
+                value={indiaMaxInstrumentPct}
+                onChange={(e) => setIndiaMaxInstrumentPct(Number(e.target.value))}
+                min={1}
+                max={100}
+                disabled={isRunning || isPaused}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+              />
+            </div>
+
+            <div>
+              <label className="text-xs text-slate-400 mb-1 block">US Max / Instrument (%)</label>
+              <input
+                type="number"
+                value={usMaxInstrumentPct}
+                onChange={(e) => setUsMaxInstrumentPct(Number(e.target.value))}
+                min={1}
+                max={100}
+                disabled={isRunning || isPaused}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+              />
+            </div>
+
+            <div>
+              <label className="text-xs text-slate-400 mb-1 block">Crypto Max / Instrument (%)</label>
+              <input
+                type="number"
+                value={cryptoMaxInstrumentPct}
+                onChange={(e) => setCryptoMaxInstrumentPct(Number(e.target.value))}
+                min={1}
+                max={100}
+                disabled={isRunning || isPaused}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+              />
+            </div>
+
+            <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+              <div className="text-xs text-slate-400">Total Allocated Capital (INR equiv)</div>
+              <div className="mt-2 text-sm font-medium text-slate-200">
+                ₹{Math.round(totalAllocatedCapitalInr || (indiaCapital + (usCapital + cryptoCapital) * 83)).toLocaleString('en-IN')}
+              </div>
             </div>
 
             {/* Paper Mode Toggle */}

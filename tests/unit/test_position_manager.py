@@ -168,6 +168,25 @@ class TestPositionManagerOpenPosition:
         assert pos.avg_price == pytest.approx(150.0)
         assert pm.position_count == 1
 
+    def test_open_position_keeps_strategy_lots_under_one_symbol(self) -> None:
+        """Different strategies share one visible symbol row but keep separate lots."""
+        pm = PositionManager()
+        pm.open_position("SYM", 40, PositionSide.LONG, 100.0, strategy_tag="alpha")
+        pos = pm.open_position("SYM", 60, PositionSide.LONG, 110.0, strategy_tag="beta")
+
+        assert pos.quantity == 100
+        assert pos.avg_price == pytest.approx(106.0)
+        assert pos.strategy_tag == "MULTI"
+
+        alpha_positions = pm.get_positions_by_tag("alpha")
+        beta_positions = pm.get_positions_by_tag("beta")
+        assert len(alpha_positions) == 1
+        assert len(beta_positions) == 1
+        assert alpha_positions[0].quantity == 40
+        assert alpha_positions[0].avg_price == pytest.approx(100.0)
+        assert beta_positions[0].quantity == 60
+        assert beta_positions[0].avg_price == pytest.approx(110.0)
+
     def test_open_position_partial_close_opposite(self) -> None:
         """Opposite direction with smaller qty partially closes."""
         pm = PositionManager()
@@ -239,6 +258,23 @@ class TestPositionManagerClosePosition:
         pm.open_position("SYM", 50, PositionSide.LONG, 100.0)
         with pytest.raises(ValueError, match="Cannot close"):
             pm.close_position("SYM", 110.0, quantity=100)
+
+    def test_close_position_can_target_one_strategy_lot(self) -> None:
+        """Closing a mixed position by strategy only closes that strategy slice."""
+        pm = PositionManager()
+        pm.open_position("SYM", 40, PositionSide.LONG, 100.0, strategy_tag="alpha")
+        pm.open_position("SYM", 60, PositionSide.LONG, 110.0, strategy_tag="beta")
+
+        pnl = pm.close_position("SYM", 120.0, quantity=40, strategy_tag="alpha")
+
+        assert pnl == pytest.approx(800.0)
+        pos = pm.get_position("SYM")
+        assert pos is not None
+        assert pos.quantity == 60
+        assert pos.strategy_tag == "beta"
+        trades = pm.get_closed_trades()
+        assert len(trades) == 1
+        assert trades[0]["strategy_tag"] == "alpha"
 
 
 class TestPositionManagerPriceUpdates:

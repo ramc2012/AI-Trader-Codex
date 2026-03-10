@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.config.settings import get_settings
 from src.config.market_hours import IST
 from src.utils.logger import get_logger
+from src.utils.market_symbols import parse_currency_context
 
 logger = get_logger(__name__)
 
@@ -125,6 +126,24 @@ class RiskManager:
         self._persist_state()
         logger.info("daily_risk_state_auto_rollover", date=str(today), open_positions=open_positions)
 
+    def _effective_max_daily_loss(self) -> float:
+        """Return the active daily loss threshold."""
+        max_loss_abs = self.config.max_daily_loss
+        max_loss_pct_abs = self.config.capital * self.config.max_daily_loss_pct
+        return min(max_loss_abs, max_loss_pct_abs)
+
+    @staticmethod
+    def _to_inr(symbol: str, amount: float) -> float:
+        _, _, fx_to_inr = parse_currency_context(
+            symbol,
+            usd_inr_rate=float(get_settings().usd_inr_reference_rate),
+        )
+        return float(amount) * float(fx_to_inr)
+
+    def is_circuit_breaker_active(self) -> bool:
+        """Return whether circuit breaker enforcement is currently active."""
+        return bool(self.config.circuit_breaker_enabled and self.daily_state.circuit_breaker_triggered)
+
     def validate_trade(
         self,
         symbol: str,
@@ -166,7 +185,7 @@ class RiskManager:
             )
 
         # 2. Circuit breaker
-        if self.daily_state.circuit_breaker_triggered:
+        if self.is_circuit_breaker_active():
             logger.warning("trade_rejected_circuit_breaker", symbol=symbol)
             return TradeValidation(
                 is_valid=False,
@@ -176,11 +195,13 @@ class RiskManager:
 
         # 3. Daily loss limit
         total_daily_pnl = self.daily_state.realized_pnl + self.daily_state.unrealized_pnl
-        max_loss_abs = self.config.max_daily_loss
-        max_loss_pct_abs = self.config.capital * self.config.max_daily_loss_pct
-        effective_max_loss = min(max_loss_abs, max_loss_pct_abs)
+        effective_max_loss = self._effective_max_daily_loss()
 
-        if total_daily_pnl < 0 and abs(total_daily_pnl) >= effective_max_loss:
+        if (
+            self.config.circuit_breaker_enabled
+            and total_daily_pnl < 0
+            and abs(total_daily_pnl) >= effective_max_loss
+        ):
             logger.warning(
                 "trade_rejected_daily_loss",
                 symbol=symbol,
@@ -210,7 +231,8 @@ class RiskManager:
             )
 
         # 5. Position size limit
-        position_value = quantity * entry_price
+        position_value_native = quantity * entry_price
+        position_value = self._to_inr(symbol, position_value_native)
         if position_value > self.config.max_position_size:
             logger.warning(
                 "trade_rejected_position_size",
@@ -246,7 +268,7 @@ class RiskManager:
 
         # 7. Risk per trade
         risk_per_unit = abs(entry_price - stop_loss)
-        trade_risk = quantity * risk_per_unit
+        trade_risk = self._to_inr(symbol, quantity * risk_per_unit)
         risk_pct = trade_risk / self.config.capital if self.config.capital > 0 else 0.0
 
         if risk_pct > self.config.max_risk_per_trade_pct:
@@ -323,16 +345,14 @@ class RiskManager:
             True if the circuit breaker was triggered (or already triggered).
         """
         self._rollover_if_new_day()
-        if self.daily_state.circuit_breaker_triggered:
-            return True
-
         if not self.config.circuit_breaker_enabled:
             return False
 
+        if self.daily_state.circuit_breaker_triggered:
+            return True
+
         total_pnl = self.daily_state.realized_pnl + self.daily_state.unrealized_pnl
-        max_loss_abs = self.config.max_daily_loss
-        max_loss_pct_abs = self.config.capital * self.config.max_daily_loss_pct
-        effective_max_loss = min(max_loss_abs, max_loss_pct_abs)
+        effective_max_loss = self._effective_max_daily_loss()
 
         if total_pnl < 0 and abs(total_pnl) >= effective_max_loss:
             self.daily_state.circuit_breaker_triggered = True
@@ -376,9 +396,7 @@ class RiskManager:
             Remaining loss budget before circuit breaker triggers.
         """
         self._rollover_if_new_day()
-        max_loss_abs = self.config.max_daily_loss
-        max_loss_pct_abs = self.config.capital * self.config.max_daily_loss_pct
-        effective_max_loss = min(max_loss_abs, max_loss_pct_abs)
+        effective_max_loss = self._effective_max_daily_loss()
 
         total_pnl = self.daily_state.realized_pnl + self.daily_state.unrealized_pnl
         used = abs(total_pnl) if total_pnl < 0 else 0.0
@@ -392,9 +410,7 @@ class RiskManager:
             Dict with all current risk state fields.
         """
         self._rollover_if_new_day()
-        max_loss_abs = self.config.max_daily_loss
-        max_loss_pct_abs = self.config.capital * self.config.max_daily_loss_pct
-        effective_max_loss = min(max_loss_abs, max_loss_pct_abs)
+        effective_max_loss = self._effective_max_daily_loss()
 
         return {
             "date": str(self.daily_state.date),
@@ -411,7 +427,8 @@ class RiskManager:
             "max_open_positions": self.config.max_open_positions,
             "daily_loss_limit": effective_max_loss,
             "available_risk": round(self.get_available_risk(), 2),
-            "circuit_breaker_triggered": self.daily_state.circuit_breaker_triggered,
+            "circuit_breaker_enabled": bool(self.config.circuit_breaker_enabled),
+            "circuit_breaker_triggered": self.is_circuit_breaker_active(),
             "emergency_stop": self.emergency_stop,
             "position_values": dict(self._position_values),
         }
@@ -452,8 +469,9 @@ class RiskManager:
             position_value: Notional value of the position.
         """
         self._rollover_if_new_day()
+        position_value_inr = self._to_inr(symbol, position_value)
         existing = self._position_values.get(symbol, 0.0)
-        self._position_values[symbol] = existing + position_value
+        self._position_values[symbol] = existing + position_value_inr
         # Count open positions by symbol, not by trade count.
         if existing <= 0:
             self.daily_state.open_positions += 1
@@ -467,10 +485,11 @@ class RiskManager:
             position_value: Notional value being removed.
         """
         self._rollover_if_new_day()
+        position_value_inr = self._to_inr(symbol, position_value)
         current = self._position_values.get(symbol, 0.0)
         if current <= 0:
             return
-        remaining = current - position_value
+        remaining = current - position_value_inr
         if remaining <= 0:
             self._position_values.pop(symbol, None)
             self.daily_state.open_positions = max(0, self.daily_state.open_positions - 1)
@@ -486,14 +505,15 @@ class RiskManager:
         """
         self._rollover_if_new_day()
         current = self._position_values.get(symbol, 0.0)
-        if position_value <= 0:
+        position_value_inr = self._to_inr(symbol, position_value)
+        if position_value_inr <= 0:
             if current > 0:
                 self._position_values.pop(symbol, None)
                 self.daily_state.open_positions = max(0, self.daily_state.open_positions - 1)
                 self._persist_state()
             return
 
-        self._position_values[symbol] = position_value
+        self._position_values[symbol] = position_value_inr
         if current <= 0:
             self.daily_state.open_positions += 1
         self._persist_state()

@@ -18,6 +18,7 @@ from src.api.dependencies import (
     get_position_manager,
     get_risk_calculator,
     get_risk_manager,
+    get_trading_agent,
     reset_managers,
 )
 from src.api.main import create_app
@@ -45,9 +46,54 @@ def app() -> Tuple[FastAPI, RiskManager, RiskCalculator, PositionManager]:
     rc = RiskCalculator()
     pm = PositionManager()
 
+    class DummyAgent:
+        def get_capital_allocations(self):
+            return {
+                "NSE": {
+                    "market": "NSE",
+                    "label": "India",
+                    "currency": "INR",
+                    "currency_symbol": "₹",
+                    "fx_to_inr": 1.0,
+                    "allocated_capital": 250000.0,
+                    "allocated_capital_inr": 250000.0,
+                    "max_instrument_pct": 25.0,
+                    "max_instrument_capital": 62500.0,
+                    "max_instrument_capital_inr": 62500.0,
+                },
+                "US": {
+                    "market": "US",
+                    "label": "US",
+                    "currency": "USD",
+                    "currency_symbol": "$",
+                    "fx_to_inr": 83.0,
+                    "allocated_capital": 250000.0,
+                    "allocated_capital_inr": 20750000.0,
+                    "max_instrument_pct": 20.0,
+                    "max_instrument_capital": 50000.0,
+                    "max_instrument_capital_inr": 4150000.0,
+                },
+                "CRYPTO": {
+                    "market": "CRYPTO",
+                    "label": "Crypto",
+                    "currency": "USD",
+                    "currency_symbol": "$",
+                    "fx_to_inr": 83.0,
+                    "allocated_capital": 250000.0,
+                    "allocated_capital_inr": 20750000.0,
+                    "max_instrument_pct": 20.0,
+                    "max_instrument_capital": 50000.0,
+                    "max_instrument_capital_inr": 4150000.0,
+                },
+            }
+
+        def total_allocated_capital_inr(self) -> float:
+            return 41750000.0
+
     application.dependency_overrides[get_risk_manager] = lambda: rm
     application.dependency_overrides[get_risk_calculator] = lambda: rc
     application.dependency_overrides[get_position_manager] = lambda: pm
+    application.dependency_overrides[get_trading_agent] = lambda: DummyAgent()
 
     yield application, rm, rc, pm
 
@@ -93,9 +139,11 @@ class TestRiskSummary:
         expected_keys = {
             "date",
             "capital",
+            "total_allocated_capital_inr",
             "realized_pnl",
             "unrealized_pnl",
             "total_pnl",
+            "total_pnl_pct_on_allocated",
             "total_trades",
             "winning_trades",
             "losing_trades",
@@ -103,26 +151,32 @@ class TestRiskSummary:
             "max_open_positions",
             "daily_loss_limit",
             "available_risk",
+            "circuit_breaker_enabled",
             "circuit_breaker_triggered",
             "emergency_stop",
             "position_values",
+            "market_allocations",
         }
         assert set(data.keys()) == expected_keys
 
         # Default values for a fresh RiskManager
         assert data["date"] == str(date.today())
-        assert data["capital"] == 250000.0
+        assert data["capital"] == 41750000.0
+        assert data["total_allocated_capital_inr"] == 41750000.0
         assert data["realized_pnl"] == 0.0
         assert data["unrealized_pnl"] == 0.0
         assert data["total_pnl"] == 0.0
+        assert data["total_pnl_pct_on_allocated"] == 0.0
         assert data["total_trades"] == 0
         assert data["winning_trades"] == 0
         assert data["losing_trades"] == 0
         assert data["open_positions"] == 0
         assert data["max_open_positions"] == 6
+        assert data["circuit_breaker_enabled"] is True
         assert data["circuit_breaker_triggered"] is False
         assert data["emergency_stop"] is False
         assert data["position_values"] == {}
+        assert set(data["market_allocations"].keys()) == {"NSE", "US", "CRYPTO"}
 
         # daily_loss_limit should be min(5000, 250000 * 0.02) = 5000
         assert data["daily_loss_limit"] == 5000.0
@@ -159,6 +213,7 @@ class TestRiskSummary:
         assert data["total_pnl"] == 900.0
         assert data["open_positions"] == 1
         assert data["position_values"] == {"NSE:NIFTY50-INDEX": 50000.0}
+        assert data["circuit_breaker_enabled"] is True
         assert data["circuit_breaker_triggered"] is False
         assert data["emergency_stop"] is False
 
@@ -177,6 +232,7 @@ class TestRiskSummary:
         assert resp.status_code == 200
 
         data = resp.json()
+        assert data["circuit_breaker_enabled"] is True
         assert data["circuit_breaker_triggered"] is True
         assert data["realized_pnl"] == -5500.0
         assert data["available_risk"] == 0.0
@@ -195,7 +251,50 @@ class TestRiskSummary:
         assert resp.status_code == 200
 
         data = resp.json()
+        assert data["circuit_breaker_enabled"] is True
         assert data["emergency_stop"] is True
+
+    def test_reset_risk_state_clears_daily_counters(
+        self,
+        app: Tuple[FastAPI, RiskManager, RiskCalculator, PositionManager],
+        client: TestClient,
+    ) -> None:
+        """POST /risk/reset should clear today's PnL and circuit breaker state."""
+        _, rm, _, _ = app
+
+        rm.record_trade_result(pnl=-5500.0)
+        rm.add_position("NSE:NIFTY50-INDEX", 50000.0)
+
+        resp = client.post("/api/v1/risk/reset")
+        assert resp.status_code == 200
+
+        data = resp.json()
+        assert data["realized_pnl"] == 0.0
+        assert data["unrealized_pnl"] == 0.0
+        assert data["total_pnl"] == 0.0
+        assert data["total_trades"] == 0
+        assert data["open_positions"] == 0
+        assert data["circuit_breaker_enabled"] is True
+        assert data["circuit_breaker_triggered"] is False
+        assert data["emergency_stop"] is False
+        assert data["position_values"] == {}
+
+    def test_reset_risk_state_can_clear_emergency_stop(
+        self,
+        app: Tuple[FastAPI, RiskManager, RiskCalculator, PositionManager],
+        client: TestClient,
+    ) -> None:
+        """POST /risk/reset can optionally clear the kill switch."""
+        _, rm, _, _ = app
+
+        rm.trigger_emergency_stop("manual_test")
+
+        resp = client.post("/api/v1/risk/reset?clear_emergency_stop=true")
+        assert resp.status_code == 200
+
+        data = resp.json()
+        assert data["circuit_breaker_enabled"] is True
+        assert data["emergency_stop"] is False
 
 
 # =========================================================================

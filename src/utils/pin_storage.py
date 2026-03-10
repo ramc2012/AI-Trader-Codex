@@ -7,13 +7,28 @@ automatic token refresh functionality.
 from pathlib import Path
 from typing import Optional
 
+from src.config.settings import get_settings
 from src.utils.crypto import encrypt_pin, decrypt_pin
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# PIN file location (gitignored)
-_PIN_FILE = Path(".fyers_pin")
+_LEGACY_PIN_FILE = Path(".fyers_pin")
+
+
+def _pin_file_path() -> Path:
+    path = get_settings().pin_file_path
+    if path != _LEGACY_PIN_FILE and not path.exists() and _LEGACY_PIN_FILE.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_LEGACY_PIN_FILE.read_text(), encoding="utf-8")
+        path.chmod(0o600)
+        _LEGACY_PIN_FILE.unlink()
+        logger.info(
+            "pin_file_migrated",
+            from_path=str(_LEGACY_PIN_FILE),
+            to_path=str(path),
+        )
+    return path
 
 
 def save_pin(pin: str) -> bool:
@@ -31,10 +46,12 @@ def save_pin(pin: str) -> bool:
             return False
         
         encrypted = encrypt_pin(pin)
-        _PIN_FILE.write_text(encrypted)
-        _PIN_FILE.chmod(0o600)  # Owner read/write only
+        pin_file = _pin_file_path()
+        pin_file.parent.mkdir(parents=True, exist_ok=True)
+        pin_file.write_text(encrypted, encoding="utf-8")
+        pin_file.chmod(0o600)  # Owner read/write only
         
-        logger.info("pin_saved_securely", path=str(_PIN_FILE))
+        logger.info("pin_saved_securely", path=str(pin_file))
         return True
         
     except Exception as exc:
@@ -48,12 +65,13 @@ def load_pin() -> Optional[str]:
     Returns:
         Decrypted PIN or None if not found or decryption fails
     """
-    if not _PIN_FILE.exists():
-        logger.debug("pin_file_not_found", path=str(_PIN_FILE))
+    pin_file = _pin_file_path()
+    if not pin_file.exists():
+        logger.debug("pin_file_not_found", path=str(pin_file))
         return None
     
     try:
-        encrypted = _PIN_FILE.read_text()
+        encrypted = pin_file.read_text(encoding="utf-8")
         pin = decrypt_pin(encrypted)
         logger.debug("pin_loaded_successfully")
         return pin
@@ -70,9 +88,13 @@ def delete_pin() -> bool:
         True if deleted successfully or file doesn't exist
     """
     try:
-        if _PIN_FILE.exists():
-            _PIN_FILE.unlink()
-            logger.info("pin_deleted", path=str(_PIN_FILE))
+        pin_file = _pin_file_path()
+        if pin_file.exists():
+            pin_file.unlink()
+            logger.info("pin_deleted", path=str(pin_file))
+        if _LEGACY_PIN_FILE != pin_file and _LEGACY_PIN_FILE.exists():
+            _LEGACY_PIN_FILE.unlink()
+            logger.info("legacy_pin_deleted", path=str(_LEGACY_PIN_FILE))
         return True
         
     except Exception as exc:
@@ -86,4 +108,5 @@ def has_saved_pin() -> bool:
     Returns:
         True if PIN file exists and is readable
     """
-    return _PIN_FILE.exists()
+    pin_file = _pin_file_path()
+    return pin_file.exists()

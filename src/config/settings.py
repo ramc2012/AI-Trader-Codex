@@ -107,6 +107,7 @@ class Settings(BaseSettings):
     max_concentration_pct: float = Field(default=30.0, ge=5.0, le=100.0)
     max_trade_risk_pct: float = Field(default=0.5, ge=0.05, le=5.0)
     max_open_positions: int = Field(default=6, ge=1, le=20)
+    risk_circuit_breaker_enabled: bool = True
 
     # --- Data Collection ---
     fyers_rate_limit_per_sec: int = 1
@@ -168,6 +169,16 @@ class Settings(BaseSettings):
     def token_file_path(self) -> Path:
         """Path to the persistent Fyers access-token JSON file."""
         return self.data_path / ".fyers_token.json"
+
+    @property
+    def pin_file_path(self) -> Path:
+        """Path to the persistent encrypted FYERS PIN file."""
+        return self.data_path / ".fyers_pin"
+
+    @property
+    def crypto_key_path(self) -> Path:
+        """Path to the persistent Fernet key used for PIN encryption."""
+        return self.data_path / ".crypto_key"
 
     @property
     def database_url(self) -> str:

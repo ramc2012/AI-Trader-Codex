@@ -5,18 +5,19 @@ import {
   Area,
   XAxis,
   YAxis,
-  ResponsiveContainer,
   Tooltip,
 } from 'recharts';
 import { Shield, AlertTriangle } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 import { useRiskSummary } from '@/hooks/use-risk-summary';
 import { useRiskMetrics } from '@/hooks/use-risk-metrics';
+import { usePortfolio } from '@/hooks/use-portfolio';
 import { apiFetch } from '@/lib/api';
 import { formatINR, formatPercent, formatNumber } from '@/lib/formatters';
+import { buildEquityChartData, equityChartWidth } from '@/lib/equity-chart';
 import { cn } from '@/lib/utils';
 import { Skeleton } from '@/components/ui/skeleton';
-import type { EquitySnapshot } from '@/types/api';
+import type { EquitySnapshot, PortfolioPeriod } from '@/types/api';
 
 function MetricCard({
   title,
@@ -48,14 +49,30 @@ function MetricCard({
   );
 }
 
+function boundedMetric(
+  value: number | null | undefined,
+  min: number,
+  max: number,
+): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  if (value < min || value > max) {
+    return null;
+  }
+  return value;
+}
+
 export default function RiskPage() {
+  const equityPeriod: PortfolioPeriod = 'daily';
   const { data: risk, isLoading: riskLoading } = useRiskSummary();
   const { data: metrics, isLoading: metricsLoading } = useRiskMetrics();
+  const { data: portfolio } = usePortfolio();
 
   // Fetch equity curve from API instead of hardcoded sample data
   const { data: equityCurveApi, isLoading: equityLoading } = useQuery<EquitySnapshot[]>({
-    queryKey: ['equity-curve'],
-    queryFn: () => apiFetch<EquitySnapshot[]>('/portfolio/equity-curve'),
+    queryKey: ['equity-curve', equityPeriod],
+    queryFn: () => apiFetch<EquitySnapshot[]>(`/portfolio/equity-curve?period=${encodeURIComponent(equityPeriod)}`),
     refetchInterval: 10000,
   });
 
@@ -66,25 +83,11 @@ export default function RiskPage() {
   });
 
   // Use live data if available, else API data, else empty
-  const equityCurveData = (equityCurveLive && equityCurveLive.length > 1)
-    ? equityCurveLive.map((s) => ({
-        time: new Date(s.time).toLocaleTimeString('en-IN', {
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false,
-          timeZone: 'Asia/Kolkata',
-        }),
-        value: s.value,
-      }))
-    : (equityCurveApi ?? []).map((s) => ({
-        time: new Date(s.time).toLocaleTimeString('en-IN', {
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false,
-          timeZone: 'Asia/Kolkata',
-        }),
-        value: s.value,
-      }));
+  const equityCurveData = buildEquityChartData(equityCurveApi, equityCurveLive, equityPeriod);
+  const chartWidth = equityChartWidth(equityCurveData.length);
+  const maxDrawdown = boundedMetric(metrics?.max_drawdown, -1, 0);
+  const totalReturn = boundedMetric(metrics?.total_return, -10, 10);
+  const volatility = boundedMetric(metrics?.volatility, 0, 10);
 
   return (
     <div className="space-y-8">
@@ -127,9 +130,9 @@ export default function RiskPage() {
         />
         <MetricCard
           title="Max Drawdown"
-          value={metrics ? formatPercent(-metrics.max_drawdown) : '--'}
+          value={maxDrawdown !== null ? formatPercent(-maxDrawdown) : '--'}
           subtitle={
-            metrics
+            maxDrawdown !== null && metrics
               ? `Duration: ${metrics.max_drawdown_duration} days`
               : undefined
           }
@@ -173,12 +176,12 @@ export default function RiskPage() {
         />
         <MetricCard
           title="Total Return"
-          value={metrics ? formatPercent(metrics.total_return) : '--'}
+          value={totalReturn !== null ? formatPercent(totalReturn) : '--'}
           isLoading={metricsLoading}
         />
         <MetricCard
           title="Volatility"
-          value={metrics ? formatPercent(metrics.volatility) : '--'}
+          value={volatility !== null ? formatPercent(volatility) : '--'}
           isLoading={metricsLoading}
         />
       </div>
@@ -195,14 +198,13 @@ export default function RiskPage() {
             </span>
           )}
         </div>
-        <div className="h-72">
+        <div className="h-72 overflow-x-auto">
           {equityLoading ? (
             <div className="flex h-full items-center justify-center">
               <Skeleton className="h-full w-full" />
             </div>
           ) : equityCurveData.length > 0 ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={equityCurveData}>
+            <AreaChart width={chartWidth} height={288} data={equityCurveData}>
                 <defs>
                   <linearGradient id="riskEquity" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
@@ -210,7 +212,7 @@ export default function RiskPage() {
                   </linearGradient>
                 </defs>
                 <XAxis
-                  dataKey="time"
+                  dataKey="label"
                   stroke="#475569"
                   fontSize={12}
                   tickLine={false}
@@ -230,6 +232,18 @@ export default function RiskPage() {
                     borderRadius: '8px',
                     color: '#f1f5f9',
                   }}
+                  labelFormatter={(_, payload) =>
+                    payload?.[0]?.payload?.isoTime
+                      ? new Date(String(payload[0].payload.isoTime)).toLocaleString('en-IN', {
+                          day: '2-digit',
+                          month: 'short',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          hour12: false,
+                          timeZone: 'Asia/Kolkata',
+                        })
+                      : ''
+                  }
                   formatter={(val) => [formatINR(Number(val)), 'Equity']}
                 />
                 <Area
@@ -240,8 +254,7 @@ export default function RiskPage() {
                   fill="url(#riskEquity)"
                   isAnimationActive={false}
                 />
-              </AreaChart>
-            </ResponsiveContainer>
+            </AreaChart>
           ) : (
             <div className="flex h-full items-center justify-center text-sm text-slate-500">
               Equity data will appear once trading begins
@@ -281,11 +294,11 @@ export default function RiskPage() {
               <div>
                 <p className="text-xs text-slate-500">Capital</p>
                 <p className="text-sm font-medium text-slate-200">
-                  {formatINR(risk.capital)}
+                  {formatINR(risk.total_allocated_capital_inr || risk.capital)}
                 </p>
               </div>
               <div>
-                <p className="text-xs text-slate-500">Daily P&L</p>
+                <p className="text-xs text-slate-500">Total P&L</p>
                 <p
                   className={cn(
                     'text-sm font-medium',
@@ -305,6 +318,17 @@ export default function RiskPage() {
                 <p className="text-xs text-slate-500">Available Risk</p>
                 <p className="text-sm font-medium text-slate-200">
                   {formatINR(risk.available_risk)}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-slate-500">P&L On Capital</p>
+                <p
+                  className={cn(
+                    'text-sm font-medium',
+                    risk.total_pnl_pct_on_allocated >= 0 ? 'text-emerald-400' : 'text-red-400'
+                  )}
+                >
+                  {formatPercent(risk.total_pnl_pct_on_allocated)}
                 </p>
               </div>
               <div>
@@ -328,9 +352,47 @@ export default function RiskPage() {
               <div>
                 <p className="text-xs text-slate-500">Open Positions</p>
                 <p className="text-sm font-medium text-slate-200">
-                  {risk.open_positions} / {risk.max_open_positions}
+                  {risk.open_positions}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Configured cap: {risk.max_open_positions}
                 </p>
               </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
+              {Object.entries(portfolio?.market_breakdown ?? {}).map(([market, row]) => (
+                <div key={market} className="rounded-lg border border-slate-800 bg-slate-950/60 p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-semibold text-slate-100">{row.label ?? market}</div>
+                    <div className="text-xs text-slate-500">{row.open_positions ?? 0} open</div>
+                  </div>
+                  <div className="mt-2 text-sm text-slate-300">
+                    Exposure:{' '}
+                    <span className="text-slate-100">
+                      {row.currency === 'USD'
+                        ? `${row.currency_symbol}${Number(row.market_value ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                        : formatINR(Number(row.market_value_inr ?? 0))}
+                    </span>
+                  </div>
+                  <div className={cn('mt-2 text-sm', Number(row.net_pnl_inr ?? 0) >= 0 ? 'text-emerald-300' : 'text-red-300')}>
+                    Net P&L:{' '}
+                    {row.currency === 'USD'
+                      ? `${row.currency_symbol}${Number(row.net_pnl ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                      : formatINR(Number(row.net_pnl_inr ?? 0))}
+                  </div>
+                  <div className="mt-2 text-xs text-slate-500">
+                    Allocation{' '}
+                    {row.currency === 'USD'
+                      ? `${row.currency_symbol}${Number(row.allocated_capital ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`
+                      : formatINR(Number(row.allocated_capital_inr ?? 0))}
+                    {' · '}
+                    Used {formatPercent(Number(row.capital_used_pct ?? 0), 1)}
+                    {' · '}
+                    P&L {formatPercent(Number(row.pnl_pct_on_allocated ?? 0), 2)}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         ) : (

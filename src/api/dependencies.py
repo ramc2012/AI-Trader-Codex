@@ -114,7 +114,7 @@ def get_risk_manager() -> RiskManager:
                 max_daily_loss=base_config.capital * max_daily_loss_pct,
                 capital=base_config.capital,
                 max_concentration_pct=max_concentration_pct or base_config.max_concentration_pct,
-                circuit_breaker_enabled=base_config.circuit_breaker_enabled,
+                circuit_breaker_enabled=bool(settings.risk_circuit_breaker_enabled),
                 time_based_exit_minutes=base_config.time_based_exit_minutes,
             )
         )

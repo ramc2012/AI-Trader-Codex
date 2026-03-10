@@ -43,6 +43,17 @@ echo "Fixing persistent data ownership..."
 mkdir -p backend_data
 sudo chown -R 1000:1000 backend_data
 
+echo "Ensuring host swap is enabled..."
+if ! sudo swapon --show | grep -q '/swapfile'; then
+  sudo fallocate -l 2G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  if ! grep -q '^/swapfile ' /etc/fstab; then
+    echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+  fi
+fi
+
 echo "Starting stack..."
 docker compose --env-file .env.aws.single -f docker-compose.aws-single.yml up -d
 

@@ -1,3 +1,44 @@
+export interface MarketCapitalAllocation {
+  market: string;
+  label: string;
+  currency: string;
+  currency_symbol: string;
+  fx_to_inr: number;
+  allocated_capital: number;
+  allocated_capital_inr: number;
+  max_instrument_pct: number;
+  max_instrument_capital: number;
+  max_instrument_capital_inr: number;
+}
+
+export interface PerformanceStats {
+  signals: number;
+  entries: number;
+  closed_trades: number;
+  wins: number;
+  losses: number;
+  win_rate_pct: number;
+  currency: string;
+  currency_symbol: string;
+  fx_to_inr: number;
+  allocated_capital: number;
+  allocated_capital_inr: number;
+  max_instrument_pct: number;
+  max_instrument_capital: number;
+  max_instrument_capital_inr: number;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  net_pnl: number;
+  realized_pnl_inr: number;
+  unrealized_pnl_inr: number;
+  net_pnl_inr: number;
+  open_positions: number;
+  capital_used: number;
+  capital_used_inr: number;
+  capital_used_pct: number;
+  pnl_pct_on_allocated: number;
+}
+
 export interface Position {
   symbol: string;
   market: string;
@@ -54,6 +95,8 @@ export interface PortfolioSummary {
   total_unrealized_pnl_inr?: number;
   total_realized_pnl_inr?: number;
   total_pnl_inr?: number;
+  total_allocated_capital_inr?: number;
+  total_pnl_pct_on_allocated?: number;
   base_currency?: string;
   usd_inr_rate?: number;
   currency_breakdown?: Record<
@@ -72,12 +115,28 @@ export interface PortfolioSummary {
   market_breakdown?: Record<
     string,
     {
+      market: string;
+      label: string;
+      currency: string;
+      currency_symbol: string;
+      fx_to_inr: number;
+      allocated_capital: number;
+      allocated_capital_inr: number;
+      max_instrument_pct: number;
+      max_instrument_capital: number;
+      max_instrument_capital_inr: number;
       open_positions: number;
       closed_trades: number;
+      market_value: number;
       market_value_inr: number;
+      unrealized_pnl: number;
       unrealized_pnl_inr: number;
+      realized_pnl: number;
       realized_pnl_inr: number;
+      net_pnl: number;
       net_pnl_inr: number;
+      capital_used_pct: number;
+      pnl_pct_on_allocated: number;
     }
   >;
   positions: Record<string, unknown>;
@@ -87,6 +146,7 @@ export type PortfolioPeriod = 'daily' | 'week' | 'month' | 'year';
 
 export interface InstrumentPerformanceRow {
   symbol: string;
+  market: string;
   currency: string;
   currency_symbol: string;
   fx_to_inr: number;
@@ -99,6 +159,7 @@ export interface InstrumentPerformanceRow {
   realized_pnl_inr: number;
   unrealized_pnl: number;
   unrealized_pnl_inr: number;
+  net_pnl: number;
   net_pnl_inr: number;
   avg_hold_minutes: number;
   last_trade_time?: string | null;
@@ -167,9 +228,11 @@ export interface Signal {
 export interface RiskSummary {
   date: string;
   capital: number;
+  total_allocated_capital_inr: number;
   realized_pnl: number;
   unrealized_pnl: number;
   total_pnl: number;
+  total_pnl_pct_on_allocated: number;
   total_trades: number;
   winning_trades: number;
   losing_trades: number;
@@ -177,8 +240,11 @@ export interface RiskSummary {
   max_open_positions: number;
   daily_loss_limit: number;
   available_risk: number;
+  circuit_breaker_enabled?: boolean;
   circuit_breaker_triggered: boolean;
   emergency_stop: boolean;
+  position_values?: Record<string, number>;
+  market_allocations?: Record<string, MarketCapitalAllocation>;
 }
 
 export interface RiskMetrics {
@@ -464,41 +530,17 @@ export interface AgentStatus {
   execution_timeframes?: string[];
   reference_timeframes?: string[];
   telegram_status_interval_minutes?: number;
+  capital_allocations?: Record<string, MarketCapitalAllocation>;
+  total_allocated_capital_inr?: number;
   positions_count: number;
   daily_pnl: number;
   total_signals: number;
   total_trades: number;
   market_pnl_inr?: Record<string, number>;
-  market_stats?: Record<
-    string,
-    {
-      signals: number;
-      entries: number;
-      closed_trades: number;
-      wins: number;
-      losses: number;
-      win_rate_pct: number;
-      realized_pnl_inr: number;
-      unrealized_pnl_inr: number;
-      net_pnl_inr: number;
-      open_positions: number;
-    }
-  >;
-  strategy_stats?: Record<
-    string,
-    {
-      signals: number;
-      entries: number;
-      closed_trades: number;
-      wins: number;
-      losses: number;
-      win_rate_pct: number;
-      realized_pnl_inr: number;
-      unrealized_pnl_inr: number;
-      net_pnl_inr: number;
-      open_positions: number;
-    }
-  >;
+  market_stats?: Record<string, PerformanceStats>;
+  strategy_stats?: Record<string, PerformanceStats>;
+  strategy_market_stats?: Record<string, Record<string, PerformanceStats>>;
+  strategy_instrument_stats?: Record<string, Record<string, PerformanceStats>>;
   strategy_controls?: Array<{
     name: string;
     enabled: boolean;
@@ -519,7 +561,13 @@ export interface AgentConfig {
   strategies: string[];
   scan_interval_seconds: number;
   paper_mode: boolean;
-  capital: number;
+  capital?: number;
+  india_capital: number;
+  us_capital: number;
+  crypto_capital: number;
+  india_max_instrument_pct: number;
+  us_max_instrument_pct: number;
+  crypto_max_instrument_pct: number;
   max_daily_loss_pct: number;
   timeframe: string;
   execution_timeframes?: string[];

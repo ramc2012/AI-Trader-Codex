@@ -156,6 +156,33 @@ class TestValidateTradeReject:
         assert result.is_valid is False
         assert "circuit breaker" in result.reason.lower()
 
+    def test_allows_trades_after_loss_limit_when_circuit_breaker_disabled(self) -> None:
+        """Disabling the breaker should also disable daily-loss trade rejection."""
+        cfg = RiskConfig(
+            max_daily_loss=5_000.0,
+            max_daily_loss_pct=0.02,
+            max_position_size=100_000.0,
+            max_open_positions=5,
+            max_concentration_pct=0.30,
+            max_risk_per_trade_pct=0.02,
+            capital=250_000.0,
+            circuit_breaker_enabled=False,
+        )
+        mgr = RiskManager(config=cfg)
+        mgr.daily_state.realized_pnl = -5_500.0
+        mgr.daily_state.circuit_breaker_triggered = True
+
+        result = mgr.validate_trade(
+            symbol="NSE:NIFTY50-INDEX",
+            side="BUY",
+            quantity=2,
+            entry_price=22_000.0,
+            stop_loss=21_950.0,
+        )
+
+        assert result.is_valid is True
+        assert result.reason == ""
+
 
 # =========================================================================
 # Circuit breaker
@@ -300,12 +327,13 @@ class TestGetRiskSummary:
             "date", "capital", "realized_pnl", "unrealized_pnl",
             "total_pnl", "total_trades", "winning_trades", "losing_trades",
             "open_positions", "max_open_positions", "daily_loss_limit",
-            "available_risk", "circuit_breaker_triggered", "emergency_stop",
-            "position_values",
+            "available_risk", "circuit_breaker_enabled",
+            "circuit_breaker_triggered", "emergency_stop", "position_values",
         }
         assert expected_keys.issubset(set(summary.keys()))
         assert summary["realized_pnl"] == -1000.0
         assert summary["capital"] == 250_000.0
+        assert summary["circuit_breaker_enabled"] is True
 
 
 # =========================================================================

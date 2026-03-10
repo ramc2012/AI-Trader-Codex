@@ -54,6 +54,7 @@ from src.strategies.directional.rsi_reversal import RSIReversalStrategy
 from src.strategies.directional.supertrend_strategy import SupertrendStrategy
 from src.utils.logger import get_logger
 from src.utils.market_symbols import parse_currency_context
+from src.utils.us_market_data import parse_nasdaq_chart_timestamp, parse_nasdaq_historical_date
 from src.watchlist.options_analytics import BlackScholes
 from src.watchlist.options_data_service import OptionsDataService
 
@@ -114,7 +115,13 @@ class AgentConfig:
     )
     scan_interval_seconds: int = 30
     paper_mode: bool = True
-    capital: float = 250_000.0
+    capital: float = 41_750_000.0
+    india_capital: float = 250_000.0
+    us_capital: float = 250_000.0
+    crypto_capital: float = 250_000.0
+    india_max_instrument_pct: float = 25.0
+    us_max_instrument_pct: float = 20.0
+    crypto_max_instrument_pct: float = 20.0
     max_daily_loss_pct: float = 2.0
     timeframe: str = "5"
     execution_timeframes: List[str] = field(default_factory=lambda: ["3", "5", "15"])
@@ -131,6 +138,8 @@ class AgentConfig:
     reinforcement_enabled: bool = True
     reinforcement_alpha: float = 0.2
     reinforcement_size_boost_pct: float = 60.0
+    strategy_capital_bucket_enabled: bool = True
+    strategy_max_concurrent_positions: int = 4
     telegram_status_interval_minutes: int = 30
 
 
@@ -154,6 +163,7 @@ class OptionExitPlan:
     symbol: str
     underlying_symbol: str
     strategy: str
+    quantity: int
     execution_timeframe: str
     entry_price: float
     stop_loss: float
@@ -198,7 +208,7 @@ class TradingAgent:
         self._us_intraday_cache_ttl = timedelta(seconds=45)
         self._us_daily_cache: Dict[str, Tuple[datetime, pd.DataFrame]] = {}
         self._us_daily_cache_ttl = timedelta(minutes=5)
-        self._option_exit_plans: Dict[str, OptionExitPlan] = {}
+        self._option_exit_plans: Dict[str, Dict[str, OptionExitPlan]] = {}
         self._strategy_reward_ema: Dict[str, float] = {}
         self._strategy_reward_counts: Dict[str, int] = {}
         self._strategy_signal_counts: Dict[str, int] = {}
@@ -359,6 +369,62 @@ class TradingAgent:
             })
         return controls
 
+    def get_capital_allocations(self) -> Dict[str, Dict[str, Any]]:
+        """Return market-wise capital allocations in native and INR terms."""
+        usd_inr_rate = float(get_settings().usd_inr_reference_rate)
+        allocations = {
+            "NSE": {
+                "market": "NSE",
+                "label": "India",
+                "currency": "INR",
+                "currency_symbol": "₹",
+                "fx_to_inr": 1.0,
+                "allocated_capital": float(self.config.india_capital),
+                "allocated_capital_inr": float(self.config.india_capital),
+                "max_instrument_pct": float(self.config.india_max_instrument_pct),
+            },
+            "US": {
+                "market": "US",
+                "label": "US",
+                "currency": "USD",
+                "currency_symbol": "$",
+                "fx_to_inr": usd_inr_rate,
+                "allocated_capital": float(self.config.us_capital),
+                "allocated_capital_inr": float(self.config.us_capital) * usd_inr_rate,
+                "max_instrument_pct": float(self.config.us_max_instrument_pct),
+            },
+            "CRYPTO": {
+                "market": "CRYPTO",
+                "label": "Crypto",
+                "currency": "USD",
+                "currency_symbol": "$",
+                "fx_to_inr": usd_inr_rate,
+                "allocated_capital": float(self.config.crypto_capital),
+                "allocated_capital_inr": float(self.config.crypto_capital) * usd_inr_rate,
+                "max_instrument_pct": float(self.config.crypto_max_instrument_pct),
+            },
+        }
+        for row in allocations.values():
+            max_instrument_pct = float(row["max_instrument_pct"])
+            allocated_capital = float(row["allocated_capital"])
+            allocated_capital_inr = float(row["allocated_capital_inr"])
+            row["max_instrument_capital"] = round(allocated_capital * max_instrument_pct / 100.0, 2)
+            row["max_instrument_capital_inr"] = round(allocated_capital_inr * max_instrument_pct / 100.0, 2)
+            row["allocated_capital"] = round(allocated_capital, 2)
+            row["allocated_capital_inr"] = round(allocated_capital_inr, 2)
+        return allocations
+
+    def total_allocated_capital_inr(self) -> float:
+        """Return total allocated capital converted to INR."""
+        return round(
+            sum(float(row.get("allocated_capital_inr", 0.0)) for row in self.get_capital_allocations().values()),
+            2,
+        )
+
+    def _market_allocation(self, market: str) -> Dict[str, Any]:
+        key = str(market or "NSE").upper()
+        return self.get_capital_allocations().get(key, self.get_capital_allocations()["NSE"])
+
     def set_strategy_enabled(self, name: str, enabled: bool) -> bool:
         """Enable/disable a strategy without restarting the agent."""
         if name not in STRATEGY_REGISTRY:
@@ -412,7 +478,16 @@ class TradingAgent:
     def get_status(self) -> Dict[str, Any]:
         """Return current agent status and metrics."""
         portfolio = self.position_manager.get_portfolio_summary()
-        market_stats, strategy_stats = self._build_performance_snapshots()
+        (
+            market_stats,
+            strategy_stats,
+            strategy_market_stats,
+            strategy_instrument_stats,
+        ) = self._build_performance_snapshots()
+        risk_summary = self.risk_manager.get_risk_summary()
+        closed_trades = sum(int(stats.get("closed_trades", 0) or 0) for stats in strategy_stats.values())
+        open_trade_entries = int(portfolio.get("position_count", 0) or 0)
+        capital_allocations = self.get_capital_allocations()
         market_pnl = {
             market: round(float(stats.get("net_pnl_inr", 0.0)), 2)
             for market, stats in market_stats.items()
@@ -438,13 +513,19 @@ class TradingAgent:
             "execution_timeframes": self.get_execution_timeframes(),
             "reference_timeframes": self.get_reference_timeframes(),
             "telegram_status_interval_minutes": max(int(self.config.telegram_status_interval_minutes), 0),
+            "capital_allocations": capital_allocations,
+            "total_allocated_capital_inr": self.total_allocated_capital_inr(),
             "positions_count": portfolio.get("position_count", 0),
-            "daily_pnl": round(self._daily_pnl, 2),
+            # Daily risk state is persisted across agent restarts, unlike the
+            # in-memory session counters. Use it for top-level daily totals.
+            "daily_pnl": round(float(risk_summary.get("total_pnl", self._daily_pnl) or 0.0), 2),
             "total_signals": self._total_signals,
-            "total_trades": self._total_trades,
+            "total_trades": closed_trades + open_trade_entries,
             "market_stats": market_stats,
             "market_pnl_inr": market_pnl,
             "strategy_stats": strategy_stats,
+            "strategy_market_stats": strategy_market_stats,
+            "strategy_instrument_stats": strategy_instrument_stats,
             "strategy_controls": self.get_strategy_controls(),
             "last_scan_time": self._last_scan_time.isoformat() if self._last_scan_time else None,
             "bootstrap_mode_active": self._is_bootstrap_phase(),
@@ -453,8 +534,43 @@ class TradingAgent:
             "error": self._error,
         }
 
-    @staticmethod
-    def _stats_bucket() -> Dict[str, Any]:
+    def _stats_bucket(
+        self,
+        *,
+        market: Optional[str] = None,
+        symbol: Optional[str] = None,
+        overall: bool = False,
+    ) -> Dict[str, Any]:
+        allocation = self._market_allocation(market or self._symbol_market(symbol or "NSE:NIFTY50-INDEX"))
+        if overall:
+            total_capital_inr = self.total_allocated_capital_inr()
+            return {
+                "signals": 0,
+                "entries": 0,
+                "closed_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "win_rate_pct": 0.0,
+                "currency": "INR",
+                "currency_symbol": "₹",
+                "fx_to_inr": 1.0,
+                "allocated_capital": total_capital_inr,
+                "allocated_capital_inr": total_capital_inr,
+                "max_instrument_pct": 0.0,
+                "max_instrument_capital": 0.0,
+                "max_instrument_capital_inr": 0.0,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "net_pnl": 0.0,
+                "realized_pnl_inr": 0.0,
+                "unrealized_pnl_inr": 0.0,
+                "net_pnl_inr": 0.0,
+                "open_positions": 0,
+                "capital_used": 0.0,
+                "capital_used_inr": 0.0,
+                "capital_used_pct": 0.0,
+                "pnl_pct_on_allocated": 0.0,
+            }
         return {
             "signals": 0,
             "entries": 0,
@@ -462,16 +578,86 @@ class TradingAgent:
             "wins": 0,
             "losses": 0,
             "win_rate_pct": 0.0,
+            "currency": allocation["currency"],
+            "currency_symbol": allocation["currency_symbol"],
+            "fx_to_inr": float(allocation["fx_to_inr"]),
+            "allocated_capital": float(allocation["allocated_capital"]),
+            "allocated_capital_inr": float(allocation["allocated_capital_inr"]),
+            "max_instrument_pct": float(allocation["max_instrument_pct"]),
+            "max_instrument_capital": float(allocation["max_instrument_capital"]),
+            "max_instrument_capital_inr": float(allocation["max_instrument_capital_inr"]),
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "net_pnl": 0.0,
             "realized_pnl_inr": 0.0,
             "unrealized_pnl_inr": 0.0,
             "net_pnl_inr": 0.0,
             "open_positions": 0,
+            "capital_used": 0.0,
+            "capital_used_inr": 0.0,
+            "capital_used_pct": 0.0,
+            "pnl_pct_on_allocated": 0.0,
         }
 
     @staticmethod
     def _normalize_strategy_tag(tag: Any) -> str:
         token = str(tag or "").strip()
         return token if token else "Unassigned"
+
+    def _enabled_strategy_names(self) -> List[str]:
+        return [
+            str(control.get("name"))
+            for control in self.get_strategy_controls()
+            if bool(control.get("enabled"))
+        ]
+
+    def _symbol_exit_plans(self, symbol: str) -> List[OptionExitPlan]:
+        strategy_map = self._option_exit_plans.get(symbol) or {}
+        return list(strategy_map.values())
+
+    def _display_exit_plan(self, symbol: str) -> Optional[OptionExitPlan]:
+        plans = self._symbol_exit_plans(symbol)
+        if not plans:
+            return None
+        if len(plans) == 1:
+            return plans[0]
+
+        total_qty = sum(max(int(plan.quantity), 0) for plan in plans)
+        weighted_entry = sum(float(plan.entry_price) * max(int(plan.quantity), 0) for plan in plans)
+        weighted_stop = sum(float(plan.stop_loss) * max(int(plan.quantity), 0) for plan in plans)
+        weighted_target = sum(float(plan.target) * max(int(plan.quantity), 0) for plan in plans)
+        anchor = plans[0]
+        divisor = max(total_qty, 1)
+        return OptionExitPlan(
+            symbol=symbol,
+            underlying_symbol=anchor.underlying_symbol,
+            strategy="MULTI",
+            quantity=total_qty,
+            execution_timeframe=anchor.execution_timeframe,
+            entry_price=weighted_entry / divisor,
+            stop_loss=weighted_stop / divisor,
+            target=weighted_target / divisor,
+            opened_at=min(plan.opened_at for plan in plans),
+            time_exit_at=min(plan.time_exit_at for plan in plans),
+        )
+
+    def _has_exit_plan_for_underlying(self, underlying_symbol: str) -> bool:
+        for strategy_map in self._option_exit_plans.values():
+            for plan in strategy_map.values():
+                if plan.underlying_symbol == underlying_symbol:
+                    return True
+        return False
+
+    def _remove_exit_plan(self, symbol: str, strategy: Optional[str] = None) -> None:
+        if strategy is None:
+            self._option_exit_plans.pop(symbol, None)
+            return
+        strategy_map = self._option_exit_plans.get(symbol)
+        if not strategy_map:
+            return
+        strategy_map.pop(strategy, None)
+        if not strategy_map:
+            self._option_exit_plans.pop(symbol, None)
 
     @staticmethod
     def _to_ist(value: Optional[datetime]) -> datetime:
@@ -541,30 +727,64 @@ class TradingAgent:
 
         return closed_pairs
 
-    def _build_performance_snapshots(self) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    @staticmethod
+    def _bucket_native_value(bucket: Dict[str, Any], amount_inr: float) -> float:
+        fx_to_inr = max(float(bucket.get("fx_to_inr", 1.0) or 1.0), 1e-6)
+        return float(amount_inr) / fx_to_inr
+
+    def _build_performance_snapshots(
+        self,
+    ) -> Tuple[
+        Dict[str, Dict[str, Any]],
+        Dict[str, Dict[str, Any]],
+        Dict[str, Dict[str, Dict[str, Any]]],
+        Dict[str, Dict[str, Dict[str, Any]]],
+    ]:
         """Build market-wise and strategy-wise P&L/trade snapshots."""
         settings = get_settings()
         usd_inr_rate = float(settings.usd_inr_reference_rate)
 
         market_stats: Dict[str, Dict[str, Any]] = {}
         strategy_stats: Dict[str, Dict[str, Any]] = {}
+        strategy_market_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        strategy_instrument_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
         def market_bucket(market: str) -> Dict[str, Any]:
             key = str(market or "NSE").upper()
             if key not in market_stats:
-                market_stats[key] = self._stats_bucket()
+                market_stats[key] = self._stats_bucket(market=key)
             return market_stats[key]
 
         def strategy_bucket(strategy: str) -> Dict[str, Any]:
             key = self._normalize_strategy_tag(strategy)
             if key not in strategy_stats:
-                strategy_stats[key] = self._stats_bucket()
+                strategy_stats[key] = self._stats_bucket(overall=True)
             return strategy_stats[key]
+
+        def strategy_market_bucket(strategy: str, market: str) -> Dict[str, Any]:
+            key = self._normalize_strategy_tag(strategy)
+            if key not in strategy_market_stats:
+                strategy_market_stats[key] = {}
+            market_key = str(market or "NSE").upper()
+            if market_key not in strategy_market_stats[key]:
+                strategy_market_stats[key][market_key] = self._stats_bucket(market=market_key)
+            return strategy_market_stats[key][market_key]
+
+        def strategy_instrument_bucket(strategy: str, symbol: str) -> Dict[str, Any]:
+            key = self._normalize_strategy_tag(strategy)
+            if key not in strategy_instrument_stats:
+                strategy_instrument_stats[key] = {}
+            symbol_key = str(symbol or "").strip()
+            if symbol_key not in strategy_instrument_stats[key]:
+                strategy_instrument_stats[key][symbol_key] = self._stats_bucket(symbol=symbol_key)
+            return strategy_instrument_stats[key][symbol_key]
 
         for market in ("NSE", "US", "CRYPTO"):
             market_bucket(market)
         for strategy in self.config.strategies:
             strategy_bucket(strategy)
+            for market in ("NSE", "US", "CRYPTO"):
+                strategy_market_bucket(strategy, market)
 
         for market, count in self._market_signal_counts.items():
             market_bucket(market)["signals"] = int(count)
@@ -575,39 +795,82 @@ class TradingAgent:
         for strategy, count in self._strategy_trade_counts.items():
             strategy_bucket(strategy)["entries"] = int(count)
 
-        for trade in self._build_closed_trade_pairs(usd_inr_rate=usd_inr_rate):
-            market = str(trade.get("market") or "NSE")
-            strategy = self._normalize_strategy_tag(trade.get("strategy"))
-            pnl_inr = float(trade.get("pnl_inr") or 0.0)
-
-            for bucket in (market_bucket(market), strategy_bucket(strategy)):
+        for trade in self.position_manager.get_closed_trades():
+            symbol = str(trade.get("symbol") or "")
+            market = self._symbol_market(symbol)
+            strategy = self._normalize_strategy_tag(trade.get("strategy_tag"))
+            _, _, fx_to_inr = parse_currency_context(symbol, usd_inr_rate=usd_inr_rate)
+            pnl_inr = float(trade.get("pnl") or 0.0) * float(fx_to_inr)
+            buckets = (
+                market_bucket(market),
+                strategy_bucket(strategy),
+                strategy_market_bucket(strategy, market),
+                strategy_instrument_bucket(strategy, symbol),
+            )
+            for bucket in buckets:
                 bucket["closed_trades"] += 1
+                bucket["entries"] = max(int(bucket["entries"]), int(bucket["closed_trades"]))
+                bucket["realized_pnl"] += self._bucket_native_value(bucket, pnl_inr)
                 bucket["realized_pnl_inr"] += pnl_inr
                 if pnl_inr > 0:
                     bucket["wins"] += 1
                 elif pnl_inr < 0:
                     bucket["losses"] += 1
 
-        for position in self.position_manager.get_all_positions():
+        for position in self.position_manager.get_position_views():
             market = self._symbol_market(position.symbol)
             strategy = self._normalize_strategy_tag(position.strategy_tag)
             _, _, fx_to_inr = parse_currency_context(position.symbol, usd_inr_rate=usd_inr_rate)
+            market_value_inr = float(position.market_value) * float(fx_to_inr)
             unrealized_pnl_inr = float(position.unrealized_pnl) * float(fx_to_inr)
-
-            for bucket in (market_bucket(market), strategy_bucket(strategy)):
+            buckets = (
+                market_bucket(market),
+                strategy_bucket(strategy),
+                strategy_market_bucket(strategy, market),
+                strategy_instrument_bucket(strategy, position.symbol),
+            )
+            for bucket in buckets:
                 bucket["open_positions"] += 1
+                bucket["entries"] = max(int(bucket["entries"]), int(bucket["closed_trades"]) + int(bucket["open_positions"]))
+                bucket["capital_used"] += self._bucket_native_value(bucket, market_value_inr)
+                bucket["capital_used_inr"] += market_value_inr
+                bucket["unrealized_pnl"] += self._bucket_native_value(bucket, unrealized_pnl_inr)
                 bucket["unrealized_pnl_inr"] += unrealized_pnl_inr
 
-        for bucket in list(market_stats.values()) + list(strategy_stats.values()):
+        all_buckets = (
+            list(market_stats.values())
+            + list(strategy_stats.values())
+            + [bucket for row in strategy_market_stats.values() for bucket in row.values()]
+            + [bucket for row in strategy_instrument_stats.values() for bucket in row.values()]
+        )
+
+        for bucket in all_buckets:
             closed = int(bucket["closed_trades"])
             wins = int(bucket["wins"])
             bucket["win_rate_pct"] = round((wins / closed) * 100.0, 2) if closed > 0 else 0.0
+            bucket["realized_pnl"] = round(float(bucket["realized_pnl"]), 2)
+            bucket["unrealized_pnl"] = round(float(bucket["unrealized_pnl"]), 2)
             bucket["realized_pnl_inr"] = round(float(bucket["realized_pnl_inr"]), 2)
             bucket["unrealized_pnl_inr"] = round(float(bucket["unrealized_pnl_inr"]), 2)
+            bucket["net_pnl"] = round(
+                float(bucket["realized_pnl"]) + float(bucket["unrealized_pnl"]),
+                2,
+            )
             bucket["net_pnl_inr"] = round(
                 float(bucket["realized_pnl_inr"]) + float(bucket["unrealized_pnl_inr"]),
                 2,
             )
+            bucket["capital_used"] = round(float(bucket["capital_used"]), 2)
+            bucket["capital_used_inr"] = round(float(bucket["capital_used_inr"]), 2)
+            allocated_capital_inr = float(bucket.get("allocated_capital_inr", 0.0) or 0.0)
+            bucket["capital_used_pct"] = round(
+                (float(bucket["capital_used_inr"]) / allocated_capital_inr) * 100.0,
+                2,
+            ) if allocated_capital_inr > 0 else 0.0
+            bucket["pnl_pct_on_allocated"] = round(
+                (float(bucket["net_pnl_inr"]) / allocated_capital_inr) * 100.0,
+                2,
+            ) if allocated_capital_inr > 0 else 0.0
 
         ordered_market_stats: Dict[str, Dict[str, Any]] = {}
         for market in ("NSE", "US", "CRYPTO"):
@@ -618,7 +881,27 @@ class TradingAgent:
                 ordered_market_stats[market] = market_stats[market]
 
         ordered_strategy_stats = {key: strategy_stats[key] for key in sorted(strategy_stats.keys())}
-        return ordered_market_stats, ordered_strategy_stats
+        ordered_strategy_market_stats = {
+            key: {
+                market: strategy_market_stats[key][market]
+                for market in ("NSE", "US", "CRYPTO")
+                if market in strategy_market_stats[key]
+            }
+            for key in sorted(strategy_market_stats.keys())
+        }
+        ordered_strategy_instrument_stats = {
+            key: {
+                symbol: strategy_instrument_stats[key][symbol]
+                for symbol in sorted(strategy_instrument_stats[key].keys())
+            }
+            for key in sorted(strategy_instrument_stats.keys())
+        }
+        return (
+            ordered_market_stats,
+            ordered_strategy_stats,
+            ordered_strategy_market_stats,
+            ordered_strategy_instrument_stats,
+        )
 
     # ------------------------------------------------------------------
     # Main Loop
@@ -780,6 +1063,7 @@ class TradingAgent:
         trades_before_symbol = self._total_trades
         symbol_market = self._symbol_market(symbol)
         timeframe_frames: Dict[str, pd.DataFrame] = {}
+        candidate_signals: List[Dict[str, Any]] = []
 
         await self.event_bus.emit(AgentEvent(
             event_type=AgentEventType.MARKET_SCAN,
@@ -819,6 +1103,7 @@ class TradingAgent:
 
             had_data = True
             timeframe_frames[timeframe] = df
+            regime_meta = self._market_regime_profile(df, symbol_market)
             ltp = float(df["close"].iloc[-1])
             tf_label = f"{timeframe}m" if timeframe.isdigit() else timeframe
             await self.event_bus.emit(AgentEvent(
@@ -891,20 +1176,101 @@ class TradingAgent:
                     signal.metadata.update({
                         "execution_timeframe": timeframe,
                         "reference_timeframe_bias": reference_meta,
+                        "market_regime": regime_meta,
                     })
 
-                    self._total_signals += 1
-                    self._strategy_signal_counts[strat_name] = self._strategy_signal_counts.get(strat_name, 0) + 1
-                    self._market_signal_counts[symbol_market] = self._market_signal_counts.get(symbol_market, 0) + 1
-                    await self._process_signal(
-                        signal,
+                    priority_score = self._signal_priority_score(
                         strat_name,
-                        short_name,
-                        default_symbol=symbol,
-                        execution_timeframe=timeframe,
+                        signal,
+                        timeframe,
+                        regime_meta,
+                    )
+                    priority_threshold = self._trade_priority_threshold(
+                        symbol_market,
+                        timeframe,
+                        regime_meta,
+                    )
+                    signal.metadata["trade_priority_score"] = round(priority_score, 2)
+                    signal.metadata["trade_priority_threshold"] = round(priority_threshold, 2)
+
+                    if priority_score < priority_threshold:
+                        await self.event_bus.emit(AgentEvent(
+                            event_type=AgentEventType.NO_SIGNAL,
+                            title=f"{strat_name}: Priority Filtered",
+                            message=(
+                                f"{strat_name} setup on {tf_label} was skipped. "
+                                f"Priority {priority_score:.1f} < threshold {priority_threshold:.1f} "
+                                f"for {regime_meta.get('regime', 'transition')} regime."
+                            ),
+                            severity="info",
+                            metadata={
+                                "symbol": symbol,
+                                "strategy": strat_name,
+                                "timeframe": timeframe,
+                                "priority_score": round(priority_score, 2),
+                                "priority_threshold": round(priority_threshold, 2),
+                                "regime": regime_meta,
+                            },
+                        ))
+                        continue
+
+                    candidate_signals.append(
+                        {
+                            "signal": signal,
+                            "strategy": strat_name,
+                            "timeframe": timeframe,
+                            "priority_score": priority_score,
+                            "regime": regime_meta,
+                        }
                     )
 
-        if had_data and self._is_bootstrap_phase() and self._total_trades == trades_before_symbol:
+        if candidate_signals:
+            candidate_signals.sort(
+                key=lambda item: (
+                    float(item["priority_score"]),
+                    self._timeframe_sort_key(str(item["timeframe"])),
+                ),
+                reverse=True,
+            )
+            max_candidates = self._max_candidates_per_symbol(
+                symbol_market,
+                candidate_signals[0]["regime"],
+            )
+            for index, candidate in enumerate(candidate_signals):
+                if index >= max_candidates:
+                    await self.event_bus.emit(AgentEvent(
+                        event_type=AgentEventType.NO_SIGNAL,
+                        title=f"{candidate['strategy']}: Deferred",
+                        message=(
+                            f"Higher-priority setup already selected for {short_name}. "
+                            "This candidate was deferred."
+                        ),
+                        severity="info",
+                        metadata={
+                            "symbol": symbol,
+                            "strategy": candidate["strategy"],
+                            "timeframe": candidate["timeframe"],
+                            "priority_score": round(float(candidate["priority_score"]), 2),
+                        },
+                    ))
+                    continue
+
+                before_trade_count = self._total_trades
+                self._total_signals += 1
+                strat_name = str(candidate["strategy"])
+                self._strategy_signal_counts[strat_name] = self._strategy_signal_counts.get(strat_name, 0) + 1
+                self._market_signal_counts[symbol_market] = self._market_signal_counts.get(symbol_market, 0) + 1
+                await self._process_signal(
+                    candidate["signal"],
+                    strat_name,
+                    short_name,
+                    default_symbol=symbol,
+                    execution_timeframe=str(candidate["timeframe"]),
+                )
+                if self._total_trades > before_trade_count:
+                    break
+
+        if had_data and self._is_bootstrap_phase() and self._total_trades == trades_before_symbol and not candidate_signals:
             await self._attempt_bootstrap_exploration(
                 symbol=symbol,
                 short_name=short_name,
@@ -1014,7 +1380,7 @@ class TradingAgent:
     ) -> None:
         """Enter one exploratory bootstrap trade when no normal trade fired."""
         # Keep one active option position per underlying in bootstrap.
-        if any(plan.underlying_symbol == symbol for plan in self._option_exit_plans.values()):
+        if self._has_exit_plan_for_underlying(symbol):
             return
 
         selected_tf = ""
@@ -1245,26 +1611,36 @@ class TradingAgent:
         if len(closes) < 20:
             return ordered
 
-        realized_vol = float(closes.pct_change().abs().tail(20).mean() or 0.0)
-        trend, _, _ = self._infer_trend(frame)
         market = self._symbol_market(symbol)
+        regime_meta = self._market_regime_profile(frame, market)
+        realized_vol = float(regime_meta.get("realized_volatility", 0.0) or 0.0)
+        trend = str(regime_meta.get("trend", "neutral"))
+        regime = str(regime_meta.get("regime", "transition"))
         ascending = sorted(ordered, key=self._timeframe_sort_key)
         descending = list(reversed(ascending))
 
         if market == "CRYPTO":
+            if regime == "trending":
+                return descending[: min(len(descending), 2)]
+            if regime == "bracketing":
+                return ascending[: min(len(ascending), 2)]
             if realized_vol >= 0.009:
-                return descending
+                return descending[: min(len(descending), 2)]
             if trend in {"bullish", "bearish"} and realized_vol >= 0.006:
-                return descending
+                return descending[: min(len(descending), 2)]
             if realized_vol <= 0.0035:
-                return ascending
-            return ordered
+                return ascending[: min(len(ascending), 2)]
+            return ordered[: min(len(ordered), 2)]
 
+        if regime == "trending":
+            return descending[: min(len(descending), 2)]
+        if regime == "bracketing":
+            return ascending[: min(len(ascending), 2)]
         if trend in {"bullish", "bearish"} and realized_vol >= 0.0045:
-            return descending
+            return descending[: min(len(descending), 2)]
         if realized_vol <= 0.0018:
-            return ascending
-        return ordered
+            return ascending[: min(len(ascending), 2)]
+        return ordered[: min(len(ordered), 2)]
 
     # ------------------------------------------------------------------
     # Signal Processing
@@ -1403,6 +1779,8 @@ class TradingAgent:
             else ""
         )
 
+        execution_market = self._symbol_market(execution_symbol)
+        market_allocation = self._market_allocation(execution_market)
         entry_price = float(option_contract.ltp) if option_contract is not None else float(signal.price or 0.0)
         if entry_price <= 0:
             await self.event_bus.emit(AgentEvent(
@@ -1476,6 +1854,7 @@ class TradingAgent:
         ))
 
         try:
+            self.position_sizer.capital = max(float(market_allocation["allocated_capital"]), 1.0)
             sizing = self.position_sizer.fixed_fractional(
                 entry_price=entry_price,
                 stop_loss=sl_price,
@@ -1503,7 +1882,7 @@ class TradingAgent:
             effective_max_risk_per_trade_pct,
             effective_max_open_positions,
             effective_max_concentration_pct,
-        ) = self._effective_risk_limits()
+        ) = self._effective_risk_limits(execution_market)
 
         # Align quantity with configured risk caps before validation so
         # high-priced symbols are not routinely rejected as over-sized.
@@ -1512,7 +1891,7 @@ class TradingAgent:
             1,
         )
         unit_risk = max(abs(entry_price - sl_price), entry_price * 0.001, 1e-6)
-        max_trade_risk = self.risk_manager.config.capital * effective_max_risk_per_trade_pct
+        max_trade_risk = float(market_allocation["allocated_capital"]) * effective_max_risk_per_trade_pct
         max_risk_qty = max(int(max_trade_risk // unit_risk), 1)
 
         if lot_size > 1:
@@ -1543,12 +1922,173 @@ class TradingAgent:
         else:
             quantity = max(1, min(quantity, max_position_qty, max_risk_qty))
 
+        strategy_budget = self._strategy_budget_limits(strat_name, execution_symbol)
+        priority_score = self._signal_priority_score(
+            strat_name,
+            signal,
+            execution_timeframe or self.config.timeframe,
+            signal.metadata.get("market_regime", {}) if isinstance(signal.metadata, dict) else {},
+        )
+        budget_resolution = self._resolve_trade_budget_cap(
+            strategy_budget,
+            priority_score=priority_score,
+            entry_price=entry_price,
+            lot_size=lot_size,
+            market=execution_market,
+        )
+        if isinstance(signal.metadata, dict):
+            signal.metadata["strategy_budget"] = {
+                "market": execution_market,
+                "strategy_budget": round(strategy_budget["strategy_budget"], 2),
+                "per_trade_budget": round(strategy_budget["per_trade_budget"], 2),
+                "remaining_budget": round(strategy_budget["remaining_budget"], 2),
+                "remaining_trade_budget": round(strategy_budget["remaining_trade_budget"], 2),
+                "market_budget": round(strategy_budget["market_budget"], 2),
+                "market_remaining_budget": round(strategy_budget["market_remaining_budget"], 2),
+                "max_instrument_budget": round(strategy_budget["max_instrument_budget"], 2),
+                "available_slots": int(strategy_budget["available_slots"]),
+                "global_remaining_budget": round(budget_resolution["global_remaining_budget"], 2),
+                "borrowed_budget": round(budget_resolution["borrowed_budget"], 2),
+                "allow_slot_override": bool(budget_resolution["allow_slot_override"]),
+                "priority_score": round(priority_score, 2),
+            }
+
+        if strategy_budget["available_slots"] <= 0 and budget_resolution["allow_slot_override"] <= 0:
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Order Rejected — {short_name}",
+                message=(
+                    f"{strat_name} already uses all {self.config.strategy_max_concurrent_positions} "
+                    "strategy budget slots."
+                ),
+                severity="warning",
+                metadata={
+                    "symbol": execution_symbol,
+                    "underlying_symbol": underlying_symbol,
+                    "strategy": strat_name,
+                    "budget": strategy_budget,
+                },
+            ))
+            return
+
+        budget_cap = float(budget_resolution["budget_cap"])
+        max_budget_qty = max(int(budget_cap // max(entry_price, 1e-6)), 0)
+        if lot_size > 1:
+            max_budget_qty = (max_budget_qty // lot_size) * lot_size
+
+        if max_budget_qty <= 0:
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Order Rejected — {short_name}",
+                message=(
+                    f"{strat_name} cannot fit a trade for {execution_short_name} "
+                    f"at {entry_price:,.2f} within current capital headroom."
+                ),
+                severity="warning",
+                metadata={
+                    "symbol": execution_symbol,
+                    "underlying_symbol": underlying_symbol,
+                    "strategy": strat_name,
+                    "budget": strategy_budget,
+                },
+            ))
+            return
+
+        quantity = min(quantity, max_budget_qty)
+        if lot_size > 1:
+            if quantity < lot_size:
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.ORDER_REJECTED,
+                    title=f"Order Rejected — {short_name}",
+                    message=(
+                        f"{strat_name} budget cannot fit 1 lot ({lot_size}) for "
+                        f"{execution_short_name} at {entry_price:,.2f}."
+                    ),
+                    severity="warning",
+                    metadata={
+                        "symbol": execution_symbol,
+                        "underlying_symbol": underlying_symbol,
+                        "strategy": strat_name,
+                        "budget": strategy_budget,
+                    },
+                ))
+                return
+            quantity = self._align_quantity_to_lot(quantity, lot_size)
+
+        execution_side = OrderSide.BUY if option_contract is not None else (
+            OrderSide.BUY if signal.signal_type == SignalType.BUY else OrderSide.SELL
+        )
+        liquidity_constraints = await self._resolve_liquidity_quantity_cap(
+            execution_symbol=execution_symbol,
+            underlying_symbol=underlying_symbol,
+            execution_market=execution_market,
+            execution_timeframe=execution_timeframe,
+            side=execution_side,
+            lot_size=lot_size,
+            options_analytics=signal.metadata.get("options_analytics") if isinstance(signal.metadata, dict) else None,
+        )
+        if isinstance(signal.metadata, dict):
+            signal.metadata["liquidity_constraints"] = {
+                **liquidity_constraints,
+                "requested_quantity": quantity,
+            }
+
+        liquidity_cap = liquidity_constraints.get("max_quantity")
+        if liquidity_cap is not None:
+            liquidity_cap = max(int(liquidity_cap), 0)
+            if liquidity_cap <= 0:
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.ORDER_REJECTED,
+                    title=f"Order Rejected — {short_name}",
+                    message=(
+                        f"Visible liquidity cannot support a realistic fill for {execution_short_name} "
+                        "right now. Waiting for deeper volume."
+                    ),
+                    severity="warning",
+                    metadata={
+                        "symbol": execution_symbol,
+                        "underlying_symbol": underlying_symbol,
+                        "strategy": strat_name,
+                        "liquidity_constraints": liquidity_constraints,
+                    },
+                ))
+                return
+
+            original_quantity = quantity
+            quantity = min(quantity, liquidity_cap)
+            if lot_size > 1:
+                quantity = (quantity // lot_size) * lot_size
+            if quantity <= 0 or (lot_size > 1 and quantity < lot_size):
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.ORDER_REJECTED,
+                    title=f"Order Rejected — {short_name}",
+                    message=(
+                        f"Available liquidity in {execution_short_name} is below one tradable lot "
+                        f"({lot_size}). Skipping this setup."
+                    ),
+                    severity="warning",
+                    metadata={
+                        "symbol": execution_symbol,
+                        "underlying_symbol": underlying_symbol,
+                        "strategy": strat_name,
+                        "liquidity_constraints": liquidity_constraints,
+                    },
+                ))
+                return
+            if isinstance(signal.metadata, dict):
+                signal.metadata["liquidity_constraints"]["applied_quantity"] = quantity
+                signal.metadata["liquidity_constraints"]["quantity_reduced"] = quantity < original_quantity
+
         # Risk validation (after sizing so actual exposure is validated)
+        effective_max_position_size_inr = effective_max_position_size * float(market_allocation["fx_to_inr"])
+        effective_concentration_pct_total = (
+            effective_max_position_size_inr / max(self.total_allocated_capital_inr(), 1.0)
+        )
         with self._temporary_risk_overrides(
-            max_position_size=effective_max_position_size,
+            max_position_size=effective_max_position_size_inr,
             max_risk_per_trade_pct=effective_max_risk_per_trade_pct,
             max_open_positions=effective_max_open_positions,
-            max_concentration_pct=effective_max_concentration_pct,
+            max_concentration_pct=effective_concentration_pct_total,
         ):
             validation = self.risk_manager.validate_trade(
                 symbol=execution_symbol,
@@ -1587,9 +2127,7 @@ class TradingAgent:
 
         # Place order. Index directional signals are converted into long options:
         # BUY -> buy CE, SELL -> buy PE.
-        side = OrderSide.BUY if option_contract is not None else (
-            OrderSide.BUY if signal.signal_type == SignalType.BUY else OrderSide.SELL
-        )
+        side = execution_side
         order = Order(
             symbol=execution_symbol,
             quantity=quantity,
@@ -1615,6 +2153,7 @@ class TradingAgent:
                 "quantity": quantity,
                 "strategy": strat_name,
                 "lot_size": lot_size,
+                "liquidity": signal.metadata.get("liquidity_constraints") if isinstance(signal.metadata, dict) else None,
             },
         ))
 
@@ -1629,7 +2168,6 @@ class TradingAgent:
             ):
                 self._total_trades += 1
                 self._strategy_trade_counts[strat_name] = self._strategy_trade_counts.get(strat_name, 0) + 1
-                execution_market = self._symbol_market(execution_symbol)
                 self._market_trade_counts[execution_market] = self._market_trade_counts.get(execution_market, 0) + 1
                 fill_price = float(executed_order.fill_price or entry_price)
                 order_id = executed_order.order_id or ""
@@ -1689,6 +2227,7 @@ class TradingAgent:
                         symbol=execution_symbol,
                         underlying_symbol=underlying_symbol,
                         strategy=strat_name,
+                        quantity=quantity,
                         execution_timeframe=execution_timeframe or self.config.timeframe,
                         entry_price=fill_price,
                         stop_loss=sl_price,
@@ -1761,6 +2300,222 @@ class TradingAgent:
         lots = max(qty // lot_size, 1)
         return lots * lot_size
 
+    @staticmethod
+    def _safe_positive_int(value: Any) -> int:
+        try:
+            parsed = int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+        return max(parsed, 0)
+
+    @classmethod
+    def _normalize_depth_levels(cls, payload: Any) -> List[Tuple[float, int]]:
+        if payload is None:
+            return []
+
+        candidates: List[Any]
+        if isinstance(payload, list):
+            candidates = payload
+        elif isinstance(payload, dict):
+            if any(
+                key in payload
+                for key in ("price", "p", "rate", "qty", "quantity", "volume", "size", "orders")
+            ):
+                candidates = [payload]
+            else:
+                candidates = list(payload.values())
+        else:
+            candidates = [payload]
+
+        levels: List[Tuple[float, int]] = []
+        for item in candidates:
+            price = 0.0
+            qty = 0
+            if isinstance(item, dict):
+                try:
+                    price = float(item.get("price") or item.get("p") or item.get("rate") or 0.0)
+                except (TypeError, ValueError):
+                    price = 0.0
+                qty = cls._safe_positive_int(
+                    item.get("qty")
+                    or item.get("quantity")
+                    or item.get("volume")
+                    or item.get("size")
+                    or item.get("orders")
+                )
+            elif isinstance(item, (list, tuple)):
+                if len(item) >= 2:
+                    try:
+                        price = float(item[0] or 0.0)
+                    except (TypeError, ValueError):
+                        price = 0.0
+                    qty = cls._safe_positive_int(item[1])
+            if qty > 0:
+                levels.append((price, qty))
+        return levels
+
+    @classmethod
+    def _extract_visible_depth_quantity(
+        cls,
+        depth_response: Dict[str, Any] | None,
+        symbol: str,
+        side: OrderSide,
+    ) -> int:
+        if not isinstance(depth_response, dict):
+            return 0
+
+        payload: Any = depth_response
+        depth_block = depth_response.get("d")
+        if isinstance(depth_block, dict):
+            payload = depth_block.get(symbol)
+            if payload is None and len(depth_block) == 1:
+                payload = next(iter(depth_block.values()))
+        elif isinstance(depth_response.get(symbol), dict):
+            payload = depth_response.get(symbol)
+
+        if not isinstance(payload, dict):
+            return 0
+
+        side_keys = (
+            ("ask", "asks", "sell", "sells", "offer", "offers")
+            if side == OrderSide.BUY
+            else ("bid", "bids", "buy", "buys")
+        )
+        raw_levels = None
+        for key in side_keys:
+            candidate = payload.get(key)
+            if candidate is not None:
+                raw_levels = candidate
+                break
+
+        levels = cls._normalize_depth_levels(raw_levels)
+        visible_qty = sum(qty for _, qty in levels[:3])
+        if visible_qty > 0:
+            return visible_qty
+
+        fallback_keys = (
+            ("totalAskQty", "totSellQty", "sellQty", "askQty", "ask_size")
+            if side == OrderSide.BUY
+            else ("totalBidQty", "totBuyQty", "buyQty", "bidQty", "bid_size")
+        )
+        for key in fallback_keys:
+            fallback_qty = cls._safe_positive_int(payload.get(key))
+            if fallback_qty > 0:
+                return fallback_qty
+        return 0
+
+    async def _resolve_liquidity_quantity_cap(
+        self,
+        *,
+        execution_symbol: str,
+        underlying_symbol: str,
+        execution_market: str,
+        execution_timeframe: str | None,
+        side: OrderSide,
+        lot_size: int,
+        options_analytics: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        # Keep fills realistic by capping size to a conservative share of traded
+        # contract volume, open interest, visible orderbook depth, or recent bar volume.
+        details: Dict[str, Any] = {
+            "symbol": execution_symbol,
+            "underlying_symbol": underlying_symbol,
+            "market": execution_market,
+            "lot_size": lot_size,
+        }
+        raw_caps: List[int] = []
+
+        contract_snapshot: Dict[str, Any] | None = None
+        if isinstance(options_analytics, dict):
+            candidate_order = (
+                options_analytics.get("selected_contract"),
+                options_analytics.get("bullish_call"),
+                options_analytics.get("bearish_put"),
+                options_analytics.get("atm_call"),
+                options_analytics.get("atm_put"),
+            )
+            execution_key = str(execution_symbol or "").strip().upper()
+            for candidate in candidate_order:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_symbol = str(candidate.get("symbol") or "").strip().upper()
+                if candidate_symbol == execution_key:
+                    contract_snapshot = candidate
+                    break
+                if contract_snapshot is None and candidate_symbol:
+                    contract_snapshot = candidate
+
+        if contract_snapshot:
+            volume = self._safe_positive_int(contract_snapshot.get("volume"))
+            oi = self._safe_positive_int(contract_snapshot.get("oi"))
+            details["contract_liquidity"] = {
+                "symbol": contract_snapshot.get("symbol"),
+                "volume": volume,
+                "oi": oi,
+                "bid": round(float(contract_snapshot.get("bid") or 0.0), 4),
+                "ask": round(float(contract_snapshot.get("ask") or 0.0), 4),
+            }
+            if volume > 0:
+                volume_cap = int(volume * 0.05)
+                if lot_size > 1 and volume >= lot_size:
+                    volume_cap = max(volume_cap, lot_size)
+                if volume_cap > 0:
+                    raw_caps.append(volume_cap)
+                    details["volume_cap"] = volume_cap
+            if oi > 0:
+                oi_cap = int(oi * 0.02)
+                if lot_size > 1 and oi >= lot_size:
+                    oi_cap = max(oi_cap, lot_size)
+                if oi_cap > 0:
+                    raw_caps.append(oi_cap)
+                    details["oi_cap"] = oi_cap
+
+        if execution_market == "NSE":
+            try:
+                depth_response = await asyncio.to_thread(self.fyers_client.get_market_depth, execution_symbol)
+                visible_qty = self._extract_visible_depth_quantity(depth_response, execution_symbol, side)
+            except Exception as exc:
+                logger.debug("liquidity_depth_fetch_failed", symbol=execution_symbol, error=str(exc))
+                visible_qty = 0
+            if visible_qty > 0:
+                depth_cap = int(visible_qty * 0.25)
+                if lot_size > 1 and visible_qty >= lot_size:
+                    depth_cap = max(depth_cap, lot_size)
+                if depth_cap > 0:
+                    raw_caps.append(depth_cap)
+                    details["visible_orderbook_qty"] = visible_qty
+                    details["orderbook_cap"] = depth_cap
+
+        if not raw_caps:
+            frame = await self._fetch_market_data(execution_symbol, execution_timeframe or self.config.timeframe)
+            if frame is not None and not frame.empty and "volume" in frame.columns:
+                recent_volume = pd.to_numeric(frame["volume"], errors="coerce").dropna().tail(12)
+                if not recent_volume.empty:
+                    median_bar_volume = self._safe_positive_int(recent_volume.median())
+                    if median_bar_volume > 0:
+                        bar_cap = int(median_bar_volume * 0.10)
+                        if lot_size > 1 and median_bar_volume >= lot_size:
+                            bar_cap = max(bar_cap, lot_size)
+                        if bar_cap > 0:
+                            raw_caps.append(bar_cap)
+                            details["median_bar_volume"] = median_bar_volume
+                            details["recent_volume_cap"] = bar_cap
+
+        if not raw_caps:
+            details["cap_source"] = "none"
+            details["max_quantity"] = None
+            return details
+
+        raw_cap = min(raw_caps)
+        capped_quantity = raw_cap
+        if lot_size > 1:
+            capped_quantity = (raw_cap // lot_size) * lot_size
+
+        details["cap_source"] = "liquidity"
+        details["raw_cap"] = raw_cap
+        details["max_quantity"] = capped_quantity
+        return details
+
     def _derive_option_levels(self, signal: Signal, option_entry_price: float) -> Tuple[float, float]:
         """Map underlying signal SL/target into premium-space risk levels."""
         if option_entry_price <= 0:
@@ -1788,11 +2543,12 @@ class TradingAgent:
     def _is_bootstrap_phase(self) -> bool:
         return self.config.liberal_bootstrap_enabled and self._cycle_count <= max(int(self.config.bootstrap_cycles), 1)
 
-    def _effective_risk_limits(self) -> Tuple[float, float, int, float]:
-        max_position_size = float(self.risk_manager.config.max_position_size)
+    def _effective_risk_limits(self, market: str) -> Tuple[float, float, int, float]:
+        allocation = self._market_allocation(market)
+        max_position_size = float(allocation["max_instrument_capital"])
         max_risk_per_trade_pct = float(self.risk_manager.config.max_risk_per_trade_pct)
         max_open_positions = int(self.risk_manager.config.max_open_positions)
-        max_concentration_pct = float(self.risk_manager.config.max_concentration_pct)
+        max_concentration_pct = float(allocation["max_instrument_pct"]) / 100.0
 
         if not self._is_bootstrap_phase():
             return (
@@ -1813,7 +2569,7 @@ class TradingAgent:
         boosted_open_positions = max(max_open_positions, int(self.config.bootstrap_max_open_positions))
         boosted_position_size = max(
             max_position_size,
-            self.risk_manager.config.capital * boosted_concentration,
+            float(allocation["allocated_capital"]) * boosted_concentration,
         )
         return (
             boosted_position_size,
@@ -1821,6 +2577,285 @@ class TradingAgent:
             boosted_open_positions,
             boosted_concentration,
         )
+
+    def _strategy_budget_limits(self, strategy: str, symbol: str) -> Dict[str, float]:
+        market = self._symbol_market(symbol)
+        allocation = self._market_allocation(market)
+        market_budget = float(allocation["allocated_capital"])
+        market_remaining_budget = self._market_available_capital(market)
+        max_instrument_budget = float(allocation["max_instrument_capital"])
+
+        if not self.config.strategy_capital_bucket_enabled:
+            return {
+                "market_budget": market_budget,
+                "market_remaining_budget": market_remaining_budget,
+                "max_instrument_budget": max_instrument_budget,
+                "strategy_budget": market_budget,
+                "per_trade_budget": max_instrument_budget,
+                "remaining_budget": market_remaining_budget,
+                "remaining_trade_budget": min(max_instrument_budget, market_remaining_budget),
+                "open_positions": 0.0,
+                "available_slots": float(max(int(self.config.strategy_max_concurrent_positions), 1)),
+            }
+
+        enabled = self._enabled_strategy_names() or list(self.config.strategies)
+        strategy_count = max(len(enabled), 1)
+        strategy_budget = market_budget / strategy_count
+        max_slots = max(int(self.config.strategy_max_concurrent_positions), 1)
+        per_trade_budget = min(strategy_budget / max_slots, max_instrument_budget)
+
+        scoped_positions = [
+            position for position in self.position_manager.get_positions_by_tag(strategy)
+            if self._symbol_market(position.symbol) == market
+        ]
+        used_budget = 0.0
+        open_symbols: set[str] = set()
+        current_symbol_exposure = 0.0
+        for position in scoped_positions:
+            mark = float(position.current_price or position.avg_price or 0.0)
+            notional = max(mark, 0.0) * float(position.quantity)
+            used_budget += notional
+            open_symbols.add(position.symbol)
+            if position.symbol == symbol:
+                current_symbol_exposure += notional
+
+        remaining_budget = min(max(strategy_budget - used_budget, 0.0), market_remaining_budget)
+        remaining_trade_budget = min(max(per_trade_budget - current_symbol_exposure, 0.0), market_remaining_budget)
+        available_slots = max(max_slots - len(open_symbols), 0)
+        if current_symbol_exposure > 0:
+            available_slots = max(available_slots, 1)
+
+        return {
+            "market_budget": market_budget,
+            "market_remaining_budget": market_remaining_budget,
+            "max_instrument_budget": max_instrument_budget,
+            "strategy_budget": strategy_budget,
+            "per_trade_budget": per_trade_budget,
+            "remaining_budget": remaining_budget,
+            "remaining_trade_budget": remaining_trade_budget,
+            "open_positions": float(len(open_symbols)),
+            "available_slots": float(available_slots),
+        }
+
+    def _portfolio_used_capital(self) -> float:
+        used = 0.0
+        for position in self.position_manager.get_all_positions():
+            mark = float(position.current_price or position.avg_price or 0.0)
+            used += max(mark, 0.0) * float(position.quantity) * float(
+                self._market_allocation(self._symbol_market(position.symbol))["fx_to_inr"]
+            )
+        return used
+
+    def _portfolio_available_capital(self) -> float:
+        capital = self.total_allocated_capital_inr()
+        return max(capital - self._portfolio_used_capital(), 0.0)
+
+    def _market_used_capital(self, market: str) -> float:
+        used = 0.0
+        for position in self.position_manager.get_all_positions():
+            if self._symbol_market(position.symbol) != str(market or "").upper():
+                continue
+            mark = float(position.current_price or position.avg_price or 0.0)
+            used += max(mark, 0.0) * float(position.quantity)
+        return used
+
+    def _market_available_capital(self, market: str) -> float:
+        allocation = self._market_allocation(market)
+        return max(float(allocation["allocated_capital"]) - self._market_used_capital(market), 0.0)
+
+    def _resolve_trade_budget_cap(
+        self,
+        strategy_budget: Dict[str, float],
+        priority_score: float,
+        entry_price: float,
+        lot_size: int,
+        market: str,
+    ) -> Dict[str, float]:
+        global_remaining = self._market_available_capital(market)
+        base_cap = min(
+            float(strategy_budget["remaining_budget"]),
+            float(strategy_budget["remaining_trade_budget"]),
+            global_remaining,
+        )
+        minimum_trade_notional = max(float(entry_price) * max(int(lot_size), 1), 0.0)
+        allow_slot_override = False
+        borrowed_budget = 0.0
+
+        if priority_score >= 64.0 and global_remaining >= minimum_trade_notional:
+            target_cap = min(
+                global_remaining,
+                float(strategy_budget["per_trade_budget"]) * (1.35 if priority_score >= 84.0 else 1.1),
+            )
+            if target_cap > base_cap:
+                borrowed_budget = target_cap - base_cap
+                base_cap = target_cap
+            if float(strategy_budget["available_slots"]) <= 0:
+                allow_slot_override = True
+
+        return {
+            "budget_cap": max(base_cap, 0.0),
+            "global_remaining_budget": max(global_remaining, 0.0),
+            "borrowed_budget": max(borrowed_budget, 0.0),
+            "allow_slot_override": 1.0 if allow_slot_override else 0.0,
+        }
+
+    def _market_regime_profile(self, df: pd.DataFrame, market: str) -> Dict[str, Any]:
+        closes = pd.to_numeric(df.get("close"), errors="coerce").dropna()
+        highs = pd.to_numeric(df.get("high"), errors="coerce").dropna()
+        lows = pd.to_numeric(df.get("low"), errors="coerce").dropna()
+        trend, close, ema_now = self._infer_trend(df)
+        if len(closes) < 8 or highs.empty or lows.empty:
+            return {
+                "regime": "transition",
+                "trend": trend,
+                "realized_volatility": 0.0,
+                "efficiency_ratio": 0.0,
+                "range_pct": 0.0,
+                "close": close,
+                "ema20": ema_now,
+            }
+
+        window = closes.tail(min(len(closes), 24))
+        diff = window.diff().abs().dropna()
+        net_move = abs(float(window.iloc[-1]) - float(window.iloc[0]))
+        path_move = float(diff.sum() or 0.0)
+        efficiency = net_move / max(path_move, 1e-6)
+        realized_vol = float(closes.pct_change().abs().tail(min(len(closes) - 1, 20)).mean() or 0.0)
+        recent_high = float(highs.tail(min(len(highs), 20)).max() or 0.0)
+        recent_low = float(lows.tail(min(len(lows), 20)).min() or 0.0)
+        range_pct = (recent_high - recent_low) / max(abs(close), 1e-6) if close else 0.0
+
+        if market == "CRYPTO":
+            trend_efficiency = 0.34
+            bracket_efficiency = 0.18
+            volatility_threshold = 0.009
+            bracket_range_cap = 0.045
+        else:
+            trend_efficiency = 0.30
+            bracket_efficiency = 0.16
+            volatility_threshold = 0.0045
+            bracket_range_cap = 0.022
+
+        if trend in {"bullish", "bearish"} and efficiency >= trend_efficiency:
+            regime = "trending"
+        elif efficiency <= bracket_efficiency and range_pct <= max(volatility_threshold * 4.0, bracket_range_cap):
+            regime = "bracketing"
+        elif realized_vol >= volatility_threshold:
+            regime = "volatile"
+        else:
+            regime = "transition"
+
+        return {
+            "regime": regime,
+            "trend": trend,
+            "realized_volatility": round(realized_vol, 6),
+            "efficiency_ratio": round(efficiency, 4),
+            "range_pct": round(range_pct, 4),
+            "close": round(close, 4),
+            "ema20": round(ema_now, 4),
+        }
+
+    @staticmethod
+    def _signal_conviction_score(signal: Signal) -> float:
+        metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
+        for key in ("trade_priority_score", "conviction_score", "conviction"):
+            try:
+                value = float(metadata.get(key, 0.0))
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                return value
+        strength_defaults = {
+            SignalStrength.WEAK.value: 52.0,
+            SignalStrength.MODERATE.value: 68.0,
+            SignalStrength.STRONG.value: 84.0,
+        }
+        return strength_defaults.get(signal.strength.value, 60.0)
+
+    def _signal_priority_score(
+        self,
+        strategy: str,
+        signal: Signal,
+        execution_timeframe: str,
+        regime_meta: Dict[str, Any],
+    ) -> float:
+        metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
+        conviction = self._signal_conviction_score(signal)
+        reward = float(self._strategy_reward_ema.get(strategy, 0.0))
+        reward_component = max(min(reward, 12.0), -12.0)
+
+        tf_token = str(execution_timeframe or metadata.get("execution_timeframe") or "").strip().upper()
+        regime = str(regime_meta.get("regime", "transition"))
+        timeframe_fit = 1.0
+        if regime == "trending":
+            timeframe_fit = 1.14 if tf_token in {"15", "30", "60", "D"} else 1.0 if tf_token == "5" else 0.72
+        elif regime == "bracketing":
+            timeframe_fit = 1.12 if tf_token == "5" else 1.04 if tf_token == "3" else 0.78
+        elif regime == "volatile":
+            timeframe_fit = 1.08 if tf_token in {"15", "5"} else 0.84
+
+        reference_meta = metadata.get("reference_timeframe_bias", {})
+        vote_component = 0.0
+        if isinstance(reference_meta, dict):
+            bullish_votes = int(reference_meta.get("bullish_votes", 0) or 0)
+            bearish_votes = int(reference_meta.get("bearish_votes", 0) or 0)
+            vote_advantage = (
+                bullish_votes - bearish_votes
+                if signal.signal_type == SignalType.BUY
+                else bearish_votes - bullish_votes
+            )
+            if vote_advantage >= 2:
+                vote_component = 8.0
+            elif vote_advantage == 1:
+                vote_component = 4.0
+            elif vote_advantage < 0:
+                vote_component = -10.0
+
+        rr_component = 0.0
+        try:
+            adaptive_rr = float(metadata.get("adaptive_risk_reward", 0.0))
+        except (TypeError, ValueError):
+            adaptive_rr = 0.0
+        if adaptive_rr >= 2.5:
+            rr_component = 4.0
+        elif adaptive_rr >= 2.0:
+            rr_component = 2.0
+
+        if metadata.get("bootstrap_exploration"):
+            rr_component -= 10.0
+
+        score = (conviction * timeframe_fit) + reward_component + vote_component + rr_component
+        return max(0.0, min(score, 100.0))
+
+    @staticmethod
+    def _trade_priority_threshold(
+        market: str,
+        execution_timeframe: str,
+        regime_meta: Dict[str, Any],
+    ) -> float:
+        tf_token = str(execution_timeframe or "").strip().upper()
+        regime = str(regime_meta.get("regime", "transition"))
+        threshold = 58.0
+        if market in {"NSE", "US"}:
+            threshold += 4.0
+        if regime == "trending":
+            threshold += 10.0 if tf_token == "3" else -4.0 if tf_token in {"15", "30", "60", "D"} else 0.0
+        elif regime == "bracketing":
+            threshold += 8.0 if tf_token in {"15", "30", "60", "D"} else -3.0 if tf_token == "5" else 0.0
+        elif regime == "volatile":
+            threshold += 6.0 if tf_token == "3" else -2.0 if tf_token == "15" else 0.0
+        if market == "CRYPTO":
+            threshold += 2.0
+        return max(48.0, min(threshold, 78.0))
+
+    @staticmethod
+    def _max_candidates_per_symbol(market: str, regime_meta: Dict[str, Any]) -> int:
+        regime = str(regime_meta.get("regime", "transition"))
+        if regime == "trending":
+            return 2 if market == "CRYPTO" else 1
+        if regime == "volatile":
+            return 2
+        return 1
 
     def _position_size_multiplier(self, strategy: str) -> float:
         if not self.config.reinforcement_enabled:
@@ -2180,6 +3215,7 @@ class TradingAgent:
         symbol: str,
         underlying_symbol: str,
         strategy: str,
+        quantity: int,
         execution_timeframe: str,
         entry_price: float,
         stop_loss: float,
@@ -2187,17 +3223,43 @@ class TradingAgent:
     ) -> None:
         now = datetime.now(tz=IST)
         minutes = self._resolve_time_exit_minutes(execution_timeframe)
-        self._option_exit_plans[symbol] = OptionExitPlan(
-            symbol=symbol,
-            underlying_symbol=underlying_symbol,
-            strategy=strategy,
-            execution_timeframe=execution_timeframe,
-            entry_price=float(entry_price),
-            stop_loss=float(stop_loss),
-            target=float(target),
-            opened_at=now,
-            time_exit_at=now + timedelta(minutes=minutes),
-        )
+        strategy_map = self._option_exit_plans.setdefault(symbol, {})
+        existing = strategy_map.get(strategy)
+        incoming_qty = max(int(quantity), 0)
+        if existing is None:
+            strategy_map[strategy] = OptionExitPlan(
+                symbol=symbol,
+                underlying_symbol=underlying_symbol,
+                strategy=strategy,
+                quantity=incoming_qty,
+                execution_timeframe=execution_timeframe,
+                entry_price=float(entry_price),
+                stop_loss=float(stop_loss),
+                target=float(target),
+                opened_at=now,
+                time_exit_at=now + timedelta(minutes=minutes),
+            )
+            return
+
+        previous_qty = max(int(existing.quantity), 0)
+        total_qty = previous_qty + incoming_qty
+        divisor = max(total_qty, 1)
+        existing.quantity = total_qty
+        existing.execution_timeframe = execution_timeframe
+        existing.entry_price = (
+            (float(existing.entry_price) * previous_qty)
+            + (float(entry_price) * incoming_qty)
+        ) / divisor
+        existing.stop_loss = (
+            (float(existing.stop_loss) * previous_qty)
+            + (float(stop_loss) * incoming_qty)
+        ) / divisor
+        existing.target = (
+            (float(existing.target) * previous_qty)
+            + (float(target) * incoming_qty)
+        ) / divisor
+        existing.opened_at = min(existing.opened_at, now)
+        existing.time_exit_at = max(existing.time_exit_at, now + timedelta(minutes=minutes))
 
     @contextmanager
     def _temporary_risk_overrides(
@@ -3239,7 +4301,9 @@ class TradingAgent:
                         if not isinstance(row, dict):
                             continue
                         try:
-                            timestamp = datetime.strptime(str(row.get("date")), "%m/%d/%Y").replace(tzinfo=IST)
+                            timestamp = parse_nasdaq_historical_date(row.get("date"))
+                            if timestamp is None:
+                                continue
                             rows.append(
                                 {
                                     "timestamp": timestamp,
@@ -3276,14 +4340,17 @@ class TradingAgent:
 
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         chart_rows = data.get("chart", []) if isinstance(data, dict) else []
+        time_as_of = data.get("timeAsOf") if isinstance(data, dict) else None
         rows: list[dict[str, Any]] = []
         for row in chart_rows:
             if not isinstance(row, dict):
                 continue
             try:
-                ts = datetime.fromtimestamp(int(row.get("x")) / 1000.0, tz=timezone.utc).astimezone(IST)
+                ts = parse_nasdaq_chart_timestamp(row, time_as_of=time_as_of)
                 price = float(row.get("y"))
             except (TypeError, ValueError):
+                continue
+            if ts is None:
                 continue
             rows.append(
                 {
@@ -3427,6 +4494,13 @@ class TradingAgent:
                 symbol=symbol,
             )
         if frame is None or frame.empty or self._us_intraday_frame_is_stale(frame):
+            frame = await self._fetch_us_alphavantage_ohlcv(
+                ticker=ticker,
+                interval="1min",
+                symbol=symbol,
+                daily=False,
+            )
+        if frame is None or frame.empty or self._us_intraday_frame_is_stale(frame):
             frame = await self._fetch_us_yahoo_ohlcv(ticker=ticker, interval="1m", period="7d", symbol=symbol)
         if frame is None or frame.empty or self._us_intraday_frame_is_stale(frame):
             frame = await self._fetch_us_nasdaq_ohlcv(ticker=ticker, symbol=symbol, daily=False)
@@ -3436,13 +4510,6 @@ class TradingAgent:
                 resolution="1",
                 span_seconds=7 * 24 * 3600,
                 symbol=symbol,
-            )
-        if frame is None or frame.empty or self._us_intraday_frame_is_stale(frame):
-            frame = await self._fetch_us_alphavantage_ohlcv(
-                ticker=ticker,
-                interval="1min",
-                symbol=symbol,
-                daily=False,
             )
         if frame is None or frame.empty:
             return None
@@ -3489,6 +4556,13 @@ class TradingAgent:
                 symbol=symbol,
             )
         if frame is None or frame.empty:
+            frame = await self._fetch_us_alphavantage_ohlcv(
+                ticker=ticker,
+                interval="60min",
+                symbol=symbol,
+                daily=True,
+            )
+        if frame is None or frame.empty:
             frame = await self._fetch_us_yahoo_ohlcv(ticker=ticker, interval="1d", period="2y", symbol=symbol)
         if frame is None or frame.empty:
             frame = await self._fetch_us_nasdaq_ohlcv(ticker=ticker, symbol=symbol, daily=True)
@@ -3498,13 +4572,6 @@ class TradingAgent:
                 resolution="D",
                 span_seconds=2 * 365 * 24 * 3600,
                 symbol=symbol,
-            )
-        if frame is None or frame.empty:
-            frame = await self._fetch_us_alphavantage_ohlcv(
-                ticker=ticker,
-                interval="60min",
-                symbol=symbol,
-                daily=True,
             )
         if frame is None or frame.empty:
             return None
@@ -3899,8 +4966,27 @@ class TradingAgent:
         """Close an open position through order manager then book realized PnL."""
         pos_obj = self.position_manager.get_position(symbol)
         if pos_obj is None or pos_obj.quantity <= 0:
-            self._option_exit_plans.pop(symbol, None)
+            self._remove_exit_plan(symbol, plan.strategy if plan is not None else None)
             return
+
+        eligible_qty = int(pos_obj.quantity)
+        if plan is not None:
+            eligible_qty = sum(
+                int(view.quantity)
+                for view in self.position_manager.get_position_views(
+                    symbol=symbol,
+                    strategy_tag=plan.strategy,
+                )
+            )
+            if eligible_qty <= 0:
+                logger.warning(
+                    "stale_exit_plan_removed",
+                    symbol=symbol,
+                    strategy=plan.strategy,
+                    plan_qty=int(plan.quantity),
+                )
+                self._remove_exit_plan(symbol, plan.strategy)
+                return
 
         if current_price <= 0:
             await self.event_bus.emit(AgentEvent(
@@ -3912,8 +4998,9 @@ class TradingAgent:
             ))
             return
 
-        qty = int(pos_obj.quantity)
-        avg_price = float(pos_obj.avg_price)
+        qty = int(plan.quantity) if plan is not None else eligible_qty
+        qty = max(min(qty, eligible_qty), 1)
+        avg_price = float(plan.entry_price) if plan is not None else float(pos_obj.avg_price)
         entry_value = max(avg_price * qty, 1e-6)
         close_side = OrderSide.SELL if pos_obj.side == PositionSide.LONG else OrderSide.BUY
         order = Order(
@@ -3962,10 +5049,45 @@ class TradingAgent:
             return
 
         fill_price = float(executed.fill_price or current_price)
-        realized = self.position_manager.close_position(symbol, fill_price)
+        try:
+            realized = self.position_manager.close_position(
+                symbol,
+                fill_price,
+                quantity=qty,
+                strategy_tag=(plan.strategy if plan is not None else None),
+            )
+        except ValueError as exc:
+            logger.warning(
+                "position_close_mismatch",
+                symbol=symbol,
+                strategy=(plan.strategy if plan is not None else None),
+                quantity=qty,
+                error=str(exc),
+            )
+            self._remove_exit_plan(symbol, plan.strategy if plan is not None else None)
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.AGENT_ERROR,
+                title=f"Exit State Mismatch — {short_name}",
+                message=str(exc),
+                severity="warning",
+                metadata={
+                    "symbol": symbol,
+                    "strategy": (plan.strategy if plan is not None else None),
+                    "reason": reason,
+                    "quantity": qty,
+                },
+            ))
+            return
         self.risk_manager.record_trade_result(realized)
-        self.risk_manager.sync_position_value(symbol, 0.0)
-        self._option_exit_plans.pop(symbol, None)
+        remaining_pos = self.position_manager.get_position(symbol)
+        if remaining_pos is None:
+            self.risk_manager.sync_position_value(symbol, 0.0)
+        else:
+            self.risk_manager.sync_position_value(
+                symbol,
+                remaining_pos.quantity * max(remaining_pos.current_price or fill_price, fill_price),
+            )
+        self._remove_exit_plan(symbol, plan.strategy if plan is not None else None)
 
         pnl_pct = (realized / entry_value) * 100.0
         if plan is not None:
@@ -4008,7 +5130,7 @@ class TradingAgent:
         open_symbols = {p.symbol for p in positions}
         for symbol in list(self._option_exit_plans.keys()):
             if symbol not in open_symbols:
-                self._option_exit_plans.pop(symbol, None)
+                self._remove_exit_plan(symbol)
 
         # Refresh position marks from broker quotes before exit checks.
         await self.refresh_position_marks([p.symbol for p in positions])
@@ -4029,48 +5151,72 @@ class TradingAgent:
 
             # Time-based exit near market close
             if self._should_force_eod_exit(symbol, now, eod_buffer_minutes):
-                await self._close_position(
-                    symbol=symbol,
-                    short_name=short_name,
-                    current_price=current_price,
-                    reason="eod_exit",
-                    plan=self._option_exit_plans.get(symbol),
-                )
-                continue
-
-            plan = self._option_exit_plans.get(symbol)
-            if plan is None and not self._is_index_symbol(symbol):
-                # Recover exit control for carry-forward option positions that
-                # may exist after process restarts.
-                self._upsert_option_exit_plan(
-                    symbol=symbol,
-                    underlying_symbol=symbol,
-                    strategy="carry_forward",
-                    execution_timeframe=self.config.timeframe,
-                    entry_price=avg_price,
-                    stop_loss=max(avg_price * (1.0 - (self.config.option_default_stop_loss_pct / 100.0)), 0.05),
-                    target=avg_price * (1.0 + (self.config.option_default_target_pct / 100.0)),
-                )
-                plan = self._option_exit_plans.get(symbol)
-
-            if plan is not None and current_price > 0:
-                reason: Optional[str] = None
-                if current_price <= plan.stop_loss:
-                    reason = "stop_loss"
-                elif current_price >= plan.target:
-                    reason = "target"
-                elif now >= plan.time_exit_at:
-                    reason = "time_exit"
-
-                if reason is not None:
+                symbol_plans = self._symbol_exit_plans(symbol)
+                if symbol_plans:
+                    for plan in symbol_plans:
+                        await self._close_position(
+                            symbol=symbol,
+                            short_name=short_name,
+                            current_price=current_price,
+                            reason="eod_exit",
+                            plan=plan,
+                        )
+                else:
                     await self._close_position(
                         symbol=symbol,
                         short_name=short_name,
                         current_price=current_price,
-                        reason=reason,
-                        plan=plan,
+                        reason="eod_exit",
+                        plan=None,
                     )
+                continue
+
+            symbol_plans = self._symbol_exit_plans(symbol)
+            if not symbol_plans and not self._is_index_symbol(symbol):
+                # Recover exit control for carry-forward option positions that
+                # may exist after process restarts.
+                for view in self.position_manager.get_position_views(symbol=symbol):
+                    self._upsert_option_exit_plan(
+                        symbol=symbol,
+                        underlying_symbol=symbol,
+                        strategy=view.strategy_tag or "carry_forward",
+                        quantity=int(view.quantity),
+                        execution_timeframe=self.config.timeframe,
+                        entry_price=float(view.avg_price),
+                        stop_loss=max(
+                            float(view.avg_price)
+                            * (1.0 - (self.config.option_default_stop_loss_pct / 100.0)),
+                            0.05,
+                        ),
+                        target=float(view.avg_price)
+                        * (1.0 + (self.config.option_default_target_pct / 100.0)),
+                    )
+                symbol_plans = self._symbol_exit_plans(symbol)
+
+            triggered = False
+            if current_price > 0:
+                for plan in list(symbol_plans):
+                    reason: Optional[str] = None
+                    if current_price <= plan.stop_loss:
+                        reason = "stop_loss"
+                    elif current_price >= plan.target:
+                        reason = "target"
+                    elif now >= plan.time_exit_at:
+                        reason = "time_exit"
+
+                    if reason is not None:
+                        await self._close_position(
+                            symbol=symbol,
+                            short_name=short_name,
+                            current_price=current_price,
+                            reason=reason,
+                            plan=plan,
+                        )
+                        triggered = True
+                if triggered:
                     continue
+
+            plan = self._display_exit_plan(symbol)
 
             time_left_sec = 0
             if plan is not None:

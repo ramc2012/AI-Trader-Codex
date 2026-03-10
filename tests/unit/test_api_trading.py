@@ -12,7 +12,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from src.api.dependencies import get_order_manager, get_position_manager, reset_managers
+from src.api.dependencies import get_order_manager, get_position_manager, get_trading_agent, reset_managers
 from src.api.main import create_app
 from src.api.routes.trading import _build_trade_pairs
 from src.execution.order_manager import Order, OrderManager, OrderSide, OrderType
@@ -35,8 +35,60 @@ def app() -> Tuple[FastAPI, OrderManager, PositionManager]:
     application = create_app()
     om = OrderManager(paper_mode=True)
     pm = PositionManager()
+
+    class DummyAgent:
+        async def refresh_position_marks(self, symbols: list[str]) -> None:
+            return None
+
+        def _display_exit_plan(self, symbol: str):
+            return None
+
+        def get_capital_allocations(self):
+            return {
+                "NSE": {
+                    "market": "NSE",
+                    "label": "India",
+                    "currency": "INR",
+                    "currency_symbol": "₹",
+                    "fx_to_inr": 1.0,
+                    "allocated_capital": 250000.0,
+                    "allocated_capital_inr": 250000.0,
+                    "max_instrument_pct": 25.0,
+                    "max_instrument_capital": 62500.0,
+                    "max_instrument_capital_inr": 62500.0,
+                },
+                "US": {
+                    "market": "US",
+                    "label": "US",
+                    "currency": "USD",
+                    "currency_symbol": "$",
+                    "fx_to_inr": 83.0,
+                    "allocated_capital": 250000.0,
+                    "allocated_capital_inr": 20750000.0,
+                    "max_instrument_pct": 20.0,
+                    "max_instrument_capital": 50000.0,
+                    "max_instrument_capital_inr": 4150000.0,
+                },
+                "CRYPTO": {
+                    "market": "CRYPTO",
+                    "label": "Crypto",
+                    "currency": "USD",
+                    "currency_symbol": "$",
+                    "fx_to_inr": 83.0,
+                    "allocated_capital": 250000.0,
+                    "allocated_capital_inr": 20750000.0,
+                    "max_instrument_pct": 20.0,
+                    "max_instrument_capital": 50000.0,
+                    "max_instrument_capital_inr": 4150000.0,
+                },
+            }
+
+        def total_allocated_capital_inr(self) -> float:
+            return 41750000.0
+
     application.dependency_overrides[get_order_manager] = lambda: om
     application.dependency_overrides[get_position_manager] = lambda: pm
+    application.dependency_overrides[get_trading_agent] = lambda: DummyAgent()
     yield application, om, pm
     reset_managers()
 
@@ -211,6 +263,8 @@ class TestPortfolio:
         assert data["total_unrealized_pnl"] == 0.0
         assert data["total_realized_pnl"] == 0.0
         assert data["total_pnl"] == 0.0
+        assert data["total_allocated_capital_inr"] == 41750000.0
+        assert data["total_pnl_pct_on_allocated"] == 0.0
         assert data["positions"] == {}
 
     def test_portfolio_with_one_position(
@@ -238,6 +292,8 @@ class TestPortfolio:
         assert data["total_realized_pnl"] == 0.0
         # total_pnl = realized + unrealized = 10000
         assert data["total_pnl"] == pytest.approx(10000.0)
+        assert data["market_breakdown"]["NSE"]["allocated_capital"] == 250000.0
+        assert data["market_breakdown"]["NSE"]["pnl_pct_on_allocated"] == pytest.approx(4.0)
 
     def test_portfolio_positions_detail(
         self, client: TestClient, pm: PositionManager

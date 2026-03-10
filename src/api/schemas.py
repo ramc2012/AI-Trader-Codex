@@ -115,6 +115,8 @@ class PortfolioSummaryResponse(BaseModel):
     total_unrealized_pnl_inr: float = 0.0
     total_realized_pnl_inr: float = 0.0
     total_pnl_inr: float = 0.0
+    total_allocated_capital_inr: float = 0.0
+    total_pnl_pct_on_allocated: float = 0.0
     base_currency: str = "INR"
     usd_inr_rate: float = 83.0
     currency_breakdown: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
@@ -161,6 +163,7 @@ class InstrumentPerformanceRowResponse(BaseModel):
     """Performance summary for one instrument over a selected period."""
 
     symbol: str
+    market: str = "NSE"
     currency: str = "INR"
     currency_symbol: str = "₹"
     fx_to_inr: float = 1.0
@@ -173,6 +176,7 @@ class InstrumentPerformanceRowResponse(BaseModel):
     realized_pnl_inr: float = 0.0
     unrealized_pnl: float = 0.0
     unrealized_pnl_inr: float = 0.0
+    net_pnl: float = 0.0
     net_pnl_inr: float = 0.0
     avg_hold_minutes: float = 0.0
     last_trade_time: Optional[datetime] = None
@@ -253,9 +257,11 @@ class RiskSummaryResponse(BaseModel):
 
     date: str
     capital: float = 0.0
+    total_allocated_capital_inr: float = 0.0
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
     total_pnl: float = 0.0
+    total_pnl_pct_on_allocated: float = 0.0
     total_trades: int = 0
     winning_trades: int = 0
     losing_trades: int = 0
@@ -263,9 +269,11 @@ class RiskSummaryResponse(BaseModel):
     max_open_positions: int = 0
     daily_loss_limit: float = 0.0
     available_risk: float = 0.0
+    circuit_breaker_enabled: bool = True
     circuit_breaker_triggered: bool = False
     emergency_stop: bool = False
     position_values: Dict[str, float] = Field(default_factory=dict)
+    market_allocations: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
 
 class RiskMetricsResponse(BaseModel):
@@ -631,7 +639,17 @@ class AgentConfigRequest(BaseModel):
     )
     scan_interval_seconds: int = Field(default=30, ge=10, le=300)
     paper_mode: bool = Field(default=True, description="Paper or live trading")
-    capital: float = Field(default=250000.0, ge=10000)
+    capital: Optional[float] = Field(
+        default=None,
+        ge=10000,
+        description="Deprecated overall capital field; total capital is derived from market allocations.",
+    )
+    india_capital: float = Field(default=250000.0, ge=10000, description="Allocated India/NSE capital in INR")
+    us_capital: float = Field(default=250000.0, ge=1000, description="Allocated US capital in USD")
+    crypto_capital: float = Field(default=250000.0, ge=1000, description="Allocated crypto capital in USD")
+    india_max_instrument_pct: float = Field(default=25.0, ge=1.0, le=100.0)
+    us_max_instrument_pct: float = Field(default=20.0, ge=1.0, le=100.0)
+    crypto_max_instrument_pct: float = Field(default=20.0, ge=1.0, le=100.0)
     max_daily_loss_pct: float = Field(default=2.0, ge=0.1, le=10.0)
     timeframe: str = Field(default="15", description="Candle timeframe in minutes")
     execution_timeframes: List[str] = Field(
@@ -667,6 +685,8 @@ class AgentConfigRequest(BaseModel):
     reinforcement_enabled: bool = Field(default=True)
     reinforcement_alpha: float = Field(default=0.2, ge=0.01, le=1.0)
     reinforcement_size_boost_pct: float = Field(default=60.0, ge=0.0, le=300.0)
+    strategy_capital_bucket_enabled: bool = Field(default=True)
+    strategy_max_concurrent_positions: int = Field(default=4, ge=1, le=20)
     telegram_status_interval_minutes: int = Field(
         default=30,
         ge=0,
@@ -696,6 +716,8 @@ class AgentStatusResponse(BaseModel):
     execution_timeframes: List[str] = Field(default_factory=list)
     reference_timeframes: List[str] = Field(default_factory=list)
     telegram_status_interval_minutes: int = 30
+    capital_allocations: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    total_allocated_capital_inr: float = 0.0
     positions_count: int = 0
     daily_pnl: float = 0.0
     total_signals: int = 0
@@ -703,6 +725,8 @@ class AgentStatusResponse(BaseModel):
     market_stats: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     market_pnl_inr: Dict[str, float] = Field(default_factory=dict)
     strategy_stats: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    strategy_market_stats: Dict[str, Dict[str, Dict[str, Any]]] = Field(default_factory=dict)
+    strategy_instrument_stats: Dict[str, Dict[str, Dict[str, Any]]] = Field(default_factory=dict)
     strategy_controls: List[Dict[str, Any]] = Field(default_factory=list)
     last_scan_time: Optional[str] = None
     bootstrap_mode_active: bool = False

@@ -1,7 +1,10 @@
 /**
  * Format a number as INR currency using Indian number system (lakhs/crores).
  */
-export function formatINR(value: number): string {
+export function formatINR(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return '--';
+  }
   const absValue = Math.abs(value);
   const sign = value < 0 ? '-' : '';
 
@@ -23,7 +26,10 @@ export function formatINR(value: number): string {
 /**
  * Format a number as INR with full precision (no abbreviation).
  */
-export function formatINRFull(value: number): string {
+export function formatINRFull(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return '--';
+  }
   const sign = value < 0 ? '-' : '';
   const absValue = Math.abs(value);
   return `${sign}\u20B9${absValue.toLocaleString('en-IN', {
@@ -35,7 +41,10 @@ export function formatINRFull(value: number): string {
 /**
  * Format number in selected currency (INR/USD currently).
  */
-export function formatCurrency(value: number, currency: string = 'INR'): string {
+export function formatCurrency(value: number | null | undefined, currency: string = 'INR'): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return '--';
+  }
   const code = (currency || 'INR').toUpperCase();
   const locale = code === 'USD' ? 'en-US' : 'en-IN';
   const sign = value < 0 ? '-' : '';
@@ -51,7 +60,10 @@ export function formatCurrency(value: number, currency: string = 'INR'): string 
 /**
  * Format a number as a percentage.
  */
-export function formatPercent(value: number, decimals = 2): string {
+export function formatPercent(value: number | null | undefined, decimals = 2): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return '--';
+  }
   const sign = value > 0 ? '+' : '';
   return `${sign}${value.toFixed(decimals)}%`;
 }
@@ -59,7 +71,10 @@ export function formatPercent(value: number, decimals = 2): string {
 /**
  * Format a plain number with commas (Indian system).
  */
-export function formatNumber(value: number, decimals = 0): string {
+export function formatNumber(value: number | null | undefined, decimals = 0): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return '--';
+  }
   return value.toLocaleString('en-IN', {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,

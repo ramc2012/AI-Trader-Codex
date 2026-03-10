@@ -21,7 +21,10 @@
       "Bash(osascript:*)",
       "Bash(open:*)",
       "Bash(killall:*)",
-      "Bash(git restore:*)"
+      "Bash(git restore:*)",
+      "Bash(jq:*)",
+      "Bash(ls:*)",
+      "Bash(grep:*)"
     ]
   }
 }

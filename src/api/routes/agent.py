@@ -208,6 +208,7 @@ async def _load_inspection_frame(
     requested_token = str(requested_timeframe or "").strip().upper()
     requested_error: str | None = None
     candidates = _inspection_timeframe_candidates(agent, requested_token)
+    stale_requested_payload: tuple[pd.DataFrame, str, dict[str, Any]] | None = None
 
     for candidate in candidates:
         frame_raw = await agent._fetch_market_data(symbol, timeframe=candidate)
@@ -215,7 +216,7 @@ async def _load_inspection_frame(
             frame = _prepare_inspection_frame(frame_raw, symbol, lookback_bars)
             if not frame.empty:
                 last_ts = pd.to_datetime(frame["timestamp"].iloc[-1], errors="coerce")
-                return (
+                payload = (
                     frame,
                     candidate,
                     {
@@ -227,8 +228,16 @@ async def _load_inspection_frame(
                         "last_session_date": None if pd.isna(last_ts) else last_ts.date().isoformat(),
                     },
                 )
+                fresh, _ = agent._data_freshness(frame, candidate)
+                if candidate == requested_token and not fresh:
+                    stale_requested_payload = payload
+                    continue
+                return payload
         elif candidate == requested_token:
             requested_error = f"No market data available for {symbol} on {requested_token}."
+
+    if stale_requested_payload is not None:
+        return stale_requested_payload
 
     now = datetime.now(tz=timezone.utc)
     for candidate in candidates:

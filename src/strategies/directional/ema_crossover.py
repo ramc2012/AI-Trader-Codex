@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.analysis.indicators import ATR, EMA
+from src.analysis.indicators import ADX, ATR, EMA
 from src.strategies.base import BaseStrategy, Signal, SignalStrength, SignalType
 from src.utils.logger import get_logger
 
@@ -39,6 +39,8 @@ class EMACrossoverStrategy(BaseStrategy):
         atr_period: int = 14,
         atr_multiplier: float = 1.5,
         risk_reward: float = 2.0,
+        adx_period: int = 14,
+        adx_threshold: float = 20.0,
     ) -> None:
         if fast_period >= slow_period:
             raise ValueError(
@@ -49,10 +51,13 @@ class EMACrossoverStrategy(BaseStrategy):
         self.atr_period = atr_period
         self.atr_multiplier = atr_multiplier
         self.risk_reward = risk_reward
+        self.adx_period = adx_period
+        self.adx_threshold = adx_threshold
 
         self._fast_ema = EMA(period=fast_period)
         self._slow_ema = EMA(period=slow_period)
         self._atr = ATR(period=atr_period)
+        self._adx = ADX(period=adx_period)
 
     def generate_signals(self, data: pd.DataFrame) -> list[Signal]:
         """Generate BUY/SELL signals based on EMA crossovers.
@@ -73,6 +78,7 @@ class EMACrossoverStrategy(BaseStrategy):
         fast = self._fast_ema.calculate(close)
         slow = self._slow_ema.calculate(close)
         atr = self._atr.calculate(close, high=high, low=low)
+        adx_series = self._adx.calculate(data)["adx"]
 
         signals: list[Signal] = []
 
@@ -82,6 +88,11 @@ class EMACrossoverStrategy(BaseStrategy):
 
             prev_diff = fast.iloc[i - 1] - slow.iloc[i - 1]
             curr_diff = fast.iloc[i] - slow.iloc[i]
+
+            # ADX trend filter — only trade when trend is strong enough
+            current_adx = float(adx_series.iloc[i]) if not pd.isna(adx_series.iloc[i]) else 0.0
+            if current_adx < self.adx_threshold:
+                continue  # Choppy / sideways market — skip EMA crossover
 
             signal: Signal | None = None
             current_atr = atr.iloc[i] if not pd.isna(atr.iloc[i]) else 0
@@ -108,6 +119,7 @@ class EMACrossoverStrategy(BaseStrategy):
                         "slow_ema": round(float(slow.iloc[i]), 2),
                         "atr": round(float(current_atr), 2),
                         "crossover_diff": round(float(curr_diff), 2),
+                        "adx": round(current_adx, 2),
                     },
                 )
 
@@ -131,6 +143,7 @@ class EMACrossoverStrategy(BaseStrategy):
                         "slow_ema": round(float(slow.iloc[i]), 2),
                         "atr": round(float(current_atr), 2),
                         "crossover_diff": round(float(curr_diff), 2),
+                        "adx": round(current_adx, 2),
                     },
                 )
 

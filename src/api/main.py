@@ -7,7 +7,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.api.dependencies import (
     get_fractal_scan_notifier,
@@ -95,7 +95,11 @@ async def _warm_ohlc_cache() -> None:
                     if rows:
                         data[symbol][tf] = [
                             {
-                                "timestamp": r.timestamp.isoformat(),
+                                "timestamp": (
+                                    r.timestamp.replace(tzinfo=timezone.utc).isoformat()
+                                    if r.timestamp.tzinfo is None
+                                    else r.timestamp.astimezone(timezone.utc).isoformat()
+                                ),
                                 "open": float(r.open),
                                 "high": float(r.high),
                                 "low": float(r.low),
@@ -136,7 +140,10 @@ async def _warm_ohlc_cache() -> None:
                         if raw and raw.get("candles"):
                             data.setdefault(symbol, {})[tf] = [
                                 {
-                                    "timestamp": datetime.utcfromtimestamp(row[0]).isoformat(),
+                                    "timestamp": datetime.fromtimestamp(
+                                        row[0],
+                                        tz=timezone.utc,
+                                    ).isoformat(),
                                     "open": float(row[1]),
                                     "high": float(row[2]),
                                     "low": float(row[3]),

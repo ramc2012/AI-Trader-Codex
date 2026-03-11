@@ -30,6 +30,7 @@ COLLECTION_PLAN = {
     "D": {"days_back": 365, "refresh_minutes": 0},      # Daily: backfill 1yr, no intraday refresh
     "60": {"days_back": 60, "refresh_minutes": 5},       # Hourly: backfill 60d, refresh every 5m
     "15": {"days_back": 30, "refresh_minutes": 5},       # 15min: backfill 30d, refresh every 5m
+    "3": {"days_back": 14, "refresh_minutes": 3},        # 3min: backfill 14d, refresh every 3m
     "5": {"days_back": 10, "refresh_minutes": 3},        # 5min: backfill 10d, refresh every 3m
 }
 
@@ -135,7 +136,7 @@ async def _intraday_refresh(client: FyersClient) -> int:
     """Quick refresh of intraday timeframes during market hours."""
     total = 0
     for symbol in ALL_WATCHLIST_SYMBOLS:
-        for tf in ["5", "15", "60"]:
+        for tf in ["3", "5", "15", "60"]:
             count = await collect_symbol_data(client, symbol, tf, days_back=2)
             total += count
             await asyncio.sleep(0.3)

@@ -65,7 +65,7 @@ services:
       APP_LOG_LEVEL: INFO
       SECRET_KEY: docker_dev_secret_key_v2
       TRADING_MODE: paper
-      AGENT_AUTO_START: "false"
+      AGENT_AUTO_START: "true"
       MAX_DAILY_LOSS_PCT: "2.0"
       MAX_POSITION_SIZE_PCT: "25.0"
       MAX_CONCENTRATION_PCT: "60.0"

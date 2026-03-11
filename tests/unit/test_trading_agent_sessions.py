@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
 import pytest
 
 from src.agent.trading_agent import AgentConfig, OptionExitPlan, TradingAgent
+from src.agent.trading_agent import AgentState
 from src.config.market_hours import IST
 from src.execution.order_manager import OrderSide
 from src.execution.order_manager import OrderStatus
@@ -40,6 +41,24 @@ def _frame_from_prices(prices: list[float]) -> pd.DataFrame:
                 "low": price * 0.998,
                 "close": price,
                 "volume": 1000 + index,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _frame_with_end(end: datetime, minutes: int = 3, bars: int = 20, price: float = 100.0) -> pd.DataFrame:
+    rows = []
+    for index in range(bars):
+        ts = end - timedelta(minutes=minutes * (bars - index - 1))
+        rows.append(
+            {
+                "timestamp": ts,
+                "open": price,
+                "high": price * 1.002,
+                "low": price * 0.998,
+                "close": price,
+                "volume": 1000 + index,
+                "symbol": "NSE:NIFTY50-INDEX",
             }
         )
     return pd.DataFrame(rows)
@@ -113,6 +132,9 @@ def test_agent_status_exposes_market_and_strategy_stats() -> None:
     assert "capital_allocations" in status
     assert "strategy_market_stats" in status
     assert "strategy_instrument_stats" in status
+    assert "online_learning_active" in status
+    assert "online_learning_stats" in status
+    assert "strategy_reward_ema_by_market" in status
     assert set(status["market_stats"].keys()) >= {"NSE", "US", "CRYPTO"}
     assert "MP_OrderFlow_Breakout" in status["strategy_stats"]
 
@@ -158,6 +180,84 @@ def test_agent_status_counts_open_entries_as_trades() -> None:
     status = agent.get_status()
     assert status["positions_count"] == 1
     assert status["total_trades"] == 3
+
+
+def test_coerce_ist_timestamp_treats_naive_values_as_utc() -> None:
+    agent = _build_agent(AgentConfig())
+
+    ts = agent._coerce_ist_timestamp(datetime(2026, 3, 11, 9, 55))
+
+    assert ts is not None
+    assert ts.tzinfo == IST
+    assert ts.hour == 15
+    assert ts.minute == 25
+
+
+def test_market_open_position_count_is_scoped_per_market() -> None:
+    agent = _build_agent(AgentConfig())
+    us_position = MagicMock()
+    us_position.symbol = "US:SPY260313C00600000"
+    us_position.quantity = 100
+    crypto_position = MagicMock()
+    crypto_position.symbol = "CRYPTO:BTCUSDT"
+    crypto_position.quantity = 1
+    nse_position = MagicMock()
+    nse_position.symbol = "NSE:NIFTY50-INDEX"
+    nse_position.quantity = 75
+    agent.position_manager.get_all_positions.return_value = [us_position, crypto_position, nse_position]
+
+    assert agent._market_open_position_count("NSE") == 1
+    assert agent._market_open_position_count("US") == 1
+    assert agent._market_open_position_count("CRYPTO") == 1
+
+
+@pytest.mark.asyncio
+async def test_init_online_learning_does_not_require_ml_ensemble(tmp_path) -> None:
+    agent = _build_agent(AgentConfig(strategies=["EMA_Crossover"]))
+    agent.executor._strategies = {}
+
+    original_settings = agent._init_online_learning.__globals__["get_settings"]
+
+    class _Settings:
+        data_dir = str(tmp_path)
+
+    agent._init_online_learning.__globals__["get_settings"] = lambda: _Settings()
+    try:
+        await agent._init_online_learning()
+    finally:
+        agent._init_online_learning.__globals__["get_settings"] = original_settings
+
+    assert agent._online_learning_engine is not None
+
+
+@pytest.mark.asyncio
+async def test_start_sets_error_state_when_online_learning_init_fails() -> None:
+    config = AgentConfig()
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    executor = MagicMock()
+    order_manager = MagicMock()
+    position_manager = MagicMock()
+    risk_manager = MagicMock()
+    risk_manager.emergency_stop = False
+
+    agent = TradingAgent(
+        config=config,
+        strategy_executor=executor,
+        order_manager=order_manager,
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent._init_online_learning = AsyncMock(side_effect=TypeError("boom"))
+
+    with pytest.raises(TypeError, match="boom"):
+        await agent.start()
+
+    assert agent.state == AgentState.ERROR
+    assert agent._error == "boom"
+    executor.stop.assert_called_once()
 
 
 def test_synthetic_option_fallback_is_disabled() -> None:
@@ -212,6 +312,49 @@ async def test_rank_execution_timeframes_prefers_faster_frames_in_bracket() -> N
     assert ranked == ["3", "5"]
 
 
+@pytest.mark.asyncio
+async def test_fetch_market_data_prefers_fresh_db_frame_over_stale_cache(monkeypatch) -> None:
+    agent = _build_agent(AgentConfig())
+    stale_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(days=2))
+    fresh_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(minutes=3))
+
+    class _Cache:
+        def as_dataframe(self, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+            return stale_frame.set_index("timestamp")
+
+    monkeypatch.setattr("src.data.ohlc_cache.get_ohlc_cache", lambda: _Cache())
+    agent._requires_live_bars = MagicMock(return_value=True)
+    agent._fetch_database_market_data = AsyncMock(return_value=fresh_frame)
+    agent._fetch_fyers_market_data = AsyncMock(return_value=None)
+
+    frame = await agent._fetch_market_data("NSE:NIFTY50-INDEX", timeframe="3")
+
+    assert frame is not None
+    assert pd.to_datetime(frame["timestamp"].iloc[-1]) == pd.to_datetime(fresh_frame["timestamp"].iloc[-1])
+    agent._fetch_fyers_market_data.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fetch_market_data_prefers_newer_stale_db_frame_when_market_closed(monkeypatch) -> None:
+    agent = _build_agent(AgentConfig())
+    stale_cache_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(days=2))
+    newer_db_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(hours=4))
+
+    class _Cache:
+        def as_dataframe(self, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+            return stale_cache_frame.set_index("timestamp")
+
+    monkeypatch.setattr("src.data.ohlc_cache.get_ohlc_cache", lambda: _Cache())
+    agent._requires_live_bars = MagicMock(return_value=False)
+    agent._fetch_database_market_data = AsyncMock(return_value=newer_db_frame)
+    agent._fetch_fyers_market_data = AsyncMock(return_value=None)
+
+    frame = await agent._fetch_market_data("NSE:NIFTY50-INDEX", timeframe="5")
+
+    assert frame is not None
+    assert pd.to_datetime(frame["timestamp"].iloc[-1]) == pd.to_datetime(newer_db_frame["timestamp"].iloc[-1])
+
+
 def test_signal_priority_score_penalizes_small_timeframe_in_trend() -> None:
     agent = _build_agent(AgentConfig())
     signal = Signal(
@@ -232,6 +375,49 @@ def test_signal_priority_score_penalizes_small_timeframe_in_trend() -> None:
     score_3 = agent._signal_priority_score("EMA_Crossover", signal, "3", regime)
 
     assert score_15 > score_3
+
+
+def test_signal_priority_score_prefers_market_specific_reward_curve() -> None:
+    agent = _build_agent(AgentConfig())
+    signal = Signal(
+        timestamp=datetime.now(tz=IST),
+        symbol="CRYPTO:BTCUSDT",
+        signal_type=SignalType.BUY,
+        strength=SignalStrength.MODERATE,
+        price=100.0,
+        strategy_name="Fractal_Profile_Breakout",
+        metadata={
+            "market": "CRYPTO",
+            "conviction": 78.0,
+            "setup_type": "acceptance_trend",
+            "value_acceptance": "accepted",
+        },
+    )
+    regime = {"regime": "trending", "trend": "bullish"}
+    agent._strategy_reward_ema["Fractal_Profile_Breakout"] = 8.0
+    agent._strategy_market_reward_ema["Fractal_Profile_Breakout"] = {"CRYPTO": -6.0}
+    agent._strategy_perf_tracker.record_trade("Fractal_Profile_Breakout", 8.0)
+    for _ in range(8):
+        agent._strategy_perf_tracker.record_trade("Fractal_Profile_Breakout", -1.0, market="CRYPTO")
+
+    score = agent._signal_priority_score("Fractal_Profile_Breakout", signal, "3", regime)
+
+    assert score < 90.0
+
+
+def test_position_size_multiplier_uses_market_reward_when_available() -> None:
+    agent = _build_agent(AgentConfig(reinforcement_size_boost_pct=50.0))
+    agent._strategy_reward_ema["EMA_Crossover"] = 10.0
+    agent._strategy_market_reward_ema["EMA_Crossover"] = {"CRYPTO": -5.0, "US": 12.0}
+    for _ in range(10):
+        agent._strategy_perf_tracker.record_trade("EMA_Crossover", 1.0, market="US")
+    for _ in range(10):
+        agent._strategy_perf_tracker.record_trade("EMA_Crossover", -1.0, market="CRYPTO")
+
+    us_mult = agent._position_size_multiplier("EMA_Crossover", "US")
+    crypto_mult = agent._position_size_multiplier("EMA_Crossover", "CRYPTO")
+
+    assert us_mult > crypto_mult
 
 
 def test_resolve_trade_budget_cap_can_borrow_unused_global_capital_for_high_priority() -> None:

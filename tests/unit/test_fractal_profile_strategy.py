@@ -157,6 +157,20 @@ def _make_crypto_fractal_data(direction: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _make_us_fractal_data(direction: str) -> pd.DataFrame:
+    frame = _make_fractal_data(direction).copy()
+    frame["symbol"] = "US:SPY"
+    shifted: list[datetime] = []
+    prev_base = datetime(2026, 3, 5, 20, 0, tzinfo=IST)
+    current_base = datetime(2026, 3, 6, 20, 0, tzinfo=IST)
+    for index in range(len(frame)):
+        base = prev_base if index < 125 else current_base
+        offset = index if index < 125 else index - 125
+        shifted.append(base + timedelta(minutes=offset * 3))
+    frame["timestamp"] = shifted
+    return frame
+
+
 def test_generates_buy_signal_on_bullish_profile_stack() -> None:
     strategy = FractalProfileBreakoutStrategy()
     signals = strategy.generate_signals(_make_fractal_data("bullish"))
@@ -209,3 +223,25 @@ def test_generates_crypto_signal_on_supported_fractal_stack() -> None:
     assert signal.metadata["market"] == "CRYPTO"
     assert signal.metadata["hourly_shape"] == "elongated_up"
     assert signal.metadata["value_acceptance"] in {"accepted", "fast", "mixed", "balanced"}
+
+
+def test_us_fractal_rules_are_more_permissive_than_default_baseline() -> None:
+    strategy = FractalProfileBreakoutStrategy()
+    signals = strategy.generate_signals(_make_us_fractal_data("bullish"))
+
+    assert len(signals) == 1
+    profile = signals[0].metadata["market_rule_profile"]
+    assert profile["market"] == "US"
+    assert profile["min_conviction"] <= 66
+    assert profile["min_consecutive_hours"] == 1
+
+
+def test_crypto_fractal_rules_remain_tighter_than_us_profile() -> None:
+    strategy = FractalProfileBreakoutStrategy()
+    signals = strategy.generate_signals(_make_crypto_fractal_data("bullish"))
+
+    assert len(signals) == 1
+    profile = signals[0].metadata["market_rule_profile"]
+    assert profile["market"] == "CRYPTO"
+    assert profile["min_conviction"] >= 68
+    assert profile["max_stop_pct"] <= 1.8

@@ -92,6 +92,38 @@ class TestValidateTradeReject:
         assert result.is_valid is False
         assert "position" in result.reason.lower()
 
+    def test_allows_trade_when_other_market_positions_use_global_slots(self, manager: RiskManager) -> None:
+        """Market-scoped open-position counts should not be blocked by global state."""
+        manager.daily_state.open_positions = 20
+
+        result = manager.validate_trade(
+            symbol="NSE:NIFTY50-INDEX",
+            side="BUY",
+            quantity=2,
+            entry_price=22000.0,
+            stop_loss=21950.0,
+            open_positions_override=0,
+            position_would_increase_count=True,
+        )
+
+        assert result.is_valid is True
+        assert result.reason == ""
+
+    def test_allows_scale_in_when_market_at_position_limit(self, manager: RiskManager) -> None:
+        """Scaling an existing symbol should not consume a new position slot."""
+        result = manager.validate_trade(
+            symbol="NSE:NIFTY50-INDEX",
+            side="BUY",
+            quantity=1,
+            entry_price=22000.0,
+            stop_loss=21950.0,
+            open_positions_override=5,
+            position_would_increase_count=False,
+        )
+
+        assert result.is_valid is True
+        assert result.reason == ""
+
     def test_rejects_emergency_stop(self, manager: RiskManager) -> None:
         """Emergency stop blocks all trades."""
         manager.trigger_emergency_stop("test")

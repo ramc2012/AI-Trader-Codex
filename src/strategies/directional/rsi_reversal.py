@@ -41,6 +41,9 @@ class RSIReversalStrategy(BaseStrategy):
         atr_period: int = 14,
         atr_sl_multiplier: float = 1.5,
         risk_reward_ratio: float = 2.0,
+        volume_surge_multiplier: float = 1.5,
+        volume_ma_period: int = 20,
+        require_volume_surge: bool = True,
     ) -> None:
         if oversold >= overbought:
             raise ValueError(
@@ -52,6 +55,9 @@ class RSIReversalStrategy(BaseStrategy):
         self.atr_period = atr_period
         self.atr_sl_multiplier = atr_sl_multiplier
         self.risk_reward_ratio = risk_reward_ratio
+        self.volume_surge_multiplier = volume_surge_multiplier
+        self.volume_ma_period = volume_ma_period
+        self.require_volume_surge = require_volume_surge
 
         self._rsi = RSI(period=rsi_period)
         self._atr = ATR(period=atr_period)
@@ -71,15 +77,34 @@ class RSIReversalStrategy(BaseStrategy):
         close = data["close"].astype(float)
         high = data["high"].astype(float)
         low = data["low"].astype(float)
+        volume = data["volume"].astype(float) if "volume" in data.columns else None
 
         rsi = self._rsi.calculate(close)
         atr = self._atr.calculate(close, high=high, low=low)
+
+        # Volume moving average for surge detection
+        volume_ma = (
+            volume.rolling(window=self.volume_ma_period, min_periods=1).mean()
+            if volume is not None
+            else None
+        )
 
         signals: list[Signal] = []
 
         for i in range(1, len(data)):
             if pd.isna(rsi.iloc[i]) or pd.isna(rsi.iloc[i - 1]):
                 continue
+
+            # Volume surge filter: skip if volume is not elevated
+            volume_ratio = 1.0
+            volume_surge = True
+            if self.require_volume_surge and volume_ma is not None:
+                vol_ma_val = float(volume_ma.iloc[i]) if not pd.isna(volume_ma.iloc[i]) else 0.0
+                vol_val = float(volume.iloc[i]) if not pd.isna(volume.iloc[i]) else 0.0
+                volume_ratio = (vol_val / vol_ma_val) if vol_ma_val > 0 else 1.0
+                volume_surge = volume_ratio >= self.volume_surge_multiplier
+                if not volume_surge:
+                    continue
 
             signal: Signal | None = None
             current_atr = atr.iloc[i] if not pd.isna(atr.iloc[i]) else 0
@@ -108,6 +133,8 @@ class RSIReversalStrategy(BaseStrategy):
                         "prev_rsi": round(prev_rsi, 2),
                         "atr": round(float(current_atr), 2),
                         "trigger": "oversold_crossover",
+                        "volume_surge": volume_surge,
+                        "volume_ratio": round(volume_ratio, 2),
                     },
                 )
 
@@ -131,6 +158,8 @@ class RSIReversalStrategy(BaseStrategy):
                         "prev_rsi": round(prev_rsi, 2),
                         "atr": round(float(current_atr), 2),
                         "trigger": "overbought_crossover",
+                        "volume_surge": volume_surge,
+                        "volume_ratio": round(volume_ratio, 2),
                     },
                 )
 

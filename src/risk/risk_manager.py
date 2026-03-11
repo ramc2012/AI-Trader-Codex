@@ -151,6 +151,9 @@ class RiskManager:
         quantity: int,
         entry_price: float,
         stop_loss: float,
+        *,
+        open_positions_override: Optional[int] = None,
+        position_would_increase_count: bool = True,
     ) -> TradeValidation:
         """Validate a proposed trade against all risk limits.
 
@@ -216,17 +219,25 @@ class RiskManager:
             )
 
         # 4. Open positions limit
-        if self.daily_state.open_positions >= self.config.max_open_positions:
+        active_open_positions = max(
+            int(self.daily_state.open_positions if open_positions_override is None else open_positions_override),
+            0,
+        )
+        projected_open_positions = active_open_positions + (1 if position_would_increase_count else 0)
+        if (
+            position_would_increase_count
+            and projected_open_positions > self.config.max_open_positions
+        ):
             logger.warning(
                 "trade_rejected_max_positions",
                 symbol=symbol,
-                open_positions=self.daily_state.open_positions,
+                open_positions=active_open_positions,
                 limit=self.config.max_open_positions,
             )
             return TradeValidation(
                 is_valid=False,
                 reason=f"Max open positions reached: "
-                       f"{self.daily_state.open_positions}/{self.config.max_open_positions}.",
+                       f"{active_open_positions}/{self.config.max_open_positions}.",
                 risk_score=0.8,
             )
 
@@ -290,7 +301,7 @@ class RiskManager:
             abs(total_daily_pnl) / effective_max_loss if effective_max_loss > 0 else 0.0
         )
         position_usage = (
-            self.daily_state.open_positions / self.config.max_open_positions
+            projected_open_positions / self.config.max_open_positions
             if self.config.max_open_positions > 0
             else 0.0
         )

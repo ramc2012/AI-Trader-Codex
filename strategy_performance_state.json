@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "strategies": {
+    "EMA_Crossover": {
+      "strategy": "EMA_Crossover",
+      "trades": [
+        19.999999999999996
+      ],
+      "reward_ema": 3.9999999999999996,
+      "enabled": true,
+      "disabled_reason": ""
+    }
+  },
+  "strategy_markets": {
+    "EMA_Crossover": {
+      "CRYPTO": {
+        "strategy": "EMA_Crossover",
+        "trades": [
+          19.999999999999996
+        ],
+        "reward_ema": 3.9999999999999996,
+        "enabled": true,
+        "disabled_reason": ""
+      }
+    }
+  }
+}

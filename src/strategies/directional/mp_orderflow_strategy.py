@@ -47,7 +47,7 @@ class MarketProfileOrderFlowStrategy(BaseStrategy):
         breakout_buffer_pct: float = 0.06,
         risk_reward: float = 1.8,
         min_volume_ratio: float = 1.05,
-        min_imbalance_ratio: float = 0.08,
+        min_imbalance_ratio: float = 0.05,
         conviction_floor: float = 58.0,
         crypto_breakout_buffer_pct: float = 0.10,
         crypto_flow_threshold: float = 0.14,
@@ -163,24 +163,27 @@ class MarketProfileOrderFlowStrategy(BaseStrategy):
             and downward_momentum
         )
 
-        buy_orderflow_ok = (
+        # Core: directional delta clearly confirmed by recent pressure.
+        # Breadth: majority of bars closing in the signal direction.
+        # Depth: imbalance + volume surge — require EITHER breadth OR depth
+        # (not both) to avoid false-negatives from heuristic volume estimates.
+        core_buy_ok = (
             delta_bias > 0
             and flow_pressure >= flow_threshold
-            and avg_buy_pressure >= 0.53
-            and latest_delta >= 0
-            and delta_trend != "down"
-            and imbalance_ratio >= min_imbalance_ratio
-            and volume_ratio >= min_volume_ratio
+            and (latest_delta >= 0 or delta_trend == "up")
         )
-        sell_orderflow_ok = (
+        breadth_buy_ok = avg_buy_pressure >= 0.52
+        depth_buy_ok = imbalance_ratio >= min_imbalance_ratio and volume_ratio >= min_volume_ratio
+        buy_orderflow_ok = core_buy_ok and (breadth_buy_ok or depth_buy_ok)
+
+        core_sell_ok = (
             delta_bias < 0
             and flow_pressure <= -flow_threshold
-            and avg_buy_pressure <= 0.47
-            and latest_delta <= 0
-            and delta_trend != "up"
-            and imbalance_ratio >= min_imbalance_ratio
-            and volume_ratio >= min_volume_ratio
+            and (latest_delta <= 0 or delta_trend == "down")
         )
+        breadth_sell_ok = avg_buy_pressure <= 0.48
+        depth_sell_ok = imbalance_ratio >= min_imbalance_ratio and volume_ratio >= min_volume_ratio
+        sell_orderflow_ok = core_sell_ok and (breadth_sell_ok or depth_sell_ok)
 
         poc = float(profile.poc)
         vah = float(profile.vah)

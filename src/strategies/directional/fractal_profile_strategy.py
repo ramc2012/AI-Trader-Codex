@@ -34,6 +34,17 @@ class _SelectedFractalCandidate:
     active_hour: HourlyProfile
 
 
+@dataclass(frozen=True)
+class _MarketFractalRules:
+    min_conviction: int
+    min_consecutive_hours: int
+    entry_tolerance_bps: float
+    entry_tolerance_ticks: float
+    max_stop_pct: float
+    risk_reward: float
+    allow_soft_flow: bool = False
+
+
 class FractalProfileBreakoutStrategy(BaseStrategy):
     """Trade nested profile continuation only on clean 3-minute structure."""
 
@@ -96,13 +107,18 @@ class FractalProfileBreakoutStrategy(BaseStrategy):
 
         candidate = selected.candidate
         active_hour = selected.active_hour
+        rules = self._rules_for_candidate(market, candidate, active_hour)
         if not candidate.daily_alignment:
             return []
-        if candidate.consecutive_migration_hours < self.min_consecutive_hours:
+        if candidate.consecutive_migration_hours < rules.min_consecutive_hours:
             return []
-        if candidate.conviction < self.min_conviction:
+        if candidate.conviction < rules.min_conviction:
             return []
-        if not candidate.aggressive_flow_detected and candidate.conviction < (self.min_conviction + 8):
+        if (
+            not candidate.aggressive_flow_detected
+            and not rules.allow_soft_flow
+            and candidate.conviction < (rules.min_conviction + 3)
+        ):
             return []
 
         price = float(frame["close"].iloc[-1])
@@ -111,8 +127,8 @@ class FractalProfileBreakoutStrategy(BaseStrategy):
             return []
 
         tolerance = max(
-            float(context.daily_profile.tick_size) * self.entry_tolerance_ticks,
-            price * (self.entry_tolerance_bps / 10_000.0),
+            float(context.daily_profile.tick_size) * rules.entry_tolerance_ticks,
+            price * (rules.entry_tolerance_bps / 10_000.0),
         )
 
         timestamp = frame["timestamp"].iloc[-1]
@@ -123,9 +139,9 @@ class FractalProfileBreakoutStrategy(BaseStrategy):
             risk = price - float(candidate.stop_reference)
             if not triggered or risk <= 0:
                 return []
-            if (risk / price) > self.max_stop_pct:
+            if (risk / price) > rules.max_stop_pct:
                 return []
-            target_rr = float(candidate.adaptive_risk_reward or self.risk_reward)
+            target_rr = float(candidate.adaptive_risk_reward or rules.risk_reward)
             target = float(candidate.target_reference) if candidate.target_reference is not None else price + (risk * target_rr)
             if target <= price:
                 target = price + (risk * target_rr)
@@ -135,9 +151,9 @@ class FractalProfileBreakoutStrategy(BaseStrategy):
             risk = float(candidate.stop_reference) - price
             if not triggered or risk <= 0:
                 return []
-            if (risk / price) > self.max_stop_pct:
+            if (risk / price) > rules.max_stop_pct:
                 return []
-            target_rr = float(candidate.adaptive_risk_reward or self.risk_reward)
+            target_rr = float(candidate.adaptive_risk_reward or rules.risk_reward)
             target = float(candidate.target_reference) if candidate.target_reference is not None else price - (risk * target_rr)
             if target >= price:
                 target = price - (risk * target_rr)
@@ -181,6 +197,16 @@ class FractalProfileBreakoutStrategy(BaseStrategy):
                 "active_hour_poc": round(float(active_hour.poc), 4),
                 "active_hour_periods": int(active_hour.period_count),
                 "active_hour_overlap_ratio": round(float(active_hour.va_overlap_ratio), 4),
+                "market_rule_profile": {
+                    "market": market,
+                    "min_conviction": int(rules.min_conviction),
+                    "min_consecutive_hours": int(rules.min_consecutive_hours),
+                    "entry_tolerance_bps": round(float(rules.entry_tolerance_bps), 2),
+                    "entry_tolerance_ticks": round(float(rules.entry_tolerance_ticks), 2),
+                    "max_stop_pct": round(float(rules.max_stop_pct) * 100.0, 2),
+                    "risk_reward": round(float(rules.risk_reward), 3),
+                    "allow_soft_flow": bool(rules.allow_soft_flow),
+                },
                 "orderflow_summary": dict(candidate.orderflow_summary),
             },
         )
@@ -310,6 +336,76 @@ class FractalProfileBreakoutStrategy(BaseStrategy):
             "latest_delta": latest_delta,
             "imbalance_ratio": imbalance_ratio,
         }
+
+    def _rules_for_candidate(
+        self,
+        market: str,
+        candidate: TradeCandidate,
+        active_hour: HourlyProfile,
+    ) -> _MarketFractalRules:
+        min_conviction = int(self.min_conviction)
+        min_consecutive_hours = int(self.min_consecutive_hours)
+        entry_tolerance_bps = float(self.entry_tolerance_bps)
+        entry_tolerance_ticks = float(self.entry_tolerance_ticks)
+        max_stop_pct = float(self.max_stop_pct)
+        risk_reward = float(self.risk_reward)
+        allow_soft_flow = False
+
+        market_key = str(market or "").upper()
+        if market_key == "US":
+            min_conviction = max(min_conviction - 4, 60)
+            min_consecutive_hours = max(min_consecutive_hours - 1, 1)
+            entry_tolerance_bps = max(entry_tolerance_bps, 8.0)
+            entry_tolerance_ticks = max(entry_tolerance_ticks, 2.0)
+            max_stop_pct = max(max_stop_pct, 0.028)
+            risk_reward = max(risk_reward, 1.9)
+            allow_soft_flow = candidate.setup_type in {"acceptance_trend", "gap_and_go"}
+        elif market_key == "CRYPTO":
+            min_conviction = max(min_conviction + 4, 72)
+            min_consecutive_hours = max(min_consecutive_hours, 2)
+            entry_tolerance_bps = max(entry_tolerance_bps, 12.0)
+            entry_tolerance_ticks = max(entry_tolerance_ticks, 2.0)
+            max_stop_pct = min(max_stop_pct, 0.018)
+            risk_reward = min(max(risk_reward, 1.55), 1.75)
+        else:
+            min_conviction = max(min_conviction - 2, 64)
+            entry_tolerance_bps = max(entry_tolerance_bps, 7.0)
+            risk_reward = max(risk_reward, 1.85)
+            allow_soft_flow = candidate.setup_type == "acceptance_trend"
+
+        if candidate.setup_type == "acceptance_trend":
+            min_conviction -= 4 if market_key in {"NSE", "US"} else 0
+        elif candidate.setup_type == "gap_and_go":
+            min_conviction -= 2 if market_key == "US" else 0
+            min_conviction += 4 if market_key == "CRYPTO" else 0
+        elif candidate.setup_type == "breakout_drive" and market_key == "CRYPTO":
+            min_conviction += 6
+
+        if candidate.value_acceptance == "accepted":
+            min_conviction -= 2
+        elif candidate.value_acceptance == "balanced":
+            min_conviction += 4 if market_key == "CRYPTO" else 2
+        elif candidate.value_acceptance == "mixed" and market_key == "CRYPTO":
+            min_conviction += 2
+
+        if active_hour.va_overlap_ratio >= 0.35 and market_key in {"NSE", "US"}:
+            min_conviction -= 2
+            if market_key == "US":
+                min_consecutive_hours = max(min_consecutive_hours - 1, 1)
+
+        if candidate.consecutive_migration_hours >= 3 and market_key in {"NSE", "US"}:
+            min_conviction -= 2
+
+        floor = 68 if market_key == "CRYPTO" else 58 if market_key == "US" else 60
+        return _MarketFractalRules(
+            min_conviction=max(int(min_conviction), floor),
+            min_consecutive_hours=max(int(min_consecutive_hours), 1),
+            entry_tolerance_bps=entry_tolerance_bps,
+            entry_tolerance_ticks=entry_tolerance_ticks,
+            max_stop_pct=max_stop_pct,
+            risk_reward=risk_reward,
+            allow_soft_flow=allow_soft_flow,
+        )
 
     def _select_candidate(
         self,

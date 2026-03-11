@@ -512,6 +512,8 @@ export default function PositionsPage() {
 
   const totalPnlInr = portfolio?.total_pnl_inr ?? portfolio?.total_pnl ?? 0;
   const totalUnrealizedInr = portfolio?.total_unrealized_pnl_inr ?? portfolio?.total_unrealized_pnl ?? 0;
+  const grandTotalPositions = positionGroups.reduce((sum, g) => sum + g.positionCount, 0);
+  const grandTotalMarketValueInr = positionGroups.reduce((sum, g) => sum + g.marketValueInr, 0);
   const liveCount = sortedPositions.filter((row) => row.market_open).length;
 
   return (
@@ -639,19 +641,34 @@ export default function PositionsPage() {
                         <Fragment key={group.market}>
                           <tr>
                             <td colSpan={12} className="px-0 pt-4 pb-2">
-                              <div className="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3">
+                              <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3">
+                                {/* Left: market label + position count */}
                                 <div className="flex items-center gap-3">
                                   <MarketBadge market={group.market} live={group.live} />
                                   <div>
                                     <div className="text-sm font-semibold text-slate-100">{group.label}</div>
                                     <div className="text-xs text-slate-500">
-                                      {formatNumber(group.positionCount)} open positions
+                                      {formatNumber(group.positionCount)} position{group.positionCount !== 1 ? 's' : ''} · Qty {formatNumber(group.totalQuantity)}
                                     </div>
                                   </div>
                                 </div>
-                                <div className="text-right text-xs text-slate-500">
-                                  <div>Qty {formatNumber(group.totalQuantity)}</div>
-                                  <div>Value {formatCurrency(group.marketValueInr, 'INR')}</div>
+                                {/* Right: subtotals */}
+                                <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs">
+                                  <div className="text-right">
+                                    <div className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Mkt Value</div>
+                                    <div className="mt-0.5 font-medium text-slate-300">
+                                      {formatCurrency(group.marketValueInr, 'INR')}
+                                    </div>
+                                  </div>
+                                  <div className="text-right">
+                                    <div className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Unrealised P&amp;L</div>
+                                    <div className={cn(
+                                      'mt-0.5 font-semibold',
+                                      group.unrealizedPnlInr >= 0 ? 'text-emerald-300' : 'text-rose-300',
+                                    )}>
+                                      {formatCurrency(group.unrealizedPnlInr, 'INR')}
+                                    </div>
+                                  </div>
                                 </div>
                               </div>
                             </td>
@@ -838,6 +855,51 @@ export default function PositionsPage() {
                           </tr>
                         </Fragment>
                       ))}
+                      {positionGroups.length > 1 && (
+                        <tr>
+                          <td colSpan={12} className="px-0 pt-3 pb-2">
+                            <div className="grid grid-cols-2 gap-3 rounded-2xl border border-slate-600/60 bg-gradient-to-r from-slate-900/95 to-slate-800/60 px-4 py-3 ring-1 ring-slate-600/30 sm:grid-cols-4">
+                              <div>
+                                <div className="text-[10px] uppercase tracking-[0.18em] text-slate-300">Portfolio Total</div>
+                                <div className="mt-1 text-sm font-bold text-white">
+                                  {formatNumber(grandTotalPositions)} position{grandTotalPositions !== 1 ? 's' : ''}
+                                </div>
+                                <div className="mt-0.5 text-xs text-slate-400">
+                                  {positionGroups.length} market{positionGroups.length !== 1 ? 's' : ''}
+                                </div>
+                              </div>
+                              <div>
+                                <div className="text-[10px] uppercase tracking-[0.18em] text-slate-300">Total Market Value</div>
+                                <div className="mt-1 text-sm font-bold text-white">
+                                  {formatCurrency(grandTotalMarketValueInr, 'INR')}
+                                </div>
+                              </div>
+                              <div>
+                                <div className="text-[10px] uppercase tracking-[0.18em] text-slate-300">Unrealised P&amp;L</div>
+                                <div
+                                  className={cn(
+                                    'mt-1 text-sm font-bold',
+                                    totalUnrealizedInr >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                                  )}
+                                >
+                                  {formatCurrency(totalUnrealizedInr, 'INR')}
+                                </div>
+                              </div>
+                              <div>
+                                <div className="text-[10px] uppercase tracking-[0.18em] text-slate-300">Net P&amp;L</div>
+                                <div
+                                  className={cn(
+                                    'mt-1 text-sm font-bold',
+                                    totalPnlInr >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                                  )}
+                                >
+                                  {formatCurrency(totalPnlInr, 'INR')}
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -886,6 +948,41 @@ export default function PositionsPage() {
                         </td>
                       </tr>
                     ))}
+                    {marketTotals.length > 1 && (
+                      <tr className="border-t-2 border-slate-700/80 bg-slate-800/30">
+                        <td className="py-3 pr-4 text-sm font-bold text-white">All Markets</td>
+                        <td className="py-3 pr-4">
+                          <span className="inline-flex items-center rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium text-sky-300">
+                            Summary
+                          </span>
+                        </td>
+                        <td className="py-3 pr-4 text-right text-sm font-semibold text-slate-100">
+                          {formatNumber(marketTotals.reduce((s, r) => s + r.openPositions, 0))}
+                        </td>
+                        <td className="py-3 pr-4 text-right text-sm font-semibold text-slate-100">
+                          {formatNumber(marketTotals.reduce((s, r) => s + r.closedTrades, 0))}
+                        </td>
+                        <td className="py-3 pr-4 text-right text-sm font-semibold text-slate-100">
+                          {formatCurrency(marketTotals.reduce((s, r) => s + r.marketValueInr, 0), 'INR')}
+                        </td>
+                        <td
+                          className={cn(
+                            'py-3 pr-4 text-right text-sm font-bold',
+                            totalUnrealizedInr >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                          )}
+                        >
+                          {formatCurrency(totalUnrealizedInr, 'INR')}
+                        </td>
+                        <td
+                          className={cn(
+                            'py-3 text-right text-sm font-bold',
+                            totalPnlInr >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                          )}
+                        >
+                          {formatCurrency(totalPnlInr, 'INR')}
+                        </td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>

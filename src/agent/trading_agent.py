@@ -14,7 +14,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 import math
+from pathlib import Path
 import re
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -51,6 +53,8 @@ from src.strategies.directional.macd_strategy import MACDStrategy
 from src.strategies.directional.mp_orderflow_strategy import MarketProfileOrderFlowStrategy
 from src.strategies.directional.ml_ensemble import MLEnsembleStrategy
 from src.strategies.directional.rsi_reversal import RSIReversalStrategy
+from src.ml.online.learning_engine import OnlineLearningEngine
+from src.ml.online.strategy_performance_tracker import StrategyPerformanceTracker
 from src.strategies.directional.supertrend_strategy import SupertrendStrategy
 from src.utils.logger import get_logger
 from src.utils.market_symbols import parse_currency_context
@@ -170,6 +174,7 @@ class OptionExitPlan:
     target: float
     opened_at: datetime
     time_exit_at: datetime
+    signal_id: str = ""
 
 
 class TradingAgent:
@@ -210,7 +215,12 @@ class TradingAgent:
         self._us_daily_cache_ttl = timedelta(minutes=5)
         self._option_exit_plans: Dict[str, Dict[str, OptionExitPlan]] = {}
         self._strategy_reward_ema: Dict[str, float] = {}
+        self._strategy_market_reward_ema: Dict[str, Dict[str, float]] = {}
         self._strategy_reward_counts: Dict[str, int] = {}
+        self._strategy_perf_tracker = StrategyPerformanceTracker(
+            alpha=config.reinforcement_alpha, data_dir=Path(".")
+        )
+        self._online_learning_engine: Optional[OnlineLearningEngine] = None
         self._strategy_signal_counts: Dict[str, int] = {}
         self._strategy_trade_counts: Dict[str, int] = {}
         self._market_signal_counts: Dict[str, int] = {}
@@ -302,8 +312,23 @@ class TradingAgent:
             },
         ))
 
-        self._task = asyncio.create_task(self._main_loop())
-        logger.info("trading_agent_started", config=self.config.__dict__)
+        try:
+            await self._init_online_learning()
+            self._task = asyncio.create_task(self._main_loop())
+            logger.info("trading_agent_started", config=self.config.__dict__)
+        except Exception as exc:
+            self.state = AgentState.ERROR
+            self._error = str(exc)
+            self.executor.stop()
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.AGENT_ERROR,
+                title="Agent Startup Failed",
+                message=f"Failed to initialize trading agent: {exc}",
+                severity="error",
+                metadata={"error": str(exc)},
+            ))
+            logger.exception("trading_agent_start_failed", error=str(exc))
+            raise
 
     async def stop(self) -> None:
         """Gracefully stop the agent."""
@@ -319,6 +344,7 @@ class TradingAgent:
                 pass
 
         self.executor.stop()
+        self._strategy_perf_tracker._persist_state()
 
         await self.event_bus.emit(AgentEvent(
             event_type=AgentEventType.AGENT_STOPPED,
@@ -328,6 +354,97 @@ class TradingAgent:
             metadata={"cycles": self._cycle_count, "trades": self._total_trades, "pnl": self._daily_pnl},
         ))
         logger.info("trading_agent_stopped")
+
+    # ------------------------------------------------------------------
+    # Online Learning Initialisation
+    # ------------------------------------------------------------------
+
+    async def _init_online_learning(self) -> None:
+        """Initialise and load persisted state for the online learning stack."""
+        settings = get_settings()
+        data_dir = getattr(settings, "data_dir", "data")
+        ml_ensemble_strategy = self.get_strategy_instance("ML_Ensemble")
+        engine = OnlineLearningEngine(
+            ml_ensemble_strategy=ml_ensemble_strategy,
+            data_dir=Path(data_dir),
+        )
+        engine.load_state()
+        self._online_learning_engine = engine
+        # Re-create tracker with the resolved data_dir so state persists correctly
+        self._strategy_perf_tracker = StrategyPerformanceTracker(
+            alpha=self.config.reinforcement_alpha, data_dir=Path(data_dir)
+        )
+        self._strategy_perf_tracker.load_state()
+        self._bootstrap_market_learning_state()
+        self._strategy_reward_ema = self._strategy_perf_tracker.get_reward_snapshot()
+        self._strategy_market_reward_ema = self._strategy_perf_tracker.get_market_reward_snapshot()
+        logger.info(
+            "online_learning_initialised",
+            buffer_size=len(engine._buffer),
+            threshold=round(engine._confidence_threshold, 4),
+        )
+
+    def _extract_signal_features(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        signal_metadata: Optional[dict] = None,
+    ) -> tuple[list[float], list[str]]:
+        """Extract a flat numeric feature vector from the latest candle in df.
+
+        Appends strategy-specific features from signal_metadata when available
+        (conviction_score, flow_pressure, poc/value-area metrics for MP_OrderFlow;
+        daily_alignment, aggressive_flow, consecutive_hours for Fractal_Profile).
+
+        Returns (features, feature_names). Falls back to empty lists on error.
+        """
+        try:
+            close = float(df["close"].iloc[-1])
+            volume = float(df["volume"].iloc[-1]) if "volume" in df.columns else 0.0
+            high = float(df["high"].iloc[-1]) if "high" in df.columns else close
+            low = float(df["low"].iloc[-1]) if "low" in df.columns else close
+            open_ = float(df["open"].iloc[-1]) if "open" in df.columns else close
+            candle_range = max(high - low, 1e-9)
+            body = abs(close - open_)
+            vol_ma = float(df["volume"].tail(20).mean()) if "volume" in df.columns else 0.0
+            vol_ratio = volume / max(vol_ma, 1.0)
+            close_series = df["close"].astype(float)
+            roc5 = float((close_series.iloc[-1] / close_series.iloc[-6] - 1) * 100) if len(close_series) >= 6 else 0.0
+            roc20 = float((close_series.iloc[-1] / close_series.iloc[-21] - 1) * 100) if len(close_series) >= 21 else 0.0
+            features: list[float] = [close, high, low, open_, volume, candle_range, body, vol_ratio, roc5, roc20]
+            names: list[str] = ["close", "high", "low", "open", "volume", "candle_range", "body", "vol_ratio", "roc5", "roc20"]
+
+            # Strategy-specific features extracted from signal metadata.
+            # These make the ML model strategy-aware, improving label quality.
+            meta = signal_metadata if isinstance(signal_metadata, dict) else {}
+            if meta:
+                # Shared across MP_OrderFlow and Fractal_Profile
+                conviction_raw = float(meta.get("conviction_score", 0) or 0)
+                features.append(conviction_raw / 100.0)
+                names.append("conviction_score_norm")
+
+                # MP_OrderFlow_Breakout specific
+                features.append(float(meta.get("flow_pressure", 0.0) or 0.0))
+                names.append("flow_pressure")
+                features.append(float(meta.get("poc_distance_atr", 0.0) or 0.0))
+                names.append("poc_distance_atr")
+                features.append(float(meta.get("value_area_width_pct", 0.0) or 0.0))
+                names.append("value_area_width_pct")
+                features.append(float(meta.get("volume_ratio", 1.0) or 1.0))
+                names.append("volume_ratio_meta")
+
+                # Fractal_Profile_Breakout specific
+                features.append(1.0 if meta.get("daily_alignment") else 0.0)
+                names.append("daily_alignment")
+                features.append(1.0 if meta.get("aggressive_flow_detected") else 0.0)
+                names.append("aggressive_flow_detected")
+                consec_hours = float(meta.get("consecutive_migration_hours", 0) or 0)
+                features.append(min(consec_hours / 5.0, 1.0))
+                names.append("consecutive_hours_norm")
+
+            return features, names
+        except Exception:
+            return [], []
 
     async def pause(self) -> None:
         """Pause the agent (loop stays alive but skips processing)."""
@@ -492,6 +609,21 @@ class TradingAgent:
             market: round(float(stats.get("net_pnl_inr", 0.0)), 2)
             for market, stats in market_stats.items()
         }
+        ml_ensemble_live_enabled = "ML_Ensemble" in self.config.strategies
+        online_learning_stats = self._online_learning_engine.stats if self._online_learning_engine is not None else {}
+        online_learning_stats = {
+            **online_learning_stats,
+            "strategy_reinforcement_enabled": bool(self.config.reinforcement_enabled),
+            "ml_ensemble_live_enabled": ml_ensemble_live_enabled,
+            "ml_ensemble_attached": bool(
+                ml_ensemble_live_enabled
+                and self._online_learning_engine is not None
+                and getattr(self._online_learning_engine, "_ensemble", None) is not None
+            ),
+            "signal_outcome_capture_enabled": bool(
+                self._online_learning_engine is not None
+            ),
+        }
         return {
             "state": self.state.value,
             "paper_mode": self.config.paper_mode,
@@ -530,7 +662,13 @@ class TradingAgent:
             "last_scan_time": self._last_scan_time.isoformat() if self._last_scan_time else None,
             "bootstrap_mode_active": self._is_bootstrap_phase(),
             "emergency_stop": bool(self.risk_manager.emergency_stop),
+            "online_learning_active": self._online_learning_engine is not None,
+            "online_learning_stats": online_learning_stats,
             "strategy_reward_ema": {k: round(v, 4) for k, v in self._strategy_reward_ema.items()},
+            "strategy_reward_ema_by_market": {
+                strategy: {market: round(value, 4) for market, value in market_rewards.items()}
+                for strategy, market_rewards in self._strategy_market_reward_ema.items()
+            },
             "error": self._error,
         }
 
@@ -1121,6 +1259,9 @@ class TradingAgent:
             for strat_name in self.config.strategies:
                 if strat_name not in self.executor._strategies:
                     continue
+                if not self._strategy_perf_tracker.is_enabled(strat_name):
+                    logger.debug("strategy_skipped_auto_disabled", strategy=strat_name, symbol=symbol)
+                    continue
 
                 await self.event_bus.emit(AgentEvent(
                     event_type=AgentEventType.STRATEGY_ANALYZING,
@@ -1149,10 +1290,32 @@ class TradingAgent:
                 # Process each actionable signal after higher-timeframe confirmation.
                 for result in actionable:
                     signal: Signal = result["signal"]
-                    confirmed, reference_meta = await self._confirm_reference_timeframes(
-                        symbol=symbol,
-                        signal_type=signal.signal_type,
+                    sig_meta = signal.metadata if isinstance(signal.metadata, dict) else {}
+                    # Fractal_Profile_Breakout encodes daily profile context internally
+                    # via daily_alignment + hourly TPO conviction.  When the strategy
+                    # itself has already validated the higher timeframe (daily_alignment=True)
+                    # AND conviction is high, skip the external EMA-based HTF check to
+                    # avoid a double-filter that suppresses valid profile-breakout setups.
+                    _fractal_htf_bypass = (
+                        strat_name == "Fractal_Profile_Breakout"
+                        and sig_meta.get("daily_alignment") is True
+                        and float(sig_meta.get("conviction_score", 0) or 0) >= 72
                     )
+                    if _fractal_htf_bypass:
+                        confirmed = True
+                        reference_meta = {
+                            "bypassed": "fractal_daily_alignment",
+                            "conviction_score": sig_meta.get("conviction_score"),
+                            "bullish_votes": 0,
+                            "bearish_votes": 0,
+                            "dominant_trend": "neutral",
+                            "confidence_pct": 0.0,
+                        }
+                    else:
+                        confirmed, reference_meta = await self._confirm_reference_timeframes(
+                            symbol=symbol,
+                            signal_type=signal.signal_type,
+                        )
                     if not confirmed:
                         await self.event_bus.emit(AgentEvent(
                             event_type=AgentEventType.NO_SIGNAL,
@@ -1221,6 +1384,7 @@ class TradingAgent:
                             "timeframe": timeframe,
                             "priority_score": priority_score,
                             "regime": regime_meta,
+                            "df": df,
                         }
                     )
 
@@ -1266,6 +1430,7 @@ class TradingAgent:
                     short_name,
                     default_symbol=symbol,
                     execution_timeframe=str(candidate["timeframe"]),
+                    df_for_signal=candidate.get("df"),
                 )
                 if self._total_trades > before_trade_count:
                     break
@@ -1553,7 +1718,7 @@ class TradingAgent:
                 return None
             ts = parsed.to_pydatetime()
         if ts.tzinfo is None:
-            return ts.replace(tzinfo=IST)
+            return ts.replace(tzinfo=timezone.utc).astimezone(IST)
         return ts.astimezone(IST)
 
     def _data_freshness(self, df: pd.DataFrame, timeframe: str) -> Tuple[bool, Dict[str, Any]]:
@@ -1653,6 +1818,7 @@ class TradingAgent:
         short_name: str,
         default_symbol: str,
         execution_timeframe: Optional[str] = None,
+        df_for_signal: Optional[pd.DataFrame] = None,
     ) -> None:
         """Validate signal through risk, size position, place order."""
         underlying_symbol = signal.symbol or default_symbol
@@ -1662,6 +1828,25 @@ class TradingAgent:
 
         if not isinstance(signal.metadata, dict):
             signal.metadata = {}
+
+        # Assign a UUID to this signal and register features for online learning
+        signal_id = str(uuid.uuid4())
+        signal.metadata["signal_id"] = signal_id
+        if self._online_learning_engine is not None and df_for_signal is not None:
+            features, feature_names = self._extract_signal_features(
+                df_for_signal,
+                signal.symbol or default_symbol,
+                signal_metadata=signal.metadata,
+            )
+            if features:
+                self._online_learning_engine.register_signal(
+                    signal_id=signal_id,
+                    symbol=signal.symbol or default_symbol,
+                    strategy=strat_name,
+                    features=features,
+                    feature_names=feature_names,
+                    signal_type=signal.signal_type.value,
+                )
 
         if underlying_market == "NSE" and not self._is_nse_option_symbol(underlying_symbol):
             if not self._is_nse_option_eligible_underlying(underlying_symbol):
@@ -1863,7 +2048,7 @@ class TradingAgent:
         except Exception:
             quantity = 1
 
-        reinforcement_mult = self._position_size_multiplier(strat_name)
+        reinforcement_mult = self._position_size_multiplier(strat_name, execution_market)
         market_condition_mult = self._market_condition_size_multiplier(signal, execution_timeframe)
         applied_size_mult = reinforcement_mult * market_condition_mult
         if isinstance(signal.metadata, dict):
@@ -2084,6 +2269,8 @@ class TradingAgent:
         effective_concentration_pct_total = (
             effective_max_position_size_inr / max(self.total_allocated_capital_inr(), 1.0)
         )
+        market_open_positions = self._market_open_position_count(execution_market)
+        position_would_increase_count = self.position_manager.get_position(execution_symbol) is None
         with self._temporary_risk_overrides(
             max_position_size=effective_max_position_size_inr,
             max_risk_per_trade_pct=effective_max_risk_per_trade_pct,
@@ -2096,6 +2283,8 @@ class TradingAgent:
                 quantity=quantity,
                 entry_price=entry_price,
                 stop_loss=sl_price,
+                open_positions_override=market_open_positions,
+                position_would_increase_count=position_would_increase_count,
             )
 
         if not validation.is_valid:
@@ -2109,6 +2298,8 @@ class TradingAgent:
                     "underlying_symbol": underlying_symbol,
                     "reason": validation.reason,
                     "risk_score": validation.risk_score,
+                    "market_open_positions": market_open_positions,
+                    "market_open_position_limit": effective_max_open_positions,
                 },
             ))
             return
@@ -2122,6 +2313,8 @@ class TradingAgent:
                     "symbol": execution_symbol,
                     "underlying_symbol": underlying_symbol,
                     "risk_score": validation.risk_score,
+                    "market_open_positions": market_open_positions,
+                    "market_open_position_limit": effective_max_open_positions,
                 },
             ))
 
@@ -2232,6 +2425,7 @@ class TradingAgent:
                         entry_price=fill_price,
                         stop_loss=sl_price,
                         target=target_price,
+                        signal_id=signal_id,
                     )
             else:
                 status = executed_order.status.value if executed_order is not None else "rejected"
@@ -2663,6 +2857,16 @@ class TradingAgent:
         allocation = self._market_allocation(market)
         return max(float(allocation["allocated_capital"]) - self._market_used_capital(market), 0.0)
 
+    def _market_open_position_count(self, market: str) -> int:
+        market_key = str(market or "").upper()
+        return len(
+            {
+                position.symbol
+                for position in self.position_manager.get_all_positions()
+                if self._symbol_market(position.symbol) == market_key and int(position.quantity or 0) > 0
+            }
+        )
+
     def _resolve_trade_budget_cap(
         self,
         strategy_budget: Dict[str, float],
@@ -2772,6 +2976,98 @@ class TradingAgent:
         }
         return strength_defaults.get(signal.strength.value, 60.0)
 
+    def _market_scoped_reward(self, strategy: str, market: str | None) -> tuple[float, int, float]:
+        market_key = str(market or "").strip().upper()
+        global_reward = float(self._strategy_reward_ema.get(strategy, 0.0))
+        global_trades = int(self._strategy_perf_tracker.get_trade_count(strategy))
+        if not market_key:
+            return global_reward, global_trades, global_reward
+
+        market_reward = self._strategy_market_reward_ema.get(strategy, {}).get(market_key)
+        market_trades = int(
+            self._strategy_perf_tracker.get_trade_count(strategy, market=market_key, prefer_market=True)
+        )
+        if market_reward is None or market_trades <= 0:
+            return global_reward, global_trades, global_reward
+
+        if market_trades >= 12:
+            blended = (market_reward * 0.8) + (global_reward * 0.2)
+        elif market_trades >= 5:
+            blended = (market_reward * 0.6) + (global_reward * 0.4)
+        else:
+            blended = (market_reward * 0.35) + (global_reward * 0.65)
+        return blended, market_trades, market_reward
+
+    def _bootstrap_market_learning_state(self) -> None:
+        seeded_trades: list[tuple[str, str, float]] = []
+        for trade in self.position_manager.get_closed_trades():
+            symbol = str(trade.get("symbol") or "").strip()
+            strategy = self._normalize_strategy_tag(trade.get("strategy_tag"))
+            market = self._symbol_market(symbol)
+            entry_price = float(trade.get("entry_price") or 0.0)
+            quantity = int(trade.get("quantity") or 0)
+            pnl = float(trade.get("pnl") or 0.0)
+            entry_notional = entry_price * max(quantity, 0)
+            if not strategy or entry_notional <= 0:
+                continue
+            pnl_pct = (pnl / entry_notional) * 100.0
+            seeded_trades.append((strategy, market, pnl_pct))
+        if not seeded_trades:
+            return
+        self._strategy_perf_tracker.seed_market_stats(seeded_trades)
+
+    def _strategy_market_fit_score(
+        self,
+        strategy: str,
+        signal: Signal,
+        market: str,
+        execution_timeframe: str,
+        regime_meta: Dict[str, Any],
+    ) -> float:
+        metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
+        regime = str(regime_meta.get("regime", "transition"))
+        setup_type = str(metadata.get("setup_type", "") or "")
+        value_acceptance = str(metadata.get("value_acceptance", "") or "")
+        conviction = self._signal_conviction_score(signal)
+
+        if strategy == "Fractal_Profile_Breakout":
+            score = 0.0
+            if market in {"NSE", "US"}:
+                if regime == "trending":
+                    score += 6.0
+                elif regime == "bracketing":
+                    score -= 10.0
+                if setup_type == "acceptance_trend":
+                    score += 5.0
+                elif setup_type == "gap_and_go" and market == "US":
+                    score += 3.0
+                if value_acceptance == "accepted":
+                    score += 2.0
+            elif market == "CRYPTO":
+                if regime == "bracketing":
+                    score -= 12.0
+                if setup_type != "acceptance_trend":
+                    score -= 5.0
+                if value_acceptance in {"balanced", "mixed"}:
+                    score -= 4.0
+                if conviction < 78.0:
+                    score -= 8.0
+            return score
+
+        if strategy == "MP_OrderFlow_Breakout":
+            if market == "CRYPTO":
+                if conviction >= 78.0 and regime in {"trending", "volatile"}:
+                    return 4.0
+                if regime == "bracketing":
+                    return -8.0
+                if conviction < 70.0:
+                    return -6.0
+                return -2.0
+            if market in {"NSE", "US"} and regime == "trending":
+                return 3.0
+
+        return 0.0
+
     def _signal_priority_score(
         self,
         strategy: str,
@@ -2781,18 +3077,31 @@ class TradingAgent:
     ) -> float:
         metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
         conviction = self._signal_conviction_score(signal)
-        reward = float(self._strategy_reward_ema.get(strategy, 0.0))
+        market = str(metadata.get("market") or self._symbol_market(signal.symbol or "")).upper()
+        reward, market_reward_samples, raw_market_reward = self._market_scoped_reward(strategy, market)
         reward_component = max(min(reward, 12.0), -12.0)
 
         tf_token = str(execution_timeframe or metadata.get("execution_timeframe") or "").strip().upper()
         regime = str(regime_meta.get("regime", "transition"))
         timeframe_fit = 1.0
-        if regime == "trending":
+        if strategy == "Fractal_Profile_Breakout":
+            # Fractal always runs on 3m but its conviction already encodes daily
+            # profile context — do not penalise for short timeframe, and give a
+            # small edge in all regimes to encourage execution on valid setups.
+            timeframe_fit = 1.10
+        elif strategy == "MP_OrderFlow_Breakout":
+            # MP is designed for 3m–60m.  Honour the momentum of each timeframe.
+            timeframe_fit = 1.12 if tf_token in {"5", "15"} else 1.06 if tf_token in {"3", "60"} else 0.90
+        elif regime == "trending":
             timeframe_fit = 1.14 if tf_token in {"15", "30", "60", "D"} else 1.0 if tf_token == "5" else 0.72
         elif regime == "bracketing":
             timeframe_fit = 1.12 if tf_token == "5" else 1.04 if tf_token == "3" else 0.78
         elif regime == "volatile":
             timeframe_fit = 1.08 if tf_token in {"15", "5"} else 0.84
+
+        # Conviction from strategy metadata (both Fractal and MP expose this).
+        conviction_from_meta = float(metadata.get("conviction_score", 0) or 0)
+        conviction_meta_bonus = 8.0 if conviction_from_meta >= 78 else 4.0 if conviction_from_meta >= 65 else 0.0
 
         reference_meta = metadata.get("reference_timeframe_bias", {})
         vote_component = 0.0
@@ -2824,7 +3133,24 @@ class TradingAgent:
         if metadata.get("bootstrap_exploration"):
             rr_component -= 10.0
 
-        score = (conviction * timeframe_fit) + reward_component + vote_component + rr_component
+        market_fit_component = self._strategy_market_fit_score(
+            strategy,
+            signal,
+            market,
+            execution_timeframe,
+            regime_meta,
+        )
+        if market_reward_samples >= 8:
+            reward_component += max(min(raw_market_reward, 8.0), -8.0) * 0.15
+
+        score = (
+            (conviction * timeframe_fit)
+            + reward_component
+            + vote_component
+            + rr_component
+            + conviction_meta_bonus
+            + market_fit_component
+        )
         return max(0.0, min(score, 100.0))
 
     @staticmethod
@@ -2857,10 +3183,10 @@ class TradingAgent:
             return 2
         return 1
 
-    def _position_size_multiplier(self, strategy: str) -> float:
+    def _position_size_multiplier(self, strategy: str, market: str | None = None) -> float:
         if not self.config.reinforcement_enabled:
             return 1.0
-        reward = self._strategy_reward_ema.get(strategy, 0.0)
+        reward, _, _ = self._market_scoped_reward(strategy, market)
         max_boost = max(self.config.reinforcement_size_boost_pct / 100.0, 0.0)
         if max_boost <= 0:
             return 1.0
@@ -2923,14 +3249,25 @@ class TradingAgent:
 
         return max(0.35, min(multiplier, 1.75))
 
-    def _record_reinforcement(self, strategy: str, pnl_pct: float) -> None:
+    def _record_reinforcement(self, strategy: str, pnl_pct: float, market: str | None = None) -> None:
         if not self.config.reinforcement_enabled:
             return
-        alpha = min(max(float(self.config.reinforcement_alpha), 0.01), 1.0)
-        prev = self._strategy_reward_ema.get(strategy, 0.0)
-        updated = ((1.0 - alpha) * prev) + (alpha * pnl_pct)
-        self._strategy_reward_ema[strategy] = updated
+        reward_ema, was_disabled, market_reward_ema = self._strategy_perf_tracker.record_trade(
+            strategy,
+            pnl_pct,
+            market=market,
+        )
+        self._strategy_reward_ema[strategy] = reward_ema
+        if market:
+            market_key = str(market).strip().upper()
+            self._strategy_market_reward_ema.setdefault(strategy, {})[market_key] = market_reward_ema
         self._strategy_reward_counts[strategy] = self._strategy_reward_counts.get(strategy, 0) + 1
+        if was_disabled:
+            logger.warning(
+                "strategy_auto_disabled",
+                strategy=strategy,
+                sharpe=round(self._strategy_perf_tracker._stats[strategy].rolling_sharpe, 3),
+            )
 
     def _resolve_lot_size(self, underlying_symbol: str) -> int:
         root = self._normalize_nse_underlying_root(underlying_symbol)
@@ -3220,6 +3557,7 @@ class TradingAgent:
         entry_price: float,
         stop_loss: float,
         target: float,
+        signal_id: str = "",
     ) -> None:
         now = datetime.now(tz=IST)
         minutes = self._resolve_time_exit_minutes(execution_timeframe)
@@ -3238,6 +3576,7 @@ class TradingAgent:
                 target=float(target),
                 opened_at=now,
                 time_exit_at=now + timedelta(minutes=minutes),
+                signal_id=signal_id,
             )
             return
 
@@ -3972,6 +4311,23 @@ class TradingAgent:
         try:
             from src.data.ohlc_cache import get_ohlc_cache
 
+            market = self._symbol_market(symbol)
+            now = datetime.now(tz=IST)
+            require_live_bars = self._requires_live_bars(market, tf, now)
+            stale_candidate: Optional[pd.DataFrame] = None
+
+            def remember_stale(frame: Optional[pd.DataFrame]) -> None:
+                nonlocal stale_candidate
+                if frame is None or frame.empty or "timestamp" not in frame.columns:
+                    return
+                if stale_candidate is None:
+                    stale_candidate = frame.copy(deep=False)
+                    return
+                candidate_ts = self._coerce_ist_timestamp(frame["timestamp"].iloc[-1])
+                existing_ts = self._coerce_ist_timestamp(stale_candidate["timestamp"].iloc[-1])
+                if candidate_ts is not None and (existing_ts is None or candidate_ts > existing_ts):
+                    stale_candidate = frame.copy(deep=False)
+
             # 1) Fast path: in-memory cache.
             cache = get_ohlc_cache()
             cached = cache.as_dataframe(symbol, tf, limit=500)
@@ -3980,21 +4336,38 @@ class TradingAgent:
                 if "timestamp" not in df_cached.columns and "index" in df_cached.columns:
                     df_cached = df_cached.rename(columns={"index": "timestamp"})
                 df_cached["symbol"] = symbol
-                return df_cached
+                fresh, _ = self._data_freshness(df_cached, tf)
+                if fresh:
+                    return df_cached
+                if not require_live_bars:
+                    remember_stale(df_cached)
 
             # 2) In-process cache to avoid repeated external API fetches
             # within a single scan cycle across strategies/timeframes.
             cache_key = (symbol, tf)
-            now = datetime.now(tz=IST)
             local_cached = self._market_data_cache.get(cache_key)
             if local_cached is not None:
                 cached_at, cached_df = local_cached
                 if now - cached_at <= self._market_data_cache_ttl:
-                    return cached_df.copy(deep=False)
+                    fresh, _ = self._data_freshness(cached_df, tf)
+                    if fresh:
+                        return cached_df.copy(deep=False)
+                    if not require_live_bars:
+                        remember_stale(cached_df)
 
-            market = self._symbol_market(symbol)
+            # 3) TimescaleDB fallback before external broker calls. This reduces
+            # FYERS rate pressure during live NSE sessions if the background
+            # collectors already persisted the latest bars.
+            db_df = await self._fetch_database_market_data(symbol, tf)
+            if db_df is not None and not db_df.empty:
+                fresh, _ = self._data_freshness(db_df, tf)
+                if fresh:
+                    self._market_data_cache[cache_key] = (now, db_df)
+                    return db_df
+                if not require_live_bars:
+                    remember_stale(db_df)
 
-            # 3) Market-specific primary source.
+            # 4) Market-specific primary source.
             if market == "US":
                 us_df = await self._fetch_us_market_data(symbol, tf)
                 if us_df is not None and not us_df.empty:
@@ -4006,29 +4379,109 @@ class TradingAgent:
                     self._market_data_cache[cache_key] = (now, crypto_df)
                     return crypto_df
 
-            # 4) Broker fallback (NSE + any symbol supported by broker).
+            # 5) Broker fallback (NSE + any symbol supported by broker).
             fyers_df = await self._fetch_fyers_market_data(symbol, tf)
             if fyers_df is not None and not fyers_df.empty:
                 self._market_data_cache[cache_key] = (now, fyers_df)
                 return fyers_df
 
-            # 5) Last fallback for US/crypto in case primary source failed transiently.
+            # 6) Last fallback for US/crypto in case primary source failed transiently.
             if market == "US":
                 us_df = await self._fetch_us_market_data(symbol, tf)
                 if us_df is not None and not us_df.empty:
                     self._market_data_cache[cache_key] = (now, us_df)
                     return us_df
-                return None
+                return stale_candidate.copy(deep=False) if stale_candidate is not None else None
             if market == "CRYPTO":
                 crypto_df = await self._fetch_crypto_market_data(symbol, tf)
                 if crypto_df is not None and not crypto_df.empty:
                     self._market_data_cache[cache_key] = (now, crypto_df)
                     return crypto_df
-                return None
+                return stale_candidate.copy(deep=False) if stale_candidate is not None else None
+            if stale_candidate is not None:
+                self._market_data_cache[cache_key] = (now, stale_candidate)
+                return stale_candidate.copy(deep=False)
             return None
 
         except Exception as e:
             logger.warning("fetch_market_data_error", symbol=symbol, timeframe=tf, error=str(e))
+            return None
+
+    def _requires_live_bars(self, market: str, timeframe: str, now: Optional[datetime] = None) -> bool:
+        token = str(timeframe or "").strip().upper()
+        if token in {"D", "W", "M"}:
+            return False
+
+        current = now or datetime.now(tz=IST)
+        market_key = str(market or "").upper()
+        if market_key == "NSE":
+            return is_market_open(current)
+        if market_key == "US":
+            return is_us_market_open(current)
+        if market_key == "CRYPTO":
+            return True
+        return False
+
+    async def _fetch_database_market_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
+        """Load recent candles from TimescaleDB when available."""
+        try:
+            from src.database.connection import get_session
+            from src.database.operations import get_ohlc_candles
+
+            token = str(timeframe or "").strip().upper()
+            days_back = {
+                "1": 7,
+                "3": 14,
+                "5": 21,
+                "15": 45,
+                "30": 60,
+                "60": 90,
+                "D": 365,
+                "W": 730,
+                "M": 1825,
+            }.get(token, 30)
+            end = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+            start = (datetime.now(tz=timezone.utc) - timedelta(days=days_back)).replace(tzinfo=None)
+
+            async with get_session() as session:
+                rows = await get_ohlc_candles(
+                    session,
+                    symbol,
+                    token,
+                    start,
+                    end,
+                    limit=500,
+                )
+
+            if not rows:
+                return None
+
+            payload: List[Dict[str, Any]] = []
+            for row in rows:
+                ts = row.timestamp
+                if ts is None:
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc).astimezone(IST)
+                else:
+                    ts = ts.astimezone(IST)
+                payload.append(
+                    {
+                        "timestamp": ts,
+                        "open": float(row.open),
+                        "high": float(row.high),
+                        "low": float(row.low),
+                        "close": float(row.close),
+                        "volume": int(row.volume),
+                        "symbol": symbol,
+                    }
+                )
+
+            if not payload:
+                return None
+            return pd.DataFrame(payload).sort_values("timestamp").reset_index(drop=True)
+        except Exception as exc:
+            logger.warning("fetch_database_market_data_error", symbol=symbol, timeframe=timeframe, error=str(exc))
             return None
 
     async def _fetch_fyers_market_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
@@ -5091,7 +5544,17 @@ class TradingAgent:
 
         pnl_pct = (realized / entry_value) * 100.0
         if plan is not None:
-            self._record_reinforcement(plan.strategy, pnl_pct)
+            reinforcement_market = self._symbol_market(plan.underlying_symbol if plan.underlying_symbol else symbol)
+            self._record_reinforcement(plan.strategy, pnl_pct, market=reinforcement_market)
+            engine = self._online_learning_engine
+            if engine is not None and plan.signal_id:
+                asyncio.ensure_future(
+                    engine.label_outcome(
+                        signal_id=plan.signal_id,
+                        pnl_pct=pnl_pct,
+                        exit_timestamp=datetime.now(tz=IST),
+                    )
+                )
 
         await self.event_bus.emit(AgentEvent(
             event_type=AgentEventType.POSITION_CLOSED,

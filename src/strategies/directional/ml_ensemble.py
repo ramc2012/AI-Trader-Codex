@@ -73,6 +73,28 @@ class MLEnsembleStrategy(BaseStrategy):
         )
         logger.info("ml_ensemble_loaded", models=len(self._models))
 
+    # ── Live adaptation API (called by OnlineLearningEngine) ──────────────────
+
+    def update_confidence_threshold(self, threshold: float) -> None:
+        """Adapt confidence threshold based on rolling signal precision."""
+        self.confidence_threshold = max(0.50, min(0.85, float(threshold)))
+        if self._signal_generator is not None:
+            self._signal_generator.confidence_threshold = self.confidence_threshold
+        logger.info("ml_ensemble_threshold_updated", threshold=round(self.confidence_threshold, 4))
+
+    def update_model_weights(self, weights: list[float]) -> None:
+        """Rebalance ensemble weights after online retraining."""
+        if self._signal_generator is not None and weights:
+            self._signal_generator.weights = self._signal_generator._normalize_weights(weights, len(weights))
+            logger.info("ml_ensemble_weights_updated", weights=[round(w, 4) for w in weights])
+
+    def reload_models(self, new_models: list) -> None:
+        """Replace internal model list with online-retrained models."""
+        self._models = new_models
+        if self._signal_generator is not None:
+            self._signal_generator.models = new_models
+        logger.info("ml_ensemble_models_reloaded", count=len(new_models))
+
     def generate_signals(self, data: pd.DataFrame) -> list[Signal]:
         self._ensure_loaded()
         if self._signal_generator is None or data.empty:

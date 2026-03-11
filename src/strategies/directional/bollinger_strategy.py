@@ -12,7 +12,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.analysis.indicators import ATR, RSI, BollingerBands
+from src.analysis.indicators import ADX, ATR, RSI, BollingerBands
 from src.strategies.base import BaseStrategy, Signal, SignalStrength, SignalType
 from src.utils.logger import get_logger
 
@@ -41,6 +41,8 @@ class BollingerBandStrategy(BaseStrategy):
         atr_period: int = 14,
         atr_sl_multiplier: float = 1.5,
         risk_reward_ratio: float = 2.0,
+        adx_period: int = 14,
+        adx_trending_threshold: float = 25.0,
     ) -> None:
         self.bb_period = bb_period
         self.bb_std = bb_std
@@ -48,10 +50,13 @@ class BollingerBandStrategy(BaseStrategy):
         self.atr_period = atr_period
         self.atr_sl_multiplier = atr_sl_multiplier
         self.risk_reward_ratio = risk_reward_ratio
+        self.adx_period = adx_period
+        self.adx_trending_threshold = adx_trending_threshold
 
         self._bb = BollingerBands(period=bb_period, std_dev=bb_std)
         self._rsi = RSI(period=rsi_period)
         self._atr = ATR(period=atr_period)
+        self._adx = ADX(period=adx_period)
 
     def generate_signals(self, data: pd.DataFrame) -> list[Signal]:
         """Generate BUY/SELL signals based on Bollinger Band mean reversion.
@@ -73,6 +78,7 @@ class BollingerBandStrategy(BaseStrategy):
         bb = self._bb.calculate(close)
         rsi = self._rsi.calculate(close)
         atr = self._atr.calculate(close, high=high, low=low)
+        adx_series = self._adx.calculate(data)["adx"]
 
         upper_band = bb["upper"]
         lower_band = bb["lower"]
@@ -88,6 +94,12 @@ class BollingerBandStrategy(BaseStrategy):
                 or pd.isna(close.iloc[i - 1])
             ):
                 continue
+
+            # Regime filter: skip mean-reversion in strongly trending markets
+            current_adx = float(adx_series.iloc[i]) if not pd.isna(adx_series.iloc[i]) else 0.0
+            regime = "trending" if current_adx > self.adx_trending_threshold else "ranging"
+            if current_adx > self.adx_trending_threshold:
+                continue  # Mean-reversion is unreliable in strong trends
 
             signal: Signal | None = None
             current_atr = atr.iloc[i] if not pd.isna(atr.iloc[i]) else 0
@@ -122,6 +134,8 @@ class BollingerBandStrategy(BaseStrategy):
                         "middle_band": round(float(middle_band.iloc[i]), 2) if not pd.isna(middle_band.iloc[i]) else 0.0,
                         "atr": round(float(current_atr), 2),
                         "trigger": "below_lower_band",
+                        "adx": round(current_adx, 2),
+                        "regime": regime,
                     },
                 )
 
@@ -147,6 +161,8 @@ class BollingerBandStrategy(BaseStrategy):
                         "middle_band": round(float(middle_band.iloc[i]), 2) if not pd.isna(middle_band.iloc[i]) else 0.0,
                         "atr": round(float(current_atr), 2),
                         "trigger": "above_upper_band",
+                        "adx": round(current_adx, 2),
+                        "regime": regime,
                     },
                 )
 

@@ -731,7 +731,10 @@ class AgentStatusResponse(BaseModel):
     last_scan_time: Optional[str] = None
     bootstrap_mode_active: bool = False
     emergency_stop: bool = False
+    online_learning_active: bool = False
+    online_learning_stats: Dict[str, Any] = Field(default_factory=dict)
     strategy_reward_ema: Dict[str, float] = Field(default_factory=dict)
+    strategy_reward_ema_by_market: Dict[str, Dict[str, float]] = Field(default_factory=dict)
     error: Optional[str] = None
 
 

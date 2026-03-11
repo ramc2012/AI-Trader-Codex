@@ -102,11 +102,13 @@ async def get_ohlc_candles(
             IndexOHLC.timestamp >= start,
             IndexOHLC.timestamp <= end,
         )
-        .order_by(IndexOHLC.timestamp)
+        .order_by(IndexOHLC.timestamp.desc())
         .limit(limit)
     )
     result = await session.execute(stmt)
-    return result.scalars().all()
+    rows = list(result.scalars().all())
+    rows.reverse()
+    return rows
 
 
 async def get_latest_ohlc_timestamp(

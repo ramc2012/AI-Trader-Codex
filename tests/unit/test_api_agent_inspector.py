@@ -72,6 +72,30 @@ def _seed_cache(symbol: str, timeframe: str, bars: int) -> None:
     asyncio.run(cache.warm_up({symbol: {timeframe: candles}}))
 
 
+def _seed_stale_cache(symbol: str, timeframe: str, bars: int, *, days_ago: int) -> None:
+    now = (datetime.now(timezone.utc) - timedelta(days=days_ago)).replace(second=0, microsecond=0)
+    token = str(timeframe).upper()
+    step = timedelta(minutes=max(int(token), 1))
+
+    candles: list[dict[str, Any]] = []
+    price = 24_000.0
+    for i in range(bars):
+        ts = now - (step * (bars - i))
+        price += 2.0
+        candles.append(
+            {
+                "timestamp": ts.isoformat(),
+                "open": price - 3.0,
+                "high": price + 4.0,
+                "low": price - 4.0,
+                "close": price,
+                "volume": 500 + i,
+            }
+        )
+    cache = get_ohlc_cache()
+    asyncio.run(cache.warm_up({symbol: {timeframe: candles}}))
+
+
 def _mock_options_analytics() -> dict[str, Any]:
     return {
         "market": "NSE",
@@ -228,6 +252,44 @@ def test_agent_inspector_falls_back_to_last_available_timeframe() -> None:
         assert body["data_source"]["fallback_used"] is True
         assert body["data_source"]["resolved_timeframe"] == "5"
         assert body["strategies"][0]["timeframe"] == "5"
+    finally:
+        agent_module.STRATEGY_REGISTRY.pop(DummyInspectorStrategy.name, None)
+        reset_managers()
+
+
+def test_agent_inspector_skips_stale_requested_timeframe_when_fresher_fallback_exists() -> None:
+    reset_managers()
+    app = create_app()
+    client = TestClient(app, raise_server_exceptions=False)
+
+    agent_module.STRATEGY_REGISTRY[DummyInspectorStrategy.name] = DummyInspectorStrategy
+    symbol = "NSE:NIFTY50-INDEX"
+    _seed_stale_cache(symbol, "3", bars=120, days_ago=2)
+    _seed_cache(symbol, "5", bars=140)
+    _seed_cache(symbol, "60", bars=60)
+    _seed_cache(symbol, "D", bars=40)
+
+    try:
+        agent = agent_module.get_trading_agent()
+
+        async def fake_options(*_args, **_kwargs):
+            return _mock_options_analytics()
+
+        agent.get_options_trade_analytics = fake_options  # type: ignore[method-assign]
+        resp = client.get(
+            "/api/v1/agent/inspector",
+            params={
+                "symbol": symbol,
+                "timeframe": "3",
+                "lookback_bars": 120,
+                "strategies": DummyInspectorStrategy.name,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["resolved_timeframe"] == "5"
+        assert body["data_source"]["fallback_used"] is True
+        assert body["data_source"]["resolved_timeframe"] == "5"
     finally:
         agent_module.STRATEGY_REGISTRY.pop(DummyInspectorStrategy.name, None)
         reset_managers()

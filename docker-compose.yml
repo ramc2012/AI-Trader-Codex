@@ -82,7 +82,7 @@ services:
       SECRET_KEY: ${SECRET_KEY:-docker_dev_secret_key}
       # Trading
       TRADING_MODE: ${TRADING_MODE:-paper}
-      AGENT_AUTO_START: ${AGENT_AUTO_START:-false}
+      AGENT_AUTO_START: "true"
       MAX_DAILY_LOSS_PCT: ${MAX_DAILY_LOSS_PCT:-2.0}
       MAX_POSITION_SIZE_PCT: ${MAX_POSITION_SIZE_PCT:-25.0}
       MAX_CONCENTRATION_PCT: ${MAX_CONCENTRATION_PCT:-30.0}
@@ -103,19 +103,25 @@ services:
       AGENT_REINFORCEMENT_ENABLED: ${AGENT_REINFORCEMENT_ENABLED:-true}
       AGENT_REINFORCEMENT_ALPHA: ${AGENT_REINFORCEMENT_ALPHA:-0.2}
       AGENT_REINFORCEMENT_SIZE_BOOST_PCT: ${AGENT_REINFORCEMENT_SIZE_BOOST_PCT:-60.0}
-      AGENT_DEFAULT_SYMBOLS: ${AGENT_DEFAULT_SYMBOLS:-NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX,NSE:NIFTYMIDCAP50-INDEX,BSE:SENSEX-INDEX}
-      AGENT_US_SYMBOLS: ${AGENT_US_SYMBOLS:-US:AAPL,US:AMZN,US:JPM,US:XOM,US:UNH,US:CAT,US:PG,US:LIN,US:NEE,US:DIS}
-      AGENT_CRYPTO_SYMBOLS: ${AGENT_CRYPTO_SYMBOLS:-CRYPTO:BTCUSDT,CRYPTO:ETHUSDT,CRYPTO:BNBUSDT,CRYPTO:SOLUSDT,CRYPTO:XRPUSDT,CRYPTO:ADAUSDT,CRYPTO:DOGEUSDT,CRYPTO:AVAXUSDT,CRYPTO:DOTUSDT,CRYPTO:LINKUSDT}
+      # Symbol universes — omitting these lets the code defaults in agent_universe.py take effect
+      # (full Nifty 50 stocks + indices, DEFAULT_AGENT_US_SYMBOLS, DEFAULT_AGENT_CRYPTO_SYMBOLS).
+      # Override here only if you need a narrower set for testing.
+      # AGENT_DEFAULT_SYMBOLS: NSE:NIFTY50-INDEX,...
+      # AGENT_US_SYMBOLS: US:SPY,...
+      # AGENT_CRYPTO_SYMBOLS: CRYPTO:BTCUSDT,...
       AGENT_TRADE_NSE_WHEN_OPEN: ${AGENT_TRADE_NSE_WHEN_OPEN:-true}
       AGENT_TRADE_US_WHEN_OPEN: ${AGENT_TRADE_US_WHEN_OPEN:-true}
       AGENT_TRADE_US_OPTIONS: ${AGENT_TRADE_US_OPTIONS:-true}
       AGENT_TRADE_CRYPTO_24X7: ${AGENT_TRADE_CRYPTO_24X7:-true}
       TELEGRAM_STATUS_INTERVAL_MINUTES: ${TELEGRAM_STATUS_INTERVAL_MINUTES:-30}
       USD_INR_REFERENCE_RATE: ${USD_INR_REFERENCE_RATE:-83.0}
+      # Online-learning state directory (named volume — survives container rebuilds)
+      DATA_DIR: /app/data
       # Note: Fyers credentials are read from mounted .env file, not from environment
     volumes:
       - ./.env:/app/.env
       - ./.fyers_token.json:/app/.fyers_token.json
+      - agent_data:/app/data
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -170,6 +176,8 @@ volumes:
   timescaledb_data:
     driver: local
   redis_data:
+    driver: local
+  agent_data:
     driver: local
 
 networks:

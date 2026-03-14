@@ -336,6 +336,7 @@ class TradingAgent:
             max_samples=runtime_settings.agent_latency_metrics_window,
         )
         self._event_driven_task: Optional[asyncio.Task[None]] = None
+        self._event_driven_exit_task: Optional[asyncio.Task[None]] = None
         self._order_event_task: Optional[asyncio.Task[None]] = None
         self._order_submit_task: Optional[asyncio.Task[None]] = None
         self._symbol_scan_locks: Dict[str, asyncio.Lock] = {}
@@ -446,6 +447,8 @@ class TradingAgent:
             self._task = asyncio.create_task(self._main_loop())
             if self._candle_broker is not None and self.config.event_driven_execution_enabled:
                 self._event_driven_task = asyncio.create_task(self._event_driven_loop())
+            if self._tick_broker is not None and self.config.event_driven_execution_enabled:
+                self._event_driven_exit_task = asyncio.create_task(self._event_driven_exit_loop())
             if self._order_event_broker is not None and not self.config.paper_mode:
                 self._order_event_task = asyncio.create_task(self._order_event_loop())
             if not self.config.paper_mode:
@@ -484,6 +487,13 @@ class TradingAgent:
             except asyncio.CancelledError:
                 pass
         self._event_driven_task = None
+        if self._event_driven_exit_task and not self._event_driven_exit_task.done():
+            self._event_driven_exit_task.cancel()
+            try:
+                await self._event_driven_exit_task
+            except asyncio.CancelledError:
+                pass
+        self._event_driven_exit_task = None
         if self._order_event_task and not self._order_event_task.done():
             self._order_event_task.cancel()
             try:
@@ -548,6 +558,18 @@ class TradingAgent:
             return token in self.config.crypto_symbols and bool(self.config.trade_crypto_24x7)
         return False
 
+    def _is_event_driven_exit_symbol_eligible(self, symbol: str) -> bool:
+        token = str(symbol or "").strip()
+        if not token or self.state != AgentState.RUNNING:
+            return False
+        if not self._event_driven_market_enabled(self._symbol_market(token)):
+            return False
+        if self.position_manager.get_position(token) is None:
+            return False
+        if self._symbol_has_pending_live_order(token):
+            return False
+        return self._latest_stream_price(token) is not None
+
     async def _event_driven_loop(self) -> None:
         if self._candle_broker is None:
             return
@@ -602,6 +624,71 @@ class TradingAgent:
             raise
         finally:
             self._candle_broker.unsubscribe("*", queue)
+
+    async def _event_driven_exit_loop(self) -> None:
+        if self._tick_broker is None:
+            return
+
+        queue = self._tick_broker.subscribe("*")
+        pending_prices: Dict[str, float] = {}
+        debounce_seconds = max(float(self.config.event_driven_debounce_ms) / 1000.0, 0.05)
+        batch_size = max(int(self.config.event_driven_batch_size), 1)
+        last_flush = time.monotonic()
+
+        try:
+            while self.state == AgentState.RUNNING:
+                timeout = 5.0
+                if pending_prices:
+                    timeout = max(debounce_seconds - (time.monotonic() - last_flush), 0.02)
+
+                payload: Optional[Dict[str, Any]] = None
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    payload = None
+
+                if payload is not None:
+                    symbol = str(payload.get("symbol", "")).strip()
+                    try:
+                        latest_price = float(payload.get("ltp") or payload.get("close") or 0.0)
+                    except (TypeError, ValueError):
+                        latest_price = 0.0
+                    if latest_price > 0 and self._is_event_driven_exit_symbol_eligible(symbol):
+                        pending_prices[symbol] = latest_price
+
+                should_flush = bool(pending_prices) and (
+                    payload is None
+                    or len(pending_prices) >= batch_size
+                    or (time.monotonic() - last_flush) >= debounce_seconds
+                )
+                if not should_flush:
+                    continue
+
+                symbols = sorted(pending_prices.keys())[:batch_size]
+                last_flush = time.monotonic()
+                now = datetime.now(tz=IST)
+                eod_buffer_minutes = max(int(self.risk_manager.config.time_based_exit_minutes), 1)
+                for symbol in symbols:
+                    latest_price = pending_prices.pop(symbol, 0.0)
+                    if latest_price <= 0:
+                        continue
+                    started = time.perf_counter()
+                    self._apply_stream_mark_price(symbol, latest_price)
+                    await self._check_position_exit(
+                        symbol,
+                        now=now,
+                        eod_buffer_minutes=eod_buffer_minutes,
+                        emit_position_update=False,
+                    )
+                    self._latency_tracker.record(
+                        "event_driven_exit_check_ms",
+                        (time.perf_counter() - started) * 1000.0,
+                        symbol=symbol,
+                    )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._tick_broker.unsubscribe("*", queue)
 
     def _symbol_has_pending_live_order(self, symbol: str) -> bool:
         token = str(symbol or "").strip()
@@ -6742,6 +6829,18 @@ class TradingAgent:
             return None
         return price if price > 0 else None
 
+    def _apply_stream_mark_price(self, symbol: str, price: float) -> None:
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            return
+        if px <= 0:
+            return
+        position = self.position_manager.update_price(symbol, px)
+        if position is None:
+            return
+        self.risk_manager.sync_position_value(symbol, float(position.quantity or 0) * px)
+
     async def _fetch_us_live_prices(self, symbols: List[str]) -> Dict[str, float]:
         ticker_to_symbol = {
             self._normalize_us_ticker(symbol): symbol
@@ -7201,7 +7300,27 @@ class TradingAgent:
         eod_buffer_minutes = max(int(self.risk_manager.config.time_based_exit_minutes), 1)
 
         for pos_obj in self.position_manager.get_all_positions():
-            symbol = pos_obj.symbol
+            await self._check_position_exit(
+                pos_obj.symbol,
+                now=now,
+                eod_buffer_minutes=eod_buffer_minutes,
+                emit_position_update=True,
+            )
+
+    async def _check_position_exit(
+        self,
+        symbol: str,
+        *,
+        now: datetime,
+        eod_buffer_minutes: int,
+        emit_position_update: bool,
+    ) -> bool:
+        async with self._scan_lock(symbol):
+            pos_obj = self.position_manager.get_position(symbol)
+            if pos_obj is None or int(pos_obj.quantity or 0) <= 0:
+                self._remove_exit_plan(symbol)
+                return False
+
             short_name = symbol.split(":")[-1].split("-")[0]
             quantity = int(pos_obj.quantity)
             avg_price = float(pos_obj.avg_price)
@@ -7210,7 +7329,6 @@ class TradingAgent:
             unrealized_pnl_pct = float(pos_obj.unrealized_pnl_pct)
             side = str(pos_obj.side.value).upper()
 
-            # Time-based exit near market close
             if self._should_force_eod_exit(symbol, now, eod_buffer_minutes):
                 symbol_plans = self._symbol_exit_plans(symbol)
                 if symbol_plans:
@@ -7230,12 +7348,10 @@ class TradingAgent:
                         reason="eod_exit",
                         plan=None,
                     )
-                continue
+                return True
 
             symbol_plans = self._symbol_exit_plans(symbol)
             if not symbol_plans and not self._is_index_symbol(symbol):
-                # Recover exit control for carry-forward option positions that
-                # may exist after process restarts.
                 for view in self.position_manager.get_position_views(symbol=symbol):
                     self._upsert_option_exit_plan(
                         symbol=symbol,
@@ -7274,16 +7390,17 @@ class TradingAgent:
                             plan=plan,
                         )
                         triggered = True
-                if triggered:
-                    continue
+                if triggered or not emit_position_update:
+                    return triggered
+
+            if not emit_position_update:
+                return False
 
             plan = self._display_exit_plan(symbol)
-
             time_left_sec = 0
             if plan is not None:
                 time_left_sec = max(int((plan.time_exit_at - now).total_seconds()), 0)
 
-            # Emit position update
             await self.event_bus.emit(AgentEvent(
                 event_type=AgentEventType.POSITION_UPDATE,
                 title=f"Position: {short_name}",
@@ -7320,6 +7437,7 @@ class TradingAgent:
                     ),
                 },
             ))
+            return False
 
     async def refresh_position_marks(self, symbols: Optional[List[str]] = None) -> Dict[str, float]:
         """Refresh current marks for open positions using live multi-market quotes."""
@@ -7336,7 +7454,7 @@ class TradingAgent:
             except (TypeError, ValueError):
                 continue
             if px > 0:
-                self.position_manager.update_price(symbol, px)
+                self._apply_stream_mark_price(symbol, px)
         return prices
 
     def _should_force_eod_exit(self, symbol: str, now_ist: datetime, buffer_minutes: int) -> bool:

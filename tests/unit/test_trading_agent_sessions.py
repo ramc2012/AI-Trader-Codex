@@ -16,6 +16,7 @@ from src.agent.trading_agent import (
     PendingLiveEntrySubmission,
     TradingAgent,
 )
+from src.agent.events import AgentEventType
 from src.agent.trading_agent import AgentState
 from src.config.market_hours import IST
 from src.data.live.tick_stream import TickStreamBroker
@@ -467,6 +468,105 @@ async def test_fetch_live_prices_prefers_streamed_tick_snapshot() -> None:
     prices = await agent._fetch_live_prices(["CRYPTO:BTCUSDT"])
 
     assert prices == {"CRYPTO:BTCUSDT": 43125.5}
+
+
+def test_event_driven_exit_symbol_requires_position_and_live_tick() -> None:
+    tick_broker = TickStreamBroker()
+    position_manager = PositionManager()
+    agent = TradingAgent(
+        config=AgentConfig(
+            event_driven_execution_enabled=True,
+            event_driven_markets=["CRYPTO"],
+            crypto_symbols=["CRYPTO:BTCUSDT"],
+        ),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=position_manager,
+        risk_manager=MagicMock(),
+        event_bus=MagicMock(),
+        fyers_client=MagicMock(),
+        tick_broker=tick_broker,
+    )
+    agent.state = AgentState.RUNNING
+
+    assert agent._is_event_driven_exit_symbol_eligible("CRYPTO:BTCUSDT") is False
+
+    position_manager.open_position(
+        symbol="CRYPTO:BTCUSDT",
+        quantity=2,
+        side=PositionSide.LONG,
+        price=43000.0,
+        strategy_tag="EMA_Crossover",
+    )
+    assert agent._is_event_driven_exit_symbol_eligible("CRYPTO:BTCUSDT") is False
+
+    tick_broker.publish(
+        {
+            "type": "tick",
+            "symbol": "CRYPTO:BTCUSDT",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "ltp": 43125.5,
+        }
+    )
+
+    assert agent._is_event_driven_exit_symbol_eligible("CRYPTO:BTCUSDT") is True
+
+
+@pytest.mark.asyncio
+async def test_check_position_exit_closes_target_without_position_update_event() -> None:
+    position_manager = PositionManager()
+    position_manager.open_position(
+        symbol="CRYPTO:ADAUSDT",
+        quantity=10,
+        side=PositionSide.LONG,
+        price=1.0,
+        strategy_tag="EMA_Crossover",
+    )
+
+    placed_order = MagicMock()
+    placed_order.status = OrderStatus.FILLED
+    placed_order.fill_price = 1.2
+    order_manager = MagicMock()
+    order_manager.place_order.return_value = MagicMock(success=True, order=placed_order)
+
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+    risk_manager.config.time_based_exit_minutes = 5
+
+    agent = TradingAgent(
+        config=AgentConfig(),
+        strategy_executor=MagicMock(),
+        order_manager=order_manager,
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent._upsert_option_exit_plan(
+        symbol="CRYPTO:ADAUSDT",
+        underlying_symbol="CRYPTO:ADAUSDT",
+        strategy="EMA_Crossover",
+        quantity=10,
+        execution_timeframe="5",
+        entry_price=1.0,
+        stop_loss=0.9,
+        target=1.1,
+        signal_id="sig-1",
+    )
+    agent._apply_stream_mark_price("CRYPTO:ADAUSDT", 1.2)
+
+    triggered = await agent._check_position_exit(
+        "CRYPTO:ADAUSDT",
+        now=datetime.now(tz=IST),
+        eod_buffer_minutes=5,
+        emit_position_update=False,
+    )
+
+    assert triggered is True
+    assert position_manager.get_position("CRYPTO:ADAUSDT") is None
+    emitted_types = [call.args[0].event_type for call in event_bus.emit.await_args_list]
+    assert AgentEventType.POSITION_UPDATE not in emitted_types
 
 
 @pytest.mark.asyncio

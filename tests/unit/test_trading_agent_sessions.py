@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
@@ -145,6 +146,7 @@ def test_agent_status_exposes_market_and_strategy_stats() -> None:
     assert "online_learning_stats" in status
     assert "strategy_reward_ema_by_market" in status
     assert "execution_backend" in status
+    assert "execution_signal_lane" in status
     assert "execution_transport" in status
     assert "event_driven_enabled" in status
     assert "event_driven_markets" in status
@@ -404,6 +406,22 @@ def test_periodic_scan_symbols_skip_event_driven_symbols() -> None:
     assert filtered == ["CRYPTO:BTCUSDT"]
 
 
+def test_periodic_scan_symbols_skip_execution_core_lane_symbols() -> None:
+    agent = _build_agent(
+        AgentConfig(
+            event_driven_markets=["CRYPTO"],
+            crypto_symbols=["CRYPTO:BTCUSDT"],
+            us_symbols=["US:SPY"],
+        )
+    )
+    agent._runtime_settings = SimpleNamespace(nats_enabled=True)
+    agent._execution_core_backend = "rust"
+
+    filtered = agent._periodic_scan_symbols(["CRYPTO:BTCUSDT", "US:SPY"])
+
+    assert filtered == ["US:SPY"]
+
+
 def test_crypto_symbol_becomes_event_driven_only_after_live_candle() -> None:
     candle_broker = TickStreamBroker()
     agent = TradingAgent(
@@ -595,6 +613,59 @@ async def test_live_only_scan_suppresses_verbose_info_events() -> None:
     await agent._scan_symbol_unlocked("NSE:NIFTY50-INDEX", live_only=True)
 
     event_bus.emit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execution_core_signal_dispatches_into_process_signal_once() -> None:
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    agent = TradingAgent(
+        config=AgentConfig(
+            event_driven_markets=["CRYPTO"],
+            crypto_symbols=["CRYPTO:BTCUSDT"],
+        ),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=MagicMock(),
+        risk_manager=MagicMock(),
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent.state = AgentState.RUNNING
+    agent._runtime_settings = SimpleNamespace(nats_enabled=True)
+    agent._execution_core_backend = "rust"
+    agent._execution_core_signal_subject = "test_stream.execution.signals"
+    agent._reset_execution_core_signal_state()
+    agent._process_signal = AsyncMock()
+
+    payload = {
+        "stream": "execution_signals",
+        "event_time": datetime.now(tz=IST).isoformat(),
+        "event_id": "sig-rust-1",
+        "source": "execution_core",
+        "event_type": "signal_candidate",
+        "signal_type": "BUY",
+        "symbol": "CRYPTO:BTCUSDT",
+        "market": "CRYPTO",
+        "timeframe": "1",
+        "strategy": "Rust_EMA_Crossover",
+        "price": 64000.0,
+        "payload": {"ema_fast": 63990.0, "ema_slow": 63970.0},
+    }
+
+    await agent._handle_execution_core_signal(payload)
+    await agent._handle_execution_core_signal(payload)
+
+    assert agent._process_signal.await_count == 1
+    dispatched_signal = agent._process_signal.await_args.args[0]
+    assert dispatched_signal.symbol == "CRYPTO:BTCUSDT"
+    assert dispatched_signal.signal_type == SignalType.BUY
+    assert dispatched_signal.metadata["signal_source"] == "execution_core"
+    assert agent._total_signals == 1
+    assert agent._strategy_signal_counts["Rust_EMA_Crossover"] == 1
+    assert agent._market_signal_counts["CRYPTO"] == 1
+    assert agent._execution_core_signal_stats["accepted"] == 1
+    assert agent._execution_core_signal_stats["rejected"] == 1
 
 
 def test_signal_priority_score_penalizes_small_timeframe_in_trend() -> None:

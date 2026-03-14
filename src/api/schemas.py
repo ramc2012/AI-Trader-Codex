@@ -729,6 +729,7 @@ class AgentStatusResponse(BaseModel):
     pending_live_entries: int = 0
     pending_live_exits: int = 0
     execution_backend: str = "python"
+    execution_signal_lane: Dict[str, Any] = Field(default_factory=dict)
     execution_core_status: Dict[str, Any] = Field(default_factory=dict)
     execution_transport: str = "inmemory"
     streaming_backends: Dict[str, Dict[str, Any]] = Field(default_factory=dict)

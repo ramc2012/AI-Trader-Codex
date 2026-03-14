@@ -8,7 +8,7 @@ at every decision point for the live UI and Telegram.
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -335,6 +335,13 @@ class TradingAgent:
             enabled=runtime_settings.agent_latency_metrics_enabled,
             max_samples=runtime_settings.agent_latency_metrics_window,
         )
+        self._runtime_settings = runtime_settings
+        self._execution_core_backend = str(runtime_settings.execution_core_backend or "python").strip().lower()
+        self._execution_core_signal_subject = f"{runtime_settings.nats_stream_prefix}.execution.signals"
+        self._execution_core_signal_task: Optional[asyncio.Task[None]] = None
+        self._execution_core_signal_stats: Dict[str, Any] = {}
+        self._execution_core_seen_signal_ids: deque[str] = deque(maxlen=1024)
+        self._execution_core_seen_signal_lookup: set[str] = set()
         self._event_driven_task: Optional[asyncio.Task[None]] = None
         self._event_driven_exit_task: Optional[asyncio.Task[None]] = None
         self._order_event_task: Optional[asyncio.Task[None]] = None
@@ -363,6 +370,7 @@ class TradingAgent:
         self._warmed_symbols: set[str] = set()
         self._stale_data_keys: set[Tuple[str, str]] = set()
         self._circuit_breaker_notified = False
+        self._reset_execution_core_signal_state()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -392,6 +400,7 @@ class TradingAgent:
         self._us_daily_cache.clear()
         self._stale_data_keys.clear()
         self._circuit_breaker_notified = False
+        self._reset_execution_core_signal_state()
         self._strategy_signal_counts.clear()
         self._strategy_trade_counts.clear()
         self._market_signal_counts.clear()
@@ -441,6 +450,8 @@ class TradingAgent:
 
         try:
             await self._init_online_learning()
+            if self._execution_core_backend == "rust" and not self._runtime_settings.nats_enabled:
+                raise RuntimeError("execution_core_backend=rust requires NATS_ENABLED=true")
             if not self.config.paper_mode:
                 await self._recover_live_broker_state()
                 await self._order_submitter.start()
@@ -453,6 +464,8 @@ class TradingAgent:
                 self._order_event_task = asyncio.create_task(self._order_event_loop())
             if not self.config.paper_mode:
                 self._order_submit_task = asyncio.create_task(self._order_submit_result_loop())
+            if self._execution_core_signal_lane_enabled():
+                self._execution_core_signal_task = asyncio.create_task(self._execution_core_signal_loop())
             logger.info("trading_agent_started", config=self.config.__dict__)
         except Exception as exc:
             self.state = AgentState.ERROR
@@ -508,6 +521,13 @@ class TradingAgent:
             except asyncio.CancelledError:
                 pass
         self._order_submit_task = None
+        if self._execution_core_signal_task and not self._execution_core_signal_task.done():
+            self._execution_core_signal_task.cancel()
+            try:
+                await self._execution_core_signal_task
+            except asyncio.CancelledError:
+                pass
+        self._execution_core_signal_task = None
         if self._order_submitter is not None:
             await self._order_submitter.stop()
 
@@ -537,9 +557,36 @@ class TradingAgent:
         configured = {str(token or "").strip().upper() for token in self.config.event_driven_markets}
         return str(market or "").strip().upper() in configured
 
+    def _execution_core_signal_lane_enabled(self) -> bool:
+        return self._execution_core_backend == "rust" and bool(self._runtime_settings.nats_enabled)
+
+    def _execution_core_market_enabled(self, market: str) -> bool:
+        if not self._execution_core_signal_lane_enabled():
+            return False
+        configured = {str(token or "").strip().upper() for token in self.config.event_driven_markets}
+        return str(market or "").strip().upper() in configured
+
+    def _should_use_execution_core_signal_lane(self, symbol: str) -> bool:
+        token = str(symbol or "").strip()
+        if not token:
+            return False
+        market = self._symbol_market(token)
+        if not self._execution_core_market_enabled(market):
+            return False
+        now = datetime.now(tz=IST)
+        if market == "NSE":
+            return token in self.config.symbols and self.config.trade_nse_when_open and is_market_open(now)
+        if market == "US":
+            return token in self.config.us_symbols and self.config.trade_us_when_open and is_us_market_open(now)
+        if market == "CRYPTO":
+            return token in self.config.crypto_symbols and bool(self.config.trade_crypto_24x7)
+        return False
+
     def _is_event_driven_symbol_eligible(self, symbol: str) -> bool:
         token = str(symbol or "").strip()
         if not token or self.state != AgentState.RUNNING:
+            return False
+        if self._should_use_execution_core_signal_lane(token):
             return False
         market = self._symbol_market(token)
         if not self._event_driven_market_enabled(market):
@@ -569,6 +616,203 @@ class TradingAgent:
         if self._symbol_has_pending_live_order(token):
             return False
         return self._latest_stream_price(token) is not None
+
+    def _reset_execution_core_signal_state(self) -> None:
+        self._execution_core_seen_signal_ids.clear()
+        self._execution_core_seen_signal_lookup.clear()
+        self._execution_core_signal_stats = {
+            "enabled": self._execution_core_signal_lane_enabled(),
+            "backend": self._execution_core_backend,
+            "subject": self._execution_core_signal_subject,
+            "consumed": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "errors": 0,
+            "running": False,
+            "last_signal_id": None,
+            "last_signal_time": None,
+            "last_symbol": None,
+        }
+
+    def _execution_core_signal_lane_snapshot(self) -> Dict[str, Any]:
+        return dict(self._execution_core_signal_stats)
+
+    def _remember_execution_core_signal_id(self, event_id: str) -> bool:
+        token = str(event_id or "").strip()
+        if not token:
+            return False
+        if token in self._execution_core_seen_signal_lookup:
+            return False
+        if self._execution_core_seen_signal_ids.maxlen and len(self._execution_core_seen_signal_ids) >= self._execution_core_seen_signal_ids.maxlen:
+            oldest = self._execution_core_seen_signal_ids.popleft()
+            self._execution_core_seen_signal_lookup.discard(oldest)
+        self._execution_core_seen_signal_ids.append(token)
+        self._execution_core_seen_signal_lookup.add(token)
+        return True
+
+    def _execution_core_signal_strength(self, payload: Dict[str, Any], price: float) -> SignalStrength:
+        inner = payload.get("payload")
+        details = inner if isinstance(inner, dict) else {}
+        confidence = self._safe_float(payload.get("confidence"))
+        if confidence is not None:
+            if confidence >= 80.0:
+                return SignalStrength.STRONG
+            if confidence >= 60.0:
+                return SignalStrength.MODERATE
+            return SignalStrength.WEAK
+        ema_fast = self._safe_float(details.get("ema_fast"))
+        ema_slow = self._safe_float(details.get("ema_slow"))
+        if ema_fast is None or ema_slow is None or price <= 0:
+            return SignalStrength.MODERATE
+        gap_pct = abs(ema_fast - ema_slow) / max(abs(price), 1e-6)
+        if gap_pct >= 0.003:
+            return SignalStrength.STRONG
+        if gap_pct >= 0.001:
+            return SignalStrength.MODERATE
+        return SignalStrength.WEAK
+
+    def _build_execution_core_signal(self, payload: Dict[str, Any]) -> tuple[Signal, str, str] | None:
+        symbol = str(payload.get("symbol") or "").strip()
+        if not symbol or not self._should_use_execution_core_signal_lane(symbol):
+            return None
+
+        signal_type_token = str(payload.get("signal_type") or "").strip().upper()
+        try:
+            signal_type = SignalType[signal_type_token]
+        except KeyError:
+            return None
+        price = self._safe_float(payload.get("price"), fallback=self._safe_float(payload.get("close")))
+        if price is None or price <= 0:
+            return None
+
+        timestamp = self._coerce_ist_timestamp(payload.get("event_time")) or datetime.now(tz=IST)
+        timeframe = str(payload.get("timeframe") or self.config.timeframe).strip().upper() or self.config.timeframe
+        strategy_name = str(payload.get("strategy") or "Rust_EMA_Crossover").strip() or "Rust_EMA_Crossover"
+        inner = payload.get("payload")
+        signal_metadata = {
+            "market": str(payload.get("market") or self._symbol_market(symbol)).upper(),
+            "execution_backend": self._execution_core_backend,
+            "signal_source": "execution_core",
+            "execution_core_event_id": str(payload.get("event_id") or ""),
+            "execution_core_event_type": str(payload.get("event_type") or ""),
+            "execution_timeframe": timeframe,
+            "execution_core_payload": inner if isinstance(inner, dict) else {},
+        }
+        stop_loss = self._safe_float(payload.get("stop_loss"))
+        target = self._safe_float(payload.get("target"))
+        signal = Signal(
+            timestamp=timestamp,
+            symbol=symbol,
+            signal_type=signal_type,
+            strength=self._execution_core_signal_strength(payload, price),
+            price=float(price),
+            stop_loss=stop_loss,
+            target=target,
+            strategy_name=strategy_name,
+            metadata=signal_metadata,
+        )
+        return signal, strategy_name, timeframe
+
+    async def _handle_execution_core_signal(self, payload: Dict[str, Any]) -> None:
+        self._execution_core_signal_stats["consumed"] += 1
+        if not isinstance(payload, dict):
+            self._execution_core_signal_stats["rejected"] += 1
+            return
+        if str(payload.get("event_type") or "").strip().lower() != "signal_candidate":
+            self._execution_core_signal_stats["rejected"] += 1
+            return
+        event_id = str(payload.get("event_id") or "").strip()
+        if event_id and not self._remember_execution_core_signal_id(event_id):
+            self._execution_core_signal_stats["rejected"] += 1
+            return
+        built = self._build_execution_core_signal(payload)
+        if built is None:
+            self._execution_core_signal_stats["rejected"] += 1
+            return
+
+        signal, strategy_name, timeframe = built
+        symbol_market = self._symbol_market(signal.symbol)
+        short_name = signal.symbol.split(":")[-1].split("-")[0]
+        started = time.perf_counter()
+        self._total_signals += 1
+        self._strategy_signal_counts[strategy_name] = self._strategy_signal_counts.get(strategy_name, 0) + 1
+        self._market_signal_counts[symbol_market] = self._market_signal_counts.get(symbol_market, 0) + 1
+        try:
+            await self._process_signal(
+                signal,
+                strategy_name,
+                short_name,
+                default_symbol=signal.symbol,
+                execution_timeframe=timeframe,
+                df_for_signal=None,
+            )
+        except Exception as exc:
+            self._execution_core_signal_stats["errors"] += 1
+            logger.exception("execution_core_signal_processing_failed", symbol=signal.symbol, error=str(exc))
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.AGENT_ERROR,
+                title="Execution Core Signal Failed",
+                message=f"Failed to process execution-core signal for {short_name}: {exc}",
+                severity="error",
+                metadata={
+                    "symbol": signal.symbol,
+                    "strategy": strategy_name,
+                    "execution_backend": self._execution_core_backend,
+                    "event_id": event_id,
+                },
+            ))
+            return
+        self._execution_core_signal_stats["accepted"] += 1
+        self._execution_core_signal_stats["last_signal_id"] = event_id or None
+        self._execution_core_signal_stats["last_signal_time"] = str(payload.get("event_time") or signal.timestamp.isoformat())
+        self._execution_core_signal_stats["last_symbol"] = signal.symbol
+        self._latency_tracker.record(
+            "execution_core_signal_process_ms",
+            (time.perf_counter() - started) * 1000.0,
+            symbol=signal.symbol,
+            market=symbol_market,
+            strategy=strategy_name,
+        )
+
+    async def _execution_core_signal_loop(self) -> None:
+        try:
+            import nats  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("nats-py is required for execution_core_backend=rust") from exc
+
+        client = await nats.connect(self._runtime_settings.nats_url)
+        subscription = await client.subscribe(self._execution_core_signal_subject)
+        self._execution_core_signal_stats["running"] = True
+        logger.info(
+            "execution_core_signal_lane_started",
+            subject=self._execution_core_signal_subject,
+            url=self._runtime_settings.nats_url,
+        )
+        try:
+            while self.state == AgentState.RUNNING:
+                try:
+                    message = await subscription.next_msg(timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    payload = json.loads(message.data.decode("utf-8"))
+                except Exception as exc:
+                    self._execution_core_signal_stats["errors"] += 1
+                    logger.warning("execution_core_signal_decode_failed", error=str(exc))
+                    continue
+                await self._handle_execution_core_signal(payload)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._execution_core_signal_stats["running"] = False
+            try:
+                await subscription.unsubscribe()
+            except Exception:
+                pass
+            try:
+                await client.close()
+            except Exception:
+                pass
 
     async def _event_driven_loop(self) -> None:
         if self._candle_broker is None:
@@ -1868,6 +2112,7 @@ class TradingAgent:
             "pending_live_exit_submissions": len(self._pending_live_exit_submissions),
             "order_submitter": self._order_submitter.snapshot() if self._order_submitter is not None else None,
             "execution_backend": settings.execution_core_backend,
+            "execution_signal_lane": self._execution_core_signal_lane_snapshot(),
             "execution_transport": settings.execution_transport,
             "streaming_backends": {
                 "nats": {
@@ -2712,7 +2957,12 @@ class TradingAgent:
         return self._candle_broker is not None and self._is_event_driven_symbol_eligible(symbol)
 
     def _periodic_scan_symbols(self, active_symbols: List[str]) -> List[str]:
-        return [symbol for symbol in active_symbols if not self._should_use_event_driven_lane(symbol)]
+        return [
+            symbol
+            for symbol in active_symbols
+            if not self._should_use_event_driven_lane(symbol)
+            and not self._should_use_execution_core_signal_lane(symbol)
+        ]
 
     async def _scan_symbol(self, symbol: str, *, live_only: bool = False) -> None:
         async with self._scan_lock(symbol):

@@ -66,8 +66,12 @@ Current status on this branch:
   events and exposes `/health`, `/stats`, `/signals`, and `/symbols/:symbol`.
 - A standalone transport mirror now forwards NATS hot-path streams into Kafka,
   so Rust-originated events also enter the durable replay pipeline.
-- Risk checks, broker-aware order intent generation, and full Python cutover
-  still remain to be moved out of Python.
+- The Python agent now consumes `execution.signals` when
+  `EXECUTION_CORE_BACKEND=rust`, skips duplicate in-process signal generation
+  for those markets, and routes Rust-generated candidates through the existing
+  risk and order pipeline.
+- Final broker-aware risk sizing, order intent generation, and direct broker
+  routing still remain to be moved out of Python.
 
 ### Phase 4: analytics split
 

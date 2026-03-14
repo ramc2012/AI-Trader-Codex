@@ -610,6 +610,45 @@ class PositionManager:
         """
         return list(self._closed_positions)
 
+    def replace_positions(
+        self,
+        positions: List[Position],
+        *,
+        total_realized_pnl: Optional[float] = None,
+        persist: bool = True,
+    ) -> None:
+        """Replace the current open-position book with a recovered snapshot."""
+        self._positions = {}
+        for position in positions:
+            if int(position.quantity) <= 0:
+                continue
+            normalized = Position(
+                symbol=str(position.symbol),
+                quantity=int(position.quantity),
+                side=position.side,
+                avg_price=float(position.avg_price),
+                current_price=float(position.current_price),
+                entry_time=position.entry_time,
+                strategy_tag=str(position.strategy_tag or ""),
+                order_ids=list(position.order_ids),
+                lots=[
+                    PositionLot(
+                        quantity=int(lot.quantity),
+                        entry_price=float(lot.entry_price),
+                        entry_time=lot.entry_time,
+                        strategy_tag=str(lot.strategy_tag or ""),
+                        order_ids=list(lot.order_ids),
+                    )
+                    for lot in self._normalized_lots(position)
+                ],
+            )
+            self._recalculate_position(normalized)
+            self._positions[normalized.symbol] = normalized
+        if total_realized_pnl is not None:
+            self._total_realized_pnl = float(total_realized_pnl)
+        if persist:
+            self._persist_state()
+
     @staticmethod
     def _calc_pnl(
         side: PositionSide, entry: float, exit_price: float, qty: int

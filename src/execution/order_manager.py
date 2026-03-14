@@ -407,6 +407,55 @@ class OrderManager:
         """
         return [o for o in self._orders.values() if o.tag == tag]
 
+    def upsert_broker_order_snapshot(self, payload: Dict[str, Any]) -> Order:
+        """Create or update a locally tracked order from a broker order-book snapshot."""
+        raw = payload.get("orders") if isinstance(payload, dict) else None
+        if not isinstance(raw, dict):
+            raw = payload
+        if not isinstance(raw, dict):
+            raise ValueError("Invalid broker order snapshot payload.")
+
+        order_id = str(raw.get("id") or raw.get("orderNumber") or "").strip()
+        if not order_id:
+            raise ValueError("Broker order snapshot missing order id.")
+
+        existing = self._orders.get(order_id)
+        side = OrderSide.BUY if self._safe_int(raw.get("side"), fallback=1) >= 0 else OrderSide.SELL
+        order_type = self._map_broker_order_type(raw.get("type"))
+        product_type = self._map_broker_product_type(raw.get("productType"))
+        order = existing or Order(
+            symbol=str(raw.get("symbol") or ""),
+            quantity=max(self._safe_int(raw.get("qty"), fallback=0), 0),
+            side=side,
+            order_type=order_type,
+            product_type=product_type,
+            limit_price=self._safe_float(raw.get("limitPrice")),
+            stop_price=self._safe_float(raw.get("stopPrice")),
+            tag=str(raw.get("orderTag") or raw.get("tag") or ""),
+            order_id=order_id,
+        )
+        order.symbol = str(raw.get("symbol") or order.symbol)
+        order.quantity = max(self._safe_int(raw.get("qty"), fallback=order.quantity), order.quantity)
+        order.side = side
+        order.order_type = order_type
+        order.product_type = product_type
+        order.limit_price = self._safe_float(raw.get("limitPrice"), fallback=order.limit_price)
+        order.stop_price = self._safe_float(raw.get("stopPrice"), fallback=order.stop_price)
+        order.tag = str(raw.get("orderTag") or raw.get("tag") or order.tag or "")
+        if order.placed_at is None:
+            placed_at_raw = raw.get("orderDateTime")
+            if placed_at_raw:
+                try:
+                    order.placed_at = datetime.fromisoformat(str(placed_at_raw))
+                except ValueError:
+                    order.placed_at = datetime.now(tz=IST)
+            else:
+                order.placed_at = datetime.now(tz=IST)
+
+        self._orders[order_id] = order
+        update = self.apply_broker_order_update(raw)
+        return update.order or order
+
     def apply_broker_order_update(self, payload: Dict[str, Any]) -> BrokerOrderUpdateResult:
         """Reconcile a live broker order-status update against the local order book."""
         raw = payload.get("orders") if isinstance(payload, dict) else None
@@ -955,6 +1004,37 @@ class OrderManager:
             return numeric_map[token]
 
         return None
+
+    @staticmethod
+    def _map_broker_order_type(raw_type: Any) -> OrderType:
+        token = str(raw_type or "").strip().upper()
+        numeric = {
+            "1": OrderType.MARKET,
+            "2": OrderType.LIMIT,
+            "3": OrderType.STOP,
+            "4": OrderType.STOP_LIMIT,
+        }
+        if token in numeric:
+            return numeric[token]
+        named = {
+            "MARKET": OrderType.MARKET,
+            "LIMIT": OrderType.LIMIT,
+            "STOP": OrderType.STOP,
+            "STOP_LIMIT": OrderType.STOP_LIMIT,
+            "SL": OrderType.STOP,
+            "SL-M": OrderType.STOP_LIMIT,
+        }
+        return named.get(token, OrderType.MARKET)
+
+    @staticmethod
+    def _map_broker_product_type(raw_product: Any) -> ProductType:
+        token = str(raw_product or "").strip().upper()
+        mapping = {
+            ProductType.INTRADAY.value: ProductType.INTRADAY,
+            ProductType.CNC.value: ProductType.CNC,
+            ProductType.MARGIN.value: ProductType.MARGIN,
+        }
+        return mapping.get(token, ProductType.INTRADAY)
 
     def _persist_state(self) -> None:
         if self._state_path is None:

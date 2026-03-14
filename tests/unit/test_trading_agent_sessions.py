@@ -11,7 +11,7 @@ import pytest
 from src.agent.trading_agent import AgentConfig, OptionContract, OptionExitPlan, PendingLiveEntryOrder, TradingAgent
 from src.agent.trading_agent import AgentState
 from src.config.market_hours import IST
-from src.execution.order_manager import BrokerOrderUpdateResult, Order, OrderSide, OrderStatus, OrderType
+from src.execution.order_manager import BrokerOrderUpdateResult, Order, OrderManager, OrderSide, OrderStatus, OrderType
 from src.execution.position_manager import PositionManager, PositionSide
 from src.strategies.base import Signal, SignalStrength, SignalType
 
@@ -736,3 +736,115 @@ async def test_live_entry_position_opens_only_after_broker_fill() -> None:
     assert final_position.quantity == 10
     assert "LIVE-1" not in agent._pending_live_entries
     assert agent._symbol_exit_plans("NSE:NIFTY26MAR22500CE")[0].quantity == 10
+
+
+@pytest.mark.asyncio
+async def test_recover_live_broker_state_rehydrates_pending_entry_and_position(tmp_path) -> None:
+    order_manager = OrderManager(paper_mode=False, state_path=tmp_path / "orders.json")
+    position_manager = PositionManager(state_path=tmp_path / "positions.json")
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+
+    fyers_client = MagicMock()
+    fyers_client.is_authenticated = True
+    fyers_client.get_orders.return_value = {
+        "orderBook": [
+            {
+                "id": "LIVE-RECOVERY-1",
+                "symbol": "NSE:NIFTY26MAR22500CE",
+                "qty": 10,
+                "filledQty": 4,
+                "remainingQuantity": 6,
+                "tradedPrice": 100.0,
+                "status": 4,
+                "side": 1,
+                "type": 1,
+                "productType": "INTRADAY",
+                "orderTag": "EMA_Crossover",
+            }
+        ]
+    }
+    fyers_client.get_tradebook.return_value = {
+        "tradeBook": [
+            {
+                "orderNumber": "LIVE-RECOVERY-1",
+                "tradeNumber": "TRD-RECOVERY-1",
+                "symbol": "NSE:NIFTY26MAR22500CE",
+                "tradedQty": 4,
+                "tradePrice": 100.0,
+                "side": 1,
+                "orderType": 1,
+                "productType": "INTRADAY",
+                "orderTag": "EMA_Crossover",
+                "orderDateTime": "2026-03-14T09:20:00+05:30",
+            }
+        ]
+    }
+    fyers_client.get_positions.return_value = {
+        "netPositions": [
+            {
+                "symbol": "NSE:NIFTY26MAR22500CE",
+                "netQty": 4,
+                "side": 1,
+                "netAvg": 100.0,
+            }
+        ]
+    }
+
+    agent = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=order_manager,
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=fyers_client,
+    )
+    agent._runtime_state_path = tmp_path / "agent_live_state.json"
+    agent._pending_live_entries["LIVE-RECOVERY-1"] = PendingLiveEntryOrder(
+        order_id="LIVE-RECOVERY-1",
+        symbol="NSE:NIFTY26MAR22500CE",
+        underlying_symbol="NSE:NIFTY50-INDEX",
+        short_name="NIFTY",
+        execution_short_name="NSE:NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        strategy="EMA_Crossover",
+        market="NSE",
+        execution_timeframe="5",
+        entry_price_hint=100.0,
+        stop_loss=95.0,
+        target=110.0,
+        signal_id="sig-recovery",
+        option_contract=OptionContract(
+            underlying_symbol="NSE:NIFTY50-INDEX",
+            option_symbol="NSE:NIFTY26MAR22500CE",
+            option_type="CE",
+            strike=22500.0,
+            expiry="2026-03-26",
+            ltp=100.0,
+            lot_size=25,
+        ),
+    )
+    agent._persist_live_runtime_state()
+
+    restarted = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=OrderManager(paper_mode=False, state_path=tmp_path / "orders.json"),
+        position_manager=PositionManager(state_path=tmp_path / "positions.json"),
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=fyers_client,
+    )
+    restarted._runtime_state_path = tmp_path / "agent_live_state.json"
+    restarted._load_live_runtime_state()
+
+    await restarted._recover_live_broker_state()
+
+    recovered_position = restarted.position_manager.get_position("NSE:NIFTY26MAR22500CE")
+    assert recovered_position is not None
+    assert recovered_position.quantity == 4
+    assert "LIVE-RECOVERY-1" in restarted._pending_live_entries
+    assert restarted._symbol_exit_plans("NSE:NIFTY26MAR22500CE")[0].quantity == 4

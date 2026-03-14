@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
 
 from src.api.dependencies import (
+    get_execution_event_publisher,
     get_fractal_scan_notifier,
     get_fyers_client,
     get_runtime_manager,
@@ -180,6 +181,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     asyncio.create_task(start_auto_collection())
     runtime_manager = get_runtime_manager()
     asyncio.create_task(runtime_manager.start())
+    asyncio.create_task(get_execution_event_publisher().start())
     asyncio.create_task(warm_global_watchlist_cache())
     # Start real-time tick aggregator (footprint/orderflow)
     aggregator = get_tick_aggregator()
@@ -212,6 +214,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         asyncio.create_task(_auto_start_agent())
 
     yield
+
+    try:
+        await get_execution_event_publisher().stop()
+    except Exception:
+        pass
 
     try:
         agent = get_trading_agent()

@@ -23,6 +23,7 @@ from src.monitoring.health import ComponentHealth, HealthMonitor, HealthStatus
 from src.risk.risk_calculator import RiskCalculator
 from src.risk.risk_manager import RiskConfig, RiskManager
 from src.config.settings import get_settings
+from src.streaming.execution_event_publisher import ExecutionEventPublisher
 from src.watchlist.instrument_registry_service import InstrumentRegistryService
 
 
@@ -64,6 +65,7 @@ _trading_agent: Optional[TradingAgent] = None
 _telegram_notifier: Optional[TelegramNotifier] = None
 _tick_aggregator: Optional[RealTimeAggregator] = None
 _fractal_scan_notifier: Optional[FractalScanNotifier] = None
+_execution_event_publisher: Optional[ExecutionEventPublisher] = None
 
 
 def get_order_manager() -> OrderManager:
@@ -331,6 +333,18 @@ def get_telegram_notifier() -> TelegramNotifier:
     return _telegram_notifier
 
 
+def get_execution_event_publisher() -> ExecutionEventPublisher:
+    """Get or create the singleton execution-event publisher."""
+    global _execution_event_publisher
+    if _execution_event_publisher is None:
+        _execution_event_publisher = ExecutionEventPublisher(
+            settings=get_settings(),
+            agent_event_bus=get_agent_event_bus(),
+            broker_event_broker=get_runtime_manager().order_broker,
+        )
+    return _execution_event_publisher
+
+
 def get_fractal_scan_notifier() -> FractalScanNotifier:
     """Get or create the singleton fractal scan notifier."""
     global _fractal_scan_notifier
@@ -352,9 +366,11 @@ def reset_fyers_client() -> None:
     global _fyers_client
     global _instrument_registry
     global _runtime_manager
+    global _execution_event_publisher
     _fyers_client = None
     _instrument_registry = None
     _runtime_manager = None
+    _execution_event_publisher = None
 
 
 def reset_managers() -> None:
@@ -362,6 +378,7 @@ def reset_managers() -> None:
     global _order_manager, _position_manager, _strategy_executor
     global _risk_manager, _risk_calculator, _health_monitor, _alert_manager
     global _fyers_client, _agent_event_bus, _trading_agent, _telegram_notifier, _fractal_scan_notifier
+    global _execution_event_publisher
 
     _order_manager = None
     _position_manager = None
@@ -377,3 +394,4 @@ def reset_managers() -> None:
     _trading_agent = None
     _telegram_notifier = None
     _fractal_scan_notifier = None
+    _execution_event_publisher = None

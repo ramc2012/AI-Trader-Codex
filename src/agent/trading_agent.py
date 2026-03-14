@@ -13,8 +13,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
+import json
 import math
 from numbers import Real
+import os
 from pathlib import Path
 import re
 import time
@@ -259,6 +261,11 @@ class TradingAgent:
         self._candle_broker = candle_broker
         self._order_event_broker = order_event_broker
         runtime_settings = get_settings()
+        self._runtime_state_path: Path | None = (
+            None
+            if os.environ.get("PYTEST_CURRENT_TEST")
+            else runtime_settings.data_path / "trading_agent_live_runtime.json"
+        )
         self.position_sizer = PositionSizer(capital=config.capital)
         self.options_service = OptionsDataService(fyers_client)
         self._spot_to_index_name = {item.spot_symbol: name for name, item in INDEX_INSTRUMENTS.items()}
@@ -350,6 +357,7 @@ class TradingAgent:
         self.order_manager.paper_mode = self.config.paper_mode
         self.executor.paper_mode = self.config.paper_mode
         self.order_manager.set_client(self.fyers_client)
+        self._load_live_runtime_state()
 
         # Register strategies
         self._register_strategies()
@@ -386,6 +394,8 @@ class TradingAgent:
 
         try:
             await self._init_online_learning()
+            if not self.config.paper_mode:
+                await self._recover_live_broker_state()
             self._task = asyncio.create_task(self._main_loop())
             if self._candle_broker is not None and self.config.event_driven_execution_enabled:
                 self._event_driven_task = asyncio.create_task(self._event_driven_loop())
@@ -435,6 +445,7 @@ class TradingAgent:
 
         self.executor.stop()
         self._strategy_perf_tracker._persist_state()
+        self._persist_live_runtime_state()
 
         await self.event_bus.emit(AgentEvent(
             event_type=AgentEventType.AGENT_STOPPED,
@@ -549,6 +560,24 @@ class TradingAgent:
             quantity = 0
         return quantity if quantity > 0 else int(fallback)
 
+    @staticmethod
+    def _safe_int(value: Any, fallback: int = 0) -> int:
+        try:
+            if value in (None, ""):
+                return int(fallback)
+            return int(float(value))
+        except (TypeError, ValueError):
+            return int(fallback)
+
+    @staticmethod
+    def _safe_float(value: Any, fallback: float | None = None) -> float | None:
+        try:
+            if value in (None, ""):
+                return fallback
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
     async def _order_event_loop(self) -> None:
         if self._order_event_broker is None:
             return
@@ -647,11 +676,13 @@ class TradingAgent:
                         "strategy": (exit_context.plan.strategy if exit_context.plan else ""),
                     },
                 ))
+            self._persist_live_runtime_state()
             return
 
         if order.status == OrderStatus.FILLED:
             self._pending_live_entries.pop(order_id, None)
             self._pending_live_exits.pop(order_id, None)
+            self._persist_live_runtime_state()
 
     async def _finalize_live_entry_fill(
         self,
@@ -783,6 +814,7 @@ class TradingAgent:
                 error=str(exc),
             )
             self._pending_live_exits.pop(context.order_id, None)
+            self._persist_live_runtime_state()
             await self.event_bus.emit(AgentEvent(
                 event_type=AgentEventType.AGENT_ERROR,
                 title=f"Exit State Mismatch — {context.short_name}",
@@ -837,6 +869,7 @@ class TradingAgent:
 
         if order.status == OrderStatus.FILLED or plan_fully_closed:
             self._pending_live_exits.pop(context.order_id, None)
+            self._persist_live_runtime_state()
 
         event_type = AgentEventType.POSITION_CLOSED if plan_fully_closed else AgentEventType.POSITION_UPDATE
         title = "Position Closed" if plan_fully_closed else "Position Reduced"
@@ -862,6 +895,177 @@ class TradingAgent:
                 "status": order.status.value,
             },
         ))
+
+    async def _recover_live_broker_state(self) -> None:
+        if self.config.paper_mode or not self.fyers_client.is_authenticated:
+            return
+        try:
+            orders_raw, trades_raw, positions_raw = await asyncio.gather(
+                asyncio.to_thread(self.fyers_client.get_orders),
+                asyncio.to_thread(self.fyers_client.get_tradebook),
+                asyncio.to_thread(self.fyers_client.get_positions),
+            )
+        except Exception as exc:
+            logger.warning("live_state_recovery_failed", error=str(exc))
+            return
+
+        broker_orders = []
+        if isinstance(orders_raw, dict):
+            broker_orders = orders_raw.get("orderBook") or orders_raw.get("orders") or []
+
+        open_order_ids: set[str] = set()
+        for raw in broker_orders:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                order = self.order_manager.upsert_broker_order_snapshot(raw)
+            except Exception as exc:
+                logger.debug("live_order_snapshot_recovery_failed", error=str(exc))
+                continue
+            if order.status in (OrderStatus.PLACED, OrderStatus.PARTIALLY_FILLED):
+                open_order_ids.add(str(order.order_id or ""))
+
+        broker_trades = []
+        if isinstance(trades_raw, dict):
+            broker_trades = trades_raw.get("tradeBook") or trades_raw.get("trades") or []
+        broker_trades.sort(key=lambda row: str(row.get("orderDateTime") or row.get("tradeDate") or ""))
+        for raw in broker_trades:
+            if not isinstance(raw, dict):
+                continue
+            order_id = str(raw.get("orderNumber") or raw.get("id") or "").strip()
+            if not order_id:
+                continue
+            if self.order_manager.get_order(order_id) is None:
+                try:
+                    self.order_manager.upsert_broker_order_snapshot(
+                        {
+                            "id": order_id,
+                            "symbol": raw.get("symbol"),
+                            "qty": raw.get("tradedQty") or raw.get("qty"),
+                            "filledQty": raw.get("tradedQty") or raw.get("qty"),
+                            "tradedPrice": raw.get("tradePrice") or raw.get("tradedPrice"),
+                            "status": "COMPLETE",
+                            "side": raw.get("side"),
+                            "type": raw.get("orderType") or raw.get("type"),
+                            "productType": raw.get("productType"),
+                            "orderTag": raw.get("orderTag"),
+                            "orderDateTime": raw.get("orderDateTime") or raw.get("tradeDate"),
+                        }
+                    )
+                except Exception as exc:
+                    logger.debug("live_trade_snapshot_stub_failed", error=str(exc))
+                    continue
+            try:
+                await self._apply_broker_reconciliation(
+                    event_kind="trade",
+                    result=self.order_manager.apply_broker_trade_update(raw),
+                )
+            except Exception as exc:
+                logger.debug("live_trade_recovery_failed", order_id=order_id, error=str(exc))
+
+        recovered_positions = self._recover_positions_from_broker_payload(positions_raw)
+        if recovered_positions:
+            self.position_manager.replace_positions(recovered_positions)
+            for position in recovered_positions:
+                self.risk_manager.sync_position_value(
+                    position.symbol,
+                    position.quantity * max(position.current_price or position.avg_price, position.avg_price),
+                )
+
+        for order_id in list(self._pending_live_entries.keys()):
+            if order_id not in open_order_ids and self.order_manager.get_order(order_id) is None:
+                self._pending_live_entries.pop(order_id, None)
+        for order_id in list(self._pending_live_exits.keys()):
+            if order_id not in open_order_ids and self.order_manager.get_order(order_id) is None:
+                self._pending_live_exits.pop(order_id, None)
+
+        self._persist_live_runtime_state()
+        logger.info(
+            "live_state_recovered",
+            broker_orders=len(broker_orders),
+            broker_trades=len(broker_trades),
+            broker_positions=len(recovered_positions),
+            pending_entries=len(self._pending_live_entries),
+            pending_exits=len(self._pending_live_exits),
+        )
+
+    def _recover_positions_from_broker_payload(self, payload: Any) -> List[Any]:
+        if not isinstance(payload, dict):
+            return []
+        rows = payload.get("netPositions") or payload.get("positions") or payload.get("overall") or []
+        if not isinstance(rows, list):
+            return []
+        recovered = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            net_qty = self._safe_int(raw.get("netQty"), fallback=0)
+            qty = self._safe_int(raw.get("qty"), fallback=abs(net_qty))
+            side_raw = self._safe_int(raw.get("side"), fallback=1)
+            quantity = abs(net_qty) if net_qty != 0 else abs(qty)
+            if quantity <= 0:
+                continue
+            side = PositionSide.LONG if (net_qty > 0 or (net_qty == 0 and side_raw >= 0)) else PositionSide.SHORT
+            avg_price = self._safe_float(
+                raw.get("netAvg"),
+                fallback=self._safe_float(raw.get("buyAvg"), fallback=self._safe_float(raw.get("sellAvg"), fallback=0.0)),
+            )
+            symbol = str(raw.get("symbol") or "").strip()
+            if not symbol or avg_price is None or avg_price <= 0:
+                continue
+            strategy_tag = self._recovered_strategy_tag_for_symbol(symbol)
+            order_ids = self._recovered_order_ids_for_symbol(symbol)
+            recovered.append(
+                PositionManager._deserialize_position(
+                    {
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "side": side.value,
+                        "avg_price": avg_price,
+                        "current_price": avg_price,
+                        "entry_time": None,
+                        "strategy_tag": strategy_tag,
+                        "order_ids": order_ids,
+                        "lots": [
+                            {
+                                "quantity": quantity,
+                                "entry_price": avg_price,
+                                "entry_time": None,
+                                "strategy_tag": strategy_tag,
+                                "order_ids": order_ids,
+                            }
+                        ],
+                    }
+                )
+            )
+        return recovered
+
+    def _recovered_strategy_tag_for_symbol(self, symbol: str) -> str:
+        tags = {
+            context.strategy
+            for context in self._pending_live_entries.values()
+            if context.symbol == symbol and context.strategy
+        }
+        tags.update(
+            plan.strategy
+            for plan in self._symbol_exit_plans(symbol)
+            if plan.strategy and plan.strategy != "MULTI"
+        )
+        if len(tags) == 1:
+            return next(iter(tags))
+        if len(tags) > 1:
+            return "MULTI"
+        for order in self.order_manager.get_orders_by_symbol(symbol):
+            if order.tag and not order.tag.startswith("EXIT:"):
+                return order.tag
+        return ""
+
+    def _recovered_order_ids_for_symbol(self, symbol: str) -> List[str]:
+        return [
+            str(order.order_id or "")
+            for order in self.order_manager.get_orders_by_symbol(symbol)
+            if str(order.order_id or "").strip()
+        ]
 
     # ------------------------------------------------------------------
     # Online Learning Initialisation
@@ -1330,6 +1534,7 @@ class TradingAgent:
     def _remove_exit_plan(self, symbol: str, strategy: Optional[str] = None) -> None:
         if strategy is None:
             self._option_exit_plans.pop(symbol, None)
+            self._persist_live_runtime_state()
             return
         strategy_map = self._option_exit_plans.get(symbol)
         if not strategy_map:
@@ -1337,6 +1542,7 @@ class TradingAgent:
         strategy_map.pop(strategy, None)
         if not strategy_map:
             self._option_exit_plans.pop(symbol, None)
+        self._persist_live_runtime_state()
 
     def _remaining_strategy_position_quantity(self, symbol: str, strategy: Optional[str]) -> int:
         if strategy is None:
@@ -1367,6 +1573,214 @@ class TradingAgent:
             self._remove_exit_plan(symbol, strategy)
             return
         plan.quantity = int(remaining_quantity)
+        self._persist_live_runtime_state()
+
+    def _persist_live_runtime_state(self) -> None:
+        if self._runtime_state_path is None:
+            return
+        if self.config.paper_mode:
+            if self._runtime_state_path.exists():
+                try:
+                    self._runtime_state_path.unlink()
+                except OSError:
+                    pass
+            return
+
+        payload = {
+            "pending_live_entries": [
+                self._serialize_pending_live_entry(context)
+                for context in self._pending_live_entries.values()
+            ],
+            "pending_live_exits": [
+                self._serialize_pending_live_exit(context)
+                for context in self._pending_live_exits.values()
+            ],
+            "option_exit_plans": {
+                symbol: {
+                    strategy: self._serialize_option_exit_plan(plan)
+                    for strategy, plan in strategy_map.items()
+                }
+                for symbol, strategy_map in self._option_exit_plans.items()
+            },
+        }
+        try:
+            self._runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._runtime_state_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            tmp_path.replace(self._runtime_state_path)
+        except Exception as exc:
+            logger.warning("trading_agent_live_state_persist_failed", error=str(exc))
+
+    def _load_live_runtime_state(self) -> None:
+        if self._runtime_state_path is None or self.config.paper_mode or not self._runtime_state_path.exists():
+            return
+        try:
+            payload = json.loads(self._runtime_state_path.read_text(encoding="utf-8"))
+            self._pending_live_entries = {}
+            for raw in payload.get("pending_live_entries", []):
+                context = self._deserialize_pending_live_entry(raw)
+                self._pending_live_entries[context.order_id] = context
+            self._pending_live_exits = {}
+            for raw in payload.get("pending_live_exits", []):
+                context = self._deserialize_pending_live_exit(raw)
+                self._pending_live_exits[context.order_id] = context
+            self._option_exit_plans = {
+                symbol: {
+                    strategy: self._deserialize_option_exit_plan(plan_payload)
+                    for strategy, plan_payload in strategy_map.items()
+                }
+                for symbol, strategy_map in (payload.get("option_exit_plans") or {}).items()
+                if isinstance(strategy_map, dict)
+            }
+            logger.info(
+                "trading_agent_live_state_loaded",
+                pending_entries=len(self._pending_live_entries),
+                pending_exits=len(self._pending_live_exits),
+                exit_plans=len(self._option_exit_plans),
+            )
+        except Exception as exc:
+            logger.warning("trading_agent_live_state_load_failed", error=str(exc))
+
+    @staticmethod
+    def _serialize_option_contract(contract: OptionContract) -> dict[str, Any]:
+        return {
+            "underlying_symbol": contract.underlying_symbol,
+            "option_symbol": contract.option_symbol,
+            "option_type": contract.option_type,
+            "strike": float(contract.strike),
+            "expiry": contract.expiry,
+            "ltp": float(contract.ltp),
+            "lot_size": int(contract.lot_size),
+        }
+
+    @staticmethod
+    def _deserialize_option_contract(payload: dict[str, Any]) -> OptionContract:
+        return OptionContract(
+            underlying_symbol=str(payload.get("underlying_symbol") or ""),
+            option_symbol=str(payload.get("option_symbol") or ""),
+            option_type=str(payload.get("option_type") or ""),
+            strike=float(payload.get("strike") or 0.0),
+            expiry=str(payload.get("expiry") or ""),
+            ltp=float(payload.get("ltp") or 0.0),
+            lot_size=int(payload.get("lot_size") or 0),
+        )
+
+    @staticmethod
+    def _serialize_option_exit_plan(plan: OptionExitPlan) -> dict[str, Any]:
+        return {
+            "symbol": plan.symbol,
+            "underlying_symbol": plan.underlying_symbol,
+            "strategy": plan.strategy,
+            "quantity": int(plan.quantity),
+            "execution_timeframe": plan.execution_timeframe,
+            "entry_price": float(plan.entry_price),
+            "stop_loss": float(plan.stop_loss),
+            "target": float(plan.target),
+            "opened_at": plan.opened_at.isoformat(),
+            "time_exit_at": plan.time_exit_at.isoformat(),
+            "signal_id": plan.signal_id,
+        }
+
+    @staticmethod
+    def _deserialize_option_exit_plan(payload: dict[str, Any]) -> OptionExitPlan:
+        return OptionExitPlan(
+            symbol=str(payload.get("symbol") or ""),
+            underlying_symbol=str(payload.get("underlying_symbol") or ""),
+            strategy=str(payload.get("strategy") or ""),
+            quantity=int(payload.get("quantity") or 0),
+            execution_timeframe=str(payload.get("execution_timeframe") or ""),
+            entry_price=float(payload.get("entry_price") or 0.0),
+            stop_loss=float(payload.get("stop_loss") or 0.0),
+            target=float(payload.get("target") or 0.0),
+            opened_at=datetime.fromisoformat(str(payload.get("opened_at"))),
+            time_exit_at=datetime.fromisoformat(str(payload.get("time_exit_at"))),
+            signal_id=str(payload.get("signal_id") or ""),
+        )
+
+    def _serialize_pending_live_entry(self, context: PendingLiveEntryOrder) -> dict[str, Any]:
+        return {
+            "order_id": context.order_id,
+            "symbol": context.symbol,
+            "underlying_symbol": context.underlying_symbol,
+            "short_name": context.short_name,
+            "execution_short_name": context.execution_short_name,
+            "quantity": int(context.quantity),
+            "side": context.side.name,
+            "strategy": context.strategy,
+            "market": context.market,
+            "execution_timeframe": context.execution_timeframe,
+            "entry_price_hint": float(context.entry_price_hint),
+            "stop_loss": float(context.stop_loss),
+            "target": float(context.target),
+            "signal_id": context.signal_id,
+            "trade_counted": bool(context.trade_counted),
+            "option_contract": (
+                self._serialize_option_contract(context.option_contract)
+                if context.option_contract is not None
+                else None
+            ),
+        }
+
+    def _deserialize_pending_live_entry(self, payload: dict[str, Any]) -> PendingLiveEntryOrder:
+        option_contract_payload = payload.get("option_contract")
+        option_contract = (
+            self._deserialize_option_contract(option_contract_payload)
+            if isinstance(option_contract_payload, dict)
+            else None
+        )
+        return PendingLiveEntryOrder(
+            order_id=str(payload.get("order_id") or ""),
+            symbol=str(payload.get("symbol") or ""),
+            underlying_symbol=str(payload.get("underlying_symbol") or ""),
+            short_name=str(payload.get("short_name") or ""),
+            execution_short_name=str(payload.get("execution_short_name") or ""),
+            quantity=int(payload.get("quantity") or 0),
+            side=OrderSide[str(payload.get("side") or "BUY")],
+            strategy=str(payload.get("strategy") or ""),
+            market=str(payload.get("market") or ""),
+            execution_timeframe=str(payload.get("execution_timeframe") or ""),
+            entry_price_hint=float(payload.get("entry_price_hint") or 0.0),
+            stop_loss=float(payload.get("stop_loss") or 0.0),
+            target=float(payload.get("target") or 0.0),
+            signal_id=str(payload.get("signal_id") or ""),
+            option_contract=option_contract,
+            trade_counted=bool(payload.get("trade_counted")),
+        )
+
+    def _serialize_pending_live_exit(self, context: PendingLiveExitOrder) -> dict[str, Any]:
+        return {
+            "order_id": context.order_id,
+            "symbol": context.symbol,
+            "short_name": context.short_name,
+            "quantity": int(context.quantity),
+            "reason": context.reason,
+            "avg_price": float(context.avg_price),
+            "entry_value": float(context.entry_value),
+            "exit_price_hint": float(context.exit_price_hint),
+            "plan": (
+                self._serialize_option_exit_plan(context.plan)
+                if context.plan is not None
+                else None
+            ),
+        }
+
+    def _deserialize_pending_live_exit(self, payload: dict[str, Any]) -> PendingLiveExitOrder:
+        plan_payload = payload.get("plan")
+        return PendingLiveExitOrder(
+            order_id=str(payload.get("order_id") or ""),
+            symbol=str(payload.get("symbol") or ""),
+            short_name=str(payload.get("short_name") or ""),
+            quantity=int(payload.get("quantity") or 0),
+            reason=str(payload.get("reason") or ""),
+            avg_price=float(payload.get("avg_price") or 0.0),
+            entry_value=float(payload.get("entry_value") or 0.0),
+            exit_price_hint=float(payload.get("exit_price_hint") or 0.0),
+            plan=(
+                self._deserialize_option_exit_plan(plan_payload)
+                if isinstance(plan_payload, dict)
+                else None
+            ),
+        )
 
     @staticmethod
     def _to_ist(value: Optional[datetime]) -> datetime:
@@ -3038,6 +3452,7 @@ class TradingAgent:
                         signal_id=signal_id,
                         option_contract=option_contract,
                     )
+                    self._persist_live_runtime_state()
                     await self.event_bus.emit(AgentEvent(
                         event_type=AgentEventType.ORDER_PLACED,
                         title=f"Order Submitted — {short_name}",
@@ -3067,6 +3482,7 @@ class TradingAgent:
                         )
                         if executed_order.status == OrderStatus.FILLED:
                             self._pending_live_entries.pop(order_id, None)
+                            self._persist_live_runtime_state()
             else:
                 status = executed_order.status.value if executed_order is not None else "rejected"
                 reason = (
@@ -4218,6 +4634,7 @@ class TradingAgent:
                 time_exit_at=now + timedelta(minutes=minutes),
                 signal_id=signal_id,
             )
+            self._persist_live_runtime_state()
             return
 
         previous_qty = max(int(existing.quantity), 0)
@@ -4239,6 +4656,7 @@ class TradingAgent:
         ) / divisor
         existing.opened_at = min(existing.opened_at, now)
         existing.time_exit_at = max(existing.time_exit_at, now + timedelta(minutes=minutes))
+        self._persist_live_runtime_state()
 
     @contextmanager
     def _temporary_risk_overrides(
@@ -6188,6 +6606,7 @@ class TradingAgent:
                 exit_price_hint=current_price,
                 plan=plan,
             )
+            self._persist_live_runtime_state()
             await self.event_bus.emit(AgentEvent(
                 event_type=AgentEventType.ORDER_PLACED,
                 title=f"Exit Submitted — {short_name}",
@@ -6211,6 +6630,7 @@ class TradingAgent:
                 )
                 if executed.status == OrderStatus.FILLED:
                     self._pending_live_exits.pop(order_id, None)
+                    self._persist_live_runtime_state()
 
     # ------------------------------------------------------------------
     # Exit Condition Checks

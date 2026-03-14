@@ -25,6 +25,7 @@ from src.risk.risk_manager import RiskConfig, RiskManager
 from src.config.settings import get_settings
 from src.streaming.execution_event_publisher import ExecutionEventPublisher
 from src.streaming.transport_analytics_consumer import TransportAnalyticsConsumer
+from src.streaming.transport_mirror import TransportMirror
 from src.watchlist.instrument_registry_service import InstrumentRegistryService
 
 
@@ -68,6 +69,7 @@ _tick_aggregator: Optional[RealTimeAggregator] = None
 _fractal_scan_notifier: Optional[FractalScanNotifier] = None
 _execution_event_publisher: Optional[ExecutionEventPublisher] = None
 _transport_analytics_consumer: Optional[TransportAnalyticsConsumer] = None
+_transport_mirror: Optional[TransportMirror] = None
 
 
 def get_order_manager() -> OrderManager:
@@ -359,6 +361,14 @@ def get_transport_analytics_consumer() -> TransportAnalyticsConsumer:
     return _transport_analytics_consumer
 
 
+def get_transport_mirror() -> TransportMirror:
+    """Get or create the singleton NATS-to-Kafka transport mirror."""
+    global _transport_mirror
+    if _transport_mirror is None:
+        _transport_mirror = TransportMirror(settings=get_settings())
+    return _transport_mirror
+
+
 def get_fractal_scan_notifier() -> FractalScanNotifier:
     """Get or create the singleton fractal scan notifier."""
     global _fractal_scan_notifier
@@ -382,11 +392,13 @@ def reset_fyers_client() -> None:
     global _runtime_manager
     global _execution_event_publisher
     global _transport_analytics_consumer
+    global _transport_mirror
     _fyers_client = None
     _instrument_registry = None
     _runtime_manager = None
     _execution_event_publisher = None
     _transport_analytics_consumer = None
+    _transport_mirror = None
 
 
 def reset_managers() -> None:
@@ -394,7 +406,7 @@ def reset_managers() -> None:
     global _order_manager, _position_manager, _strategy_executor
     global _risk_manager, _risk_calculator, _health_monitor, _alert_manager
     global _fyers_client, _agent_event_bus, _trading_agent, _telegram_notifier, _fractal_scan_notifier
-    global _execution_event_publisher, _transport_analytics_consumer
+    global _execution_event_publisher, _transport_analytics_consumer, _transport_mirror
 
     _order_manager = None
     _position_manager = None
@@ -412,3 +424,4 @@ def reset_managers() -> None:
     _fractal_scan_notifier = None
     _execution_event_publisher = None
     _transport_analytics_consumer = None
+    _transport_mirror = None

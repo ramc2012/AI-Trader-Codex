@@ -161,6 +161,8 @@ class Settings(BaseSettings):
     execution_core_backend: str = "python"
     execution_core_status_url: str = "http://localhost:8081"
     execution_transport: str = "inmemory"
+    transport_mirror_enabled: bool = False
+    transport_mirror_embedded_enabled: bool = True
     agent_latency_metrics_enabled: bool = True
     agent_latency_metrics_window: int = Field(default=256, ge=32, le=4096)
     event_direct_analytics_write_enabled: bool = True

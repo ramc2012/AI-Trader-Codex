@@ -64,6 +64,8 @@ Current status on this branch:
 - Initial `execution-core` Rust sidecar exists and consumes hot NATS subjects.
 - It now derives EMA-crossover `execution.signals` candidates from live bar
   events and exposes `/health`, `/stats`, `/signals`, and `/symbols/:symbol`.
+- A standalone transport mirror now forwards NATS hot-path streams into Kafka,
+  so Rust-originated events also enter the durable replay pipeline.
 - Risk checks, broker-aware order intent generation, and full Python cutover
   still remain to be moved out of Python.
 

@@ -94,6 +94,8 @@ services:
       EXECUTION_CORE_BACKEND: ${EXECUTION_CORE_BACKEND:-python}
       EXECUTION_CORE_STATUS_URL: ${EXECUTION_CORE_STATUS_URL:-http://execution-core:8081}
       EXECUTION_TRANSPORT: ${EXECUTION_TRANSPORT:-nats}
+      TRANSPORT_MIRROR_ENABLED: ${TRANSPORT_MIRROR_ENABLED:-true}
+      TRANSPORT_MIRROR_EMBEDDED_ENABLED: ${TRANSPORT_MIRROR_EMBEDDED_ENABLED:-false}
       AGENT_LATENCY_METRICS_ENABLED: ${AGENT_LATENCY_METRICS_ENABLED:-true}
       AGENT_LATENCY_METRICS_WINDOW: ${AGENT_LATENCY_METRICS_WINDOW:-512}
       EVENT_DIRECT_ANALYTICS_WRITE_ENABLED: ${EVENT_DIRECT_ANALYTICS_WRITE_ENABLED:-false}
@@ -181,6 +183,32 @@ services:
       clickhouse:
         condition: service_started
       questdb:
+        condition: service_started
+    networks:
+      - nifty-network
+
+  transport-mirror:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "src.streaming.transport_mirror_service"]
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      EXECUTION_TRANSPORT: ${EXECUTION_TRANSPORT:-nats}
+      TRANSPORT_MIRROR_ENABLED: ${TRANSPORT_MIRROR_ENABLED:-true}
+      TRANSPORT_MIRROR_EMBEDDED_ENABLED: ${TRANSPORT_MIRROR_EMBEDDED_ENABLED:-false}
+      NATS_ENABLED: ${NATS_ENABLED:-true}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      NATS_STREAM_PREFIX: ${NATS_STREAM_PREFIX:-ai_trader}
+      KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-ai_trader}
+    depends_on:
+      nats:
+        condition: service_started
+      kafka:
         condition: service_started
     networks:
       - nifty-network

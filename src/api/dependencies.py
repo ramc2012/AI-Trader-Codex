@@ -337,10 +337,13 @@ def get_execution_event_publisher() -> ExecutionEventPublisher:
     """Get or create the singleton execution-event publisher."""
     global _execution_event_publisher
     if _execution_event_publisher is None:
+        runtime = get_runtime_manager()
         _execution_event_publisher = ExecutionEventPublisher(
             settings=get_settings(),
             agent_event_bus=get_agent_event_bus(),
-            broker_event_broker=get_runtime_manager().order_broker,
+            broker_event_broker=runtime.order_broker,
+            tick_broker=runtime.broker,
+            candle_broker=runtime.candle_broker,
         )
     return _execution_event_publisher
 

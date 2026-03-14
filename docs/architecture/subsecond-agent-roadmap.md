@@ -59,6 +59,14 @@ current terminal UX and control plane stable.
 - Mirror durable execution events into Kafka for replay and downstream
   consumers.
 
+Current status on this branch:
+
+- Initial `execution-core` Rust sidecar exists and consumes hot NATS subjects.
+- It now derives EMA-crossover `execution.signals` candidates from live bar
+  events and exposes `/health`, `/stats`, `/signals`, and `/symbols/:symbol`.
+- Risk checks, broker-aware order intent generation, and full Python cutover
+  still remain to be moved out of Python.
+
 ### Phase 4: analytics split
 
 - Keep PostgreSQL / TimescaleDB for application state and smaller market-data

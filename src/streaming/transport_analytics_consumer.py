@@ -142,6 +142,7 @@ class TransportAnalyticsConsumer:
             return
         self._kafka_consumer = AIOKafkaConsumer(
             f"{self._settings.kafka_topic_prefix}.execution.events",
+            f"{self._settings.kafka_topic_prefix}.execution.signals",
             f"{self._settings.kafka_topic_prefix}.market.ticks",
             f"{self._settings.kafka_topic_prefix}.market.bars",
             bootstrap_servers=self._settings.kafka_bootstrap_servers,
@@ -161,6 +162,7 @@ class TransportAnalyticsConsumer:
         self._nats_client = await nats.connect(self._settings.nats_url)
         for subject in (
             f"{self._settings.nats_stream_prefix}.execution.events",
+            f"{self._settings.nats_stream_prefix}.execution.signals",
             f"{self._settings.nats_stream_prefix}.market.ticks",
             f"{self._settings.nats_stream_prefix}.market.bars",
         ):

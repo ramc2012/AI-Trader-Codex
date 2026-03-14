@@ -59,9 +59,40 @@ services:
     networks:
       - nifty-network
 
+  execution-core:
+    build:
+      context: ./execution-core
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${EXECUTION_CORE_PORT:-8081}:8081"
+    environment:
+      RUST_LOG: ${EXECUTION_CORE_RUST_LOG:-info}
+      EXECUTION_CORE_BIND_ADDR: 0.0.0.0
+      EXECUTION_CORE_PORT: 8081
+      EXECUTION_CORE_MAX_TRACKED_SYMBOLS: ${EXECUTION_CORE_MAX_TRACKED_SYMBOLS:-256}
+      EXECUTION_CORE_SIGNAL_TIMEFRAMES: ${EXECUTION_CORE_SIGNAL_TIMEFRAMES:-1,3,5}
+      EXECUTION_CORE_EMA_FAST_PERIOD: ${EXECUTION_CORE_EMA_FAST_PERIOD:-5}
+      EXECUTION_CORE_EMA_SLOW_PERIOD: ${EXECUTION_CORE_EMA_SLOW_PERIOD:-9}
+      EXECUTION_CORE_SIGNAL_COOLDOWN_SECONDS: ${EXECUTION_CORE_SIGNAL_COOLDOWN_SECONDS:-30}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      NATS_STREAM_PREFIX: ${NATS_STREAM_PREFIX:-ai_trader}
+    depends_on:
+      nats:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 20s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    networks:
+      - nifty-network
+
   backend:
     environment:
       EXECUTION_CORE_BACKEND: ${EXECUTION_CORE_BACKEND:-python}
+      EXECUTION_CORE_STATUS_URL: ${EXECUTION_CORE_STATUS_URL:-http://execution-core:8081}
       EXECUTION_TRANSPORT: ${EXECUTION_TRANSPORT:-nats}
       AGENT_LATENCY_METRICS_ENABLED: ${AGENT_LATENCY_METRICS_ENABLED:-true}
       AGENT_LATENCY_METRICS_WINDOW: ${AGENT_LATENCY_METRICS_WINDOW:-512}
@@ -100,6 +131,8 @@ services:
       clickhouse:
         condition: service_started
       questdb:
+        condition: service_started
+      execution-core:
         condition: service_started
 
   analytics-consumer:

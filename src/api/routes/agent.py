@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import httpx
 import inspect
 import math
 from types import SimpleNamespace
@@ -114,6 +115,47 @@ def _last_valid(series: pd.Series) -> float | None:
         return None
     value = float(clean.iloc[-1])
     return round(value, 4) if math.isfinite(value) else None
+
+
+async def _execution_core_status_snapshot() -> dict[str, Any]:
+    settings = get_settings()
+    if str(settings.execution_core_backend or "").strip().lower() != "rust":
+        return {}
+
+    base_url = str(settings.execution_core_status_url or "").strip().rstrip("/")
+    if not base_url:
+        return {"reachable": False, "error": "execution_core_status_url_missing"}
+
+    timeout = httpx.Timeout(0.8, connect=0.3)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as http:
+            health_response, stats_response = await asyncio.gather(
+                http.get(f"{base_url}/health"),
+                http.get(f"{base_url}/stats"),
+            )
+        health_response.raise_for_status()
+        stats_response.raise_for_status()
+        health_payload = dict(health_response.json())
+        stats_payload = dict(stats_response.json())
+    except Exception as exc:
+        return {
+            "reachable": False,
+            "url": base_url,
+            "error": str(exc),
+        }
+
+    return {
+        "reachable": True,
+        "url": base_url,
+        "health": health_payload,
+        "stats": {
+            "status": stats_payload.get("status"),
+            "signal_subject": stats_payload.get("signal_subject"),
+            "counters": stats_payload.get("counters", {}),
+            "signal_engine": stats_payload.get("signal_engine", {}),
+            "latest_signals": stats_payload.get("latest_signals", []),
+        },
+    }
 
 
 def _serialize_bar(row: pd.Series) -> dict[str, Any]:
@@ -1069,7 +1111,9 @@ async def resume_agent() -> Dict[str, Any]:
 async def get_agent_status() -> Dict[str, Any]:
     """Get current agent status and metrics."""
     agent = get_trading_agent()
-    return agent.get_status()
+    status = agent.get_status()
+    status["execution_core_status"] = await _execution_core_status_snapshot()
+    return status
 
 
 @router.get("/readiness")

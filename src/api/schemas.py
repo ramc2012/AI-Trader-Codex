@@ -660,6 +660,13 @@ class AgentConfigRequest(BaseModel):
         default=["60", "D"],
         description="Higher timeframes used for spot trend confirmation",
     )
+    event_driven_enabled: bool = Field(
+        default=False,
+        description="Enable tick-triggered symbol scans between periodic full scans",
+    )
+    event_driven_markets: List[str] = Field(default=["NSE"])
+    event_driven_debounce_ms: int = Field(default=1000, ge=100, le=5000)
+    event_driven_batch_size: int = Field(default=8, ge=1, le=50)
     liberal_bootstrap_enabled: bool = Field(
         default=True,
         description="Temporarily loosen risk constraints for aggressive early learning",
@@ -715,6 +722,10 @@ class AgentStatusResponse(BaseModel):
     market_readiness: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     execution_timeframes: List[str] = Field(default_factory=list)
     reference_timeframes: List[str] = Field(default_factory=list)
+    event_driven_enabled: bool = False
+    event_driven_markets: List[str] = Field(default_factory=list)
+    event_driven_debounce_ms: int = 1000
+    event_driven_batch_size: int = 8
     execution_backend: str = "python"
     execution_transport: str = "inmemory"
     streaming_backends: Dict[str, Dict[str, Any]] = Field(default_factory=dict)

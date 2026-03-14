@@ -132,6 +132,10 @@ class AgentConfig:
     timeframe: str = "5"
     execution_timeframes: List[str] = field(default_factory=lambda: ["3", "5", "15"])
     reference_timeframes: List[str] = field(default_factory=lambda: ["60", "D"])
+    event_driven_execution_enabled: bool = False
+    event_driven_markets: List[str] = field(default_factory=lambda: ["NSE"])
+    event_driven_debounce_ms: int = 1000
+    event_driven_batch_size: int = 8
     liberal_bootstrap_enabled: bool = True
     bootstrap_cycles: int = 300
     bootstrap_size_multiplier: float = 2.0
@@ -196,6 +200,7 @@ class TradingAgent:
         risk_manager: RiskManager,
         event_bus: AgentEventBus,
         fyers_client: FyersClient,
+        candle_broker: Any | None = None,
     ) -> None:
         self.config = config
         self.executor = strategy_executor
@@ -204,6 +209,7 @@ class TradingAgent:
         self.risk_manager = risk_manager
         self.event_bus = event_bus
         self.fyers_client = fyers_client
+        self._candle_broker = candle_broker
         runtime_settings = get_settings()
         self.position_sizer = PositionSizer(capital=config.capital)
         self.options_service = OptionsDataService(fyers_client)
@@ -233,6 +239,8 @@ class TradingAgent:
             enabled=runtime_settings.agent_latency_metrics_enabled,
             max_samples=runtime_settings.agent_latency_metrics_window,
         )
+        self._event_driven_task: Optional[asyncio.Task[None]] = None
+        self._symbol_scan_locks: Dict[str, asyncio.Lock] = {}
 
         self.state = AgentState.IDLE
         self._task: Optional[asyncio.Task[None]] = None
@@ -322,6 +330,8 @@ class TradingAgent:
         try:
             await self._init_online_learning()
             self._task = asyncio.create_task(self._main_loop())
+            if self._candle_broker is not None and self.config.event_driven_execution_enabled:
+                self._event_driven_task = asyncio.create_task(self._event_driven_loop())
             logger.info("trading_agent_started", config=self.config.__dict__)
         except Exception as exc:
             self.state = AgentState.ERROR
@@ -349,6 +359,13 @@ class TradingAgent:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if self._event_driven_task and not self._event_driven_task.done():
+            self._event_driven_task.cancel()
+            try:
+                await self._event_driven_task
+            except asyncio.CancelledError:
+                pass
+        self._event_driven_task = None
 
         self.executor.stop()
         self._strategy_perf_tracker._persist_state()
@@ -361,6 +378,89 @@ class TradingAgent:
             metadata={"cycles": self._cycle_count, "trades": self._total_trades, "pnl": self._daily_pnl},
         ))
         logger.info("trading_agent_stopped")
+
+    def _scan_lock(self, symbol: str) -> asyncio.Lock:
+        lock = self._symbol_scan_locks.get(symbol)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._symbol_scan_locks[symbol] = lock
+        return lock
+
+    def _event_driven_market_enabled(self, market: str) -> bool:
+        if not self.config.event_driven_execution_enabled:
+            return False
+        configured = {str(token or "").strip().upper() for token in self.config.event_driven_markets}
+        return str(market or "").strip().upper() in configured
+
+    def _is_event_driven_symbol_eligible(self, symbol: str) -> bool:
+        token = str(symbol or "").strip()
+        if not token or self.state != AgentState.RUNNING:
+            return False
+        market = self._symbol_market(token)
+        if not self._event_driven_market_enabled(market):
+            return False
+        if market != "NSE":
+            return False
+        if token not in self.config.symbols:
+            return False
+        if token not in self._warmed_symbols:
+            return False
+        return is_market_open(datetime.now(tz=IST))
+
+    async def _event_driven_loop(self) -> None:
+        if self._candle_broker is None:
+            return
+
+        queue = self._candle_broker.subscribe("*")
+        pending: set[str] = set()
+        debounce_seconds = max(float(self.config.event_driven_debounce_ms) / 1000.0, 0.1)
+        batch_size = max(int(self.config.event_driven_batch_size), 1)
+        last_flush = time.monotonic()
+
+        try:
+            while self.state == AgentState.RUNNING:
+                if self.state != AgentState.RUNNING:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                timeout = 5.0
+                if pending:
+                    timeout = max(debounce_seconds - (time.monotonic() - last_flush), 0.05)
+
+                payload: Optional[Dict[str, Any]] = None
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    payload = None
+
+                if payload is not None:
+                    symbol = str(payload.get("symbol", "")).strip()
+                    if self._is_event_driven_symbol_eligible(symbol):
+                        pending.add(symbol)
+
+                should_flush = bool(pending) and (
+                    payload is None
+                    or len(pending) >= batch_size
+                    or (time.monotonic() - last_flush) >= debounce_seconds
+                )
+                if not should_flush:
+                    continue
+
+                symbols = sorted(pending)[:batch_size]
+                pending.difference_update(symbols)
+                last_flush = time.monotonic()
+                for symbol in symbols:
+                    started = time.perf_counter()
+                    await self._scan_symbol(symbol)
+                    self._latency_tracker.record(
+                        "event_driven_symbol_scan_ms",
+                        (time.perf_counter() - started) * 1000.0,
+                        symbol=symbol,
+                    )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._candle_broker.unsubscribe("*", queue)
 
     # ------------------------------------------------------------------
     # Online Learning Initialisation
@@ -652,6 +752,10 @@ class TradingAgent:
             "market_readiness": self._market_readiness,
             "execution_timeframes": self.get_execution_timeframes(),
             "reference_timeframes": self.get_reference_timeframes(),
+            "event_driven_enabled": bool(self.config.event_driven_execution_enabled),
+            "event_driven_markets": [market.upper() for market in self.config.event_driven_markets],
+            "event_driven_debounce_ms": int(self.config.event_driven_debounce_ms),
+            "event_driven_batch_size": int(self.config.event_driven_batch_size),
             "execution_backend": settings.execution_core_backend,
             "execution_transport": settings.execution_transport,
             "streaming_backends": {
@@ -1246,6 +1350,10 @@ class TradingAgent:
     # ------------------------------------------------------------------
 
     async def _scan_symbol(self, symbol: str) -> None:
+        async with self._scan_lock(symbol):
+            await self._scan_symbol_unlocked(symbol)
+
+    async def _scan_symbol_unlocked(self, symbol: str) -> None:
         """Run all strategies on a single symbol across execution timeframes."""
         scan_started = time.perf_counter()
         short_name = symbol.split(":")[-1].split("-")[0]

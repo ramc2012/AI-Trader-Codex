@@ -133,6 +133,10 @@ class Settings(BaseSettings):
     agent_default_timeframe: str = "5"
     agent_execution_timeframes: str = "3,5,15"
     agent_reference_timeframes: str = "60,D"
+    agent_event_driven_enabled: bool = False
+    agent_event_driven_markets: str = "NSE"
+    agent_event_driven_debounce_ms: int = Field(default=1000, ge=100, le=5000)
+    agent_event_driven_batch_size: int = Field(default=8, ge=1, le=50)
     agent_default_symbols: str = to_csv(DEFAULT_AGENT_NSE_SYMBOLS)
     agent_us_symbols: str = to_csv(DEFAULT_AGENT_US_SYMBOLS)
     agent_crypto_symbols: str = to_csv(DEFAULT_AGENT_CRYPTO_SYMBOLS)

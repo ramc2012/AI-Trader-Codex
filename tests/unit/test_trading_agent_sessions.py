@@ -137,6 +137,8 @@ def test_agent_status_exposes_market_and_strategy_stats() -> None:
     assert "strategy_reward_ema_by_market" in status
     assert "execution_backend" in status
     assert "execution_transport" in status
+    assert "event_driven_enabled" in status
+    assert "event_driven_markets" in status
     assert "streaming_backends" in status
     assert "analytics_backends" in status
     assert "execution_latency" in status

@@ -7,7 +7,9 @@ from datetime import date, datetime
 
 from src.config.constants import INDEX_INSTRUMENTS, INDEX_SYMBOLS
 from src.config.market_hours import IST, is_market_day, is_pre_open_window, is_market_open
+from src.config.settings import get_settings
 from src.data.collectors.tick_collector import TickCollector
+from src.data.live.live_ohlc import LiveOHLCCacheBridge
 from src.data.live.tick_stream import TickStreamBroker
 from src.database.connection import get_session
 from src.integrations.fyers_client import FyersClient
@@ -36,6 +38,8 @@ class RuntimeManager:
         self._registry = registry
         self._options_service = OptionsDataService(client)
         self._tick_broker = TickStreamBroker()
+        self._candle_broker = TickStreamBroker()
+        self._live_ohlc = LiveOHLCCacheBridge()
 
         self._running = False
         self._tasks: dict[str, asyncio.Task] = {}
@@ -45,6 +49,10 @@ class RuntimeManager:
     @property
     def broker(self) -> TickStreamBroker:
         return self._tick_broker
+
+    @property
+    def candle_broker(self) -> TickStreamBroker:
+        return self._candle_broker
 
     @property
     def is_running(self) -> bool:
@@ -63,6 +71,8 @@ class RuntimeManager:
 
         loop = asyncio.get_running_loop()
         self._tick_broker.bind_loop(loop)
+        self._candle_broker.bind_loop(loop)
+        self._live_ohlc.bind_loop(loop)
         self._running = True
 
         await asyncio.to_thread(self._registry.refresh, self._client)
@@ -103,12 +113,18 @@ class RuntimeManager:
             return
 
         symbols = []
+        settings = get_settings()
         cache = self._registry.get_cache()
         for item in cache.values():
             if item.spot_symbol:
                 symbols.append(item.spot_symbol)
             if item.futures_symbol:
                 symbols.append(item.futures_symbol)
+        symbols.extend(
+            symbol.strip()
+            for symbol in settings.agent_default_symbols.split(",")
+            if symbol.strip()
+        )
         if not symbols:
             symbols.extend(INDEX_SYMBOLS)
         symbols = sorted(set(symbols))
@@ -128,11 +144,29 @@ class RuntimeManager:
                     "bid": tick.bid,
                     "ask": tick.ask,
                     "volume": tick.volume,
+                    "cumulative_volume": tick.cumulative_volume,
                 }
             ),
+            on_candle=self._publish_live_candle,
         )
         self._tasks["tick_collector"] = asyncio.create_task(self._tick_collector.start_async())
         logger.info("tick_collector_started", symbols=len(symbols))
+
+    def _publish_live_candle(self, candle: dict[str, object]) -> None:
+        self._live_ohlc.ingest_candle(candle)
+        self._candle_broker.publish(
+            {
+                "type": "candle",
+                "symbol": candle.get("symbol"),
+                "timeframe": candle.get("timeframe", "1"),
+                "timestamp": candle.get("timestamp"),
+                "open": candle.get("open"),
+                "high": candle.get("high"),
+                "low": candle.get("low"),
+                "close": candle.get("close"),
+                "volume": candle.get("volume"),
+            }
+        )
 
     async def _tick_watchdog(self) -> None:
         """Monitor the tick-collector task and restart it if it exits.

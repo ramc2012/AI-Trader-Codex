@@ -20,6 +20,7 @@ class TestSettings:
         assert settings.kafka_enabled is False
         assert settings.clickhouse_enabled is False
         assert settings.questdb_enabled is False
+        assert settings.agent_event_driven_enabled is False
 
     def test_database_url(self) -> None:
         settings = Settings(

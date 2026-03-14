@@ -257,6 +257,14 @@ def get_trading_agent(config: Optional[AgentConfig] = None) -> TradingAgent:
                 reference_timeframes=[
                     tf.strip() for tf in settings.agent_reference_timeframes.split(",") if tf.strip()
                 ],
+                event_driven_execution_enabled=settings.agent_event_driven_enabled,
+                event_driven_markets=[
+                    market.strip().upper()
+                    for market in settings.agent_event_driven_markets.split(",")
+                    if market.strip()
+                ],
+                event_driven_debounce_ms=settings.agent_event_driven_debounce_ms,
+                event_driven_batch_size=settings.agent_event_driven_batch_size,
                 liberal_bootstrap_enabled=settings.agent_liberal_bootstrap_enabled,
                 bootstrap_cycles=settings.agent_bootstrap_cycles,
                 bootstrap_size_multiplier=settings.agent_bootstrap_size_multiplier,
@@ -279,6 +287,7 @@ def get_trading_agent(config: Optional[AgentConfig] = None) -> TradingAgent:
             risk_manager=get_risk_manager(),
             event_bus=get_agent_event_bus(),
             fyers_client=get_fyers_client(),
+            candle_broker=get_runtime_manager().candle_broker,
         )
     return _trading_agent
 

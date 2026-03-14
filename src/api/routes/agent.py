@@ -32,6 +32,7 @@ from src.api.dependencies import (
     get_order_manager,
     get_position_manager,
     get_risk_manager,
+    get_runtime_manager,
     get_telegram_notifier,
     get_trading_agent,
     reset_trading_agent,
@@ -930,6 +931,10 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
         timeframe=body.timeframe,
         execution_timeframes=body.execution_timeframes,
         reference_timeframes=body.reference_timeframes,
+        event_driven_execution_enabled=body.event_driven_enabled,
+        event_driven_markets=body.event_driven_markets,
+        event_driven_debounce_ms=body.event_driven_debounce_ms,
+        event_driven_batch_size=body.event_driven_batch_size,
         liberal_bootstrap_enabled=body.liberal_bootstrap_enabled,
         bootstrap_cycles=body.bootstrap_cycles,
         bootstrap_size_multiplier=body.bootstrap_size_multiplier,
@@ -971,6 +976,10 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
     notifier = get_telegram_notifier()
     if notifier.is_configured:
         await notifier.start()
+
+    runtime = get_runtime_manager()
+    if not runtime.is_running:
+        await runtime.start()
 
     await agent.start()
     return {"success": True, "message": "Agent started", "state": agent.state.value}

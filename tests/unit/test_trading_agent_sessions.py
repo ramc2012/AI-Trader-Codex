@@ -394,6 +394,34 @@ def test_periodic_scan_symbols_skip_event_driven_symbols() -> None:
     assert filtered == ["CRYPTO:BTCUSDT"]
 
 
+@pytest.mark.asyncio
+async def test_live_only_scan_suppresses_verbose_info_events() -> None:
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    executor = MagicMock()
+    executor._strategies = {"EMA_Crossover": object()}
+    executor.process_data.return_value = []
+
+    agent = TradingAgent(
+        config=AgentConfig(
+            strategies=["EMA_Crossover"],
+            execution_timeframes=["3"],
+            liberal_bootstrap_enabled=False,
+        ),
+        strategy_executor=executor,
+        order_manager=MagicMock(),
+        position_manager=MagicMock(),
+        risk_manager=MagicMock(),
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent._fetch_market_data = AsyncMock(return_value=_frame_with_end(datetime.now(tz=IST), minutes=3, bars=30))
+
+    await agent._scan_symbol_unlocked("NSE:NIFTY50-INDEX", live_only=True)
+
+    event_bus.emit.assert_not_awaited()
+
+
 def test_signal_priority_score_penalizes_small_timeframe_in_trend() -> None:
     agent = _build_agent(AgentConfig())
     signal = Signal(

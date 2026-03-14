@@ -2218,6 +2218,7 @@ class TradingAgent:
         """Run all strategies on a single symbol across execution timeframes."""
         scan_started = time.perf_counter()
         short_name = symbol.split(":")[-1].split("-")[0]
+        emit_verbose_events = not live_only
         execution_timeframes = await self._rank_execution_timeframes(
             symbol,
             self.get_execution_timeframes(),
@@ -2228,16 +2229,17 @@ class TradingAgent:
         timeframe_frames: Dict[str, pd.DataFrame] = {}
         candidate_signals: List[Dict[str, Any]] = []
 
-        await self.event_bus.emit(AgentEvent(
-            event_type=AgentEventType.MARKET_SCAN,
-            title=f"Scanning {short_name}",
-            message=(
-                f"Fetching candles for {symbol} across "
-                f"{', '.join(execution_timeframes)}..."
-            ),
-            severity="info",
-            metadata={"symbol": symbol, "timeframes": execution_timeframes},
-        ))
+        if emit_verbose_events:
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.MARKET_SCAN,
+                title=f"Scanning {short_name}",
+                message=(
+                    f"Fetching candles for {symbol} across "
+                    f"{', '.join(execution_timeframes)}..."
+                ),
+                severity="info",
+                metadata={"symbol": symbol, "timeframes": execution_timeframes},
+            ))
 
         had_data = False
         for timeframe in execution_timeframes:
@@ -2269,13 +2271,14 @@ class TradingAgent:
             regime_meta = self._market_regime_profile(df, symbol_market)
             ltp = float(df["close"].iloc[-1])
             tf_label = f"{timeframe}m" if timeframe.isdigit() else timeframe
-            await self.event_bus.emit(AgentEvent(
-                event_type=AgentEventType.MARKET_DATA_RECEIVED,
-                title=f"{short_name} LTP ({tf_label}): {ltp:,.2f}",
-                message=f"Loaded {len(df)} candles ({tf_label}). Last close: {ltp:,.2f}.",
-                severity="info",
-                metadata={"symbol": symbol, "ltp": ltp, "candles": len(df), "timeframe": timeframe},
-            ))
+            if emit_verbose_events:
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.MARKET_DATA_RECEIVED,
+                    title=f"{short_name} LTP ({tf_label}): {ltp:,.2f}",
+                    message=f"Loaded {len(df)} candles ({tf_label}). Last close: {ltp:,.2f}.",
+                    severity="info",
+                    metadata={"symbol": symbol, "ltp": ltp, "candles": len(df), "timeframe": timeframe},
+                ))
 
             # Run strategies and namespace the symbol key with timeframe so
             # dedupe state doesn't suppress valid signals across resolutions.
@@ -2288,13 +2291,14 @@ class TradingAgent:
                     logger.debug("strategy_skipped_auto_disabled", strategy=strat_name, symbol=symbol)
                     continue
 
-                await self.event_bus.emit(AgentEvent(
-                    event_type=AgentEventType.STRATEGY_ANALYZING,
-                    title=f"Running {strat_name} ({tf_label})",
-                    message=f"Analyzing {short_name} on {tf_label} with {strat_name}...",
-                    severity="info",
-                    metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe},
-                ))
+                if emit_verbose_events:
+                    await self.event_bus.emit(AgentEvent(
+                        event_type=AgentEventType.STRATEGY_ANALYZING,
+                        title=f"Running {strat_name} ({tf_label})",
+                        message=f"Analyzing {short_name} on {tf_label} with {strat_name}...",
+                        severity="info",
+                        metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe},
+                    ))
 
                 strategy_signals = [r for r in results if r.get("strategy") == strat_name]
                 actionable = [
@@ -2303,13 +2307,14 @@ class TradingAgent:
                 ]
 
                 if not actionable:
-                    await self.event_bus.emit(AgentEvent(
-                        event_type=AgentEventType.NO_SIGNAL,
-                        title=f"{strat_name}: No Signal",
-                        message=f"{strat_name} found no actionable signal for {short_name} on {tf_label}. HOLD.",
-                        severity="info",
-                        metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe},
-                    ))
+                    if emit_verbose_events:
+                        await self.event_bus.emit(AgentEvent(
+                            event_type=AgentEventType.NO_SIGNAL,
+                            title=f"{strat_name}: No Signal",
+                            message=f"{strat_name} found no actionable signal for {short_name} on {tf_label}. HOLD.",
+                            severity="info",
+                            metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe},
+                        ))
                     continue
 
                 # Process each actionable signal after higher-timeframe confirmation.
@@ -2343,21 +2348,22 @@ class TradingAgent:
                             live_only=live_only,
                         )
                     if not confirmed:
-                        await self.event_bus.emit(AgentEvent(
-                            event_type=AgentEventType.NO_SIGNAL,
-                            title=f"{strat_name}: HTF Filter Rejected",
-                            message=(
-                                f"{signal.signal_type.value} on {tf_label} rejected by higher-timeframe "
-                                "spot confirmation."
-                            ),
-                            severity="warning",
-                            metadata={
-                                "symbol": symbol,
-                                "strategy": strat_name,
-                                "timeframe": timeframe,
-                                "reference": reference_meta,
-                            },
-                        ))
+                        if emit_verbose_events:
+                            await self.event_bus.emit(AgentEvent(
+                                event_type=AgentEventType.NO_SIGNAL,
+                                title=f"{strat_name}: HTF Filter Rejected",
+                                message=(
+                                    f"{signal.signal_type.value} on {tf_label} rejected by higher-timeframe "
+                                    "spot confirmation."
+                                ),
+                                severity="warning",
+                                metadata={
+                                    "symbol": symbol,
+                                    "strategy": strat_name,
+                                    "timeframe": timeframe,
+                                    "reference": reference_meta,
+                                },
+                            ))
                         continue
 
                     if not isinstance(signal.metadata, dict):
@@ -2383,24 +2389,25 @@ class TradingAgent:
                     signal.metadata["trade_priority_threshold"] = round(priority_threshold, 2)
 
                     if priority_score < priority_threshold:
-                        await self.event_bus.emit(AgentEvent(
-                            event_type=AgentEventType.NO_SIGNAL,
-                            title=f"{strat_name}: Priority Filtered",
-                            message=(
-                                f"{strat_name} setup on {tf_label} was skipped. "
-                                f"Priority {priority_score:.1f} < threshold {priority_threshold:.1f} "
-                                f"for {regime_meta.get('regime', 'transition')} regime."
-                            ),
-                            severity="info",
-                            metadata={
-                                "symbol": symbol,
-                                "strategy": strat_name,
-                                "timeframe": timeframe,
-                                "priority_score": round(priority_score, 2),
-                                "priority_threshold": round(priority_threshold, 2),
-                                "regime": regime_meta,
-                            },
-                        ))
+                        if emit_verbose_events:
+                            await self.event_bus.emit(AgentEvent(
+                                event_type=AgentEventType.NO_SIGNAL,
+                                title=f"{strat_name}: Priority Filtered",
+                                message=(
+                                    f"{strat_name} setup on {tf_label} was skipped. "
+                                    f"Priority {priority_score:.1f} < threshold {priority_threshold:.1f} "
+                                    f"for {regime_meta.get('regime', 'transition')} regime."
+                                ),
+                                severity="info",
+                                metadata={
+                                    "symbol": symbol,
+                                    "strategy": strat_name,
+                                    "timeframe": timeframe,
+                                    "priority_score": round(priority_score, 2),
+                                    "priority_threshold": round(priority_threshold, 2),
+                                    "regime": regime_meta,
+                                },
+                            ))
                         continue
 
                     candidate_signals.append(
@@ -2428,21 +2435,22 @@ class TradingAgent:
             )
             for index, candidate in enumerate(candidate_signals):
                 if index >= max_candidates:
-                    await self.event_bus.emit(AgentEvent(
-                        event_type=AgentEventType.NO_SIGNAL,
-                        title=f"{candidate['strategy']}: Deferred",
-                        message=(
-                            f"Higher-priority setup already selected for {short_name}. "
-                            "This candidate was deferred."
-                        ),
-                        severity="info",
-                        metadata={
-                            "symbol": symbol,
-                            "strategy": candidate["strategy"],
-                            "timeframe": candidate["timeframe"],
-                            "priority_score": round(float(candidate["priority_score"]), 2),
-                        },
-                    ))
+                    if emit_verbose_events:
+                        await self.event_bus.emit(AgentEvent(
+                            event_type=AgentEventType.NO_SIGNAL,
+                            title=f"{candidate['strategy']}: Deferred",
+                            message=(
+                                f"Higher-priority setup already selected for {short_name}. "
+                                "This candidate was deferred."
+                            ),
+                            severity="info",
+                            metadata={
+                                "symbol": symbol,
+                                "strategy": candidate["strategy"],
+                                "timeframe": candidate["timeframe"],
+                                "priority_score": round(float(candidate["priority_score"]), 2),
+                            },
+                        ))
                     continue
 
                 before_trade_count = self._total_trades
@@ -2482,13 +2490,14 @@ class TradingAgent:
                     " Configure FINNHUB_API_KEY and/or ALPHAVANTAGE_API_KEY for"
                     " primary crypto feeds; Binance remains only the fallback."
                 )
-            await self.event_bus.emit(AgentEvent(
-                event_type=AgentEventType.MARKET_DATA_RECEIVED,
-                title=f"No Data — {short_name}",
-                message=no_data_message,
-                severity="warning",
-                metadata={"symbol": symbol, "timeframes": execution_timeframes},
-            ))
+            if emit_verbose_events:
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.MARKET_DATA_RECEIVED,
+                    title=f"No Data — {short_name}",
+                    message=no_data_message,
+                    severity="warning",
+                    metadata={"symbol": symbol, "timeframes": execution_timeframes},
+                ))
         self._latency_tracker.record(
             "symbol_scan_ms",
             (time.perf_counter() - scan_started) * 1000.0,

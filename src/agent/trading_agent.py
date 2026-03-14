@@ -285,6 +285,7 @@ class TradingAgent:
         risk_manager: RiskManager,
         event_bus: AgentEventBus,
         fyers_client: FyersClient,
+        tick_broker: Any | None = None,
         candle_broker: Any | None = None,
         order_event_broker: Any | None = None,
         order_submitter: OrderSubmitter | None = None,
@@ -296,6 +297,7 @@ class TradingAgent:
         self.risk_manager = risk_manager
         self.event_bus = event_bus
         self.fyers_client = fyers_client
+        self._tick_broker = tick_broker
         self._candle_broker = candle_broker
         self._order_event_broker = order_event_broker
         self._order_submitter = order_submitter or OrderSubmitter(order_manager)
@@ -532,13 +534,19 @@ class TradingAgent:
         market = self._symbol_market(token)
         if not self._event_driven_market_enabled(market):
             return False
-        if market != "NSE":
-            return False
-        if token not in self.config.symbols:
-            return False
         if token not in self._warmed_symbols:
             return False
-        return is_market_open(datetime.now(tz=IST))
+        if self._candle_broker is None or self._candle_broker.latest(token) is None:
+            return False
+
+        now = datetime.now(tz=IST)
+        if market == "NSE":
+            return token in self.config.symbols and is_market_open(now)
+        if market == "US":
+            return token in self.config.us_symbols and is_us_market_open(now)
+        if market == "CRYPTO":
+            return token in self.config.crypto_symbols and bool(self.config.trade_crypto_24x7)
+        return False
 
     async def _event_driven_loop(self) -> None:
         if self._candle_broker is None:
@@ -6665,10 +6673,21 @@ class TradingAgent:
         if not symbols:
             return {}
 
+        prices: Dict[str, float] = {}
+        unresolved: List[str] = []
+        for symbol in symbols:
+            broker_price = self._latest_stream_price(symbol)
+            if broker_price is not None:
+                prices[symbol] = broker_price
+            else:
+                unresolved.append(symbol)
+        if not unresolved:
+            return prices
+
         nse_symbols: List[str] = []
         us_symbols: List[str] = []
         crypto_symbols: List[str] = []
-        for symbol in symbols:
+        for symbol in unresolved:
             market = self._symbol_market(symbol)
             if market == "US":
                 us_symbols.append(symbol)
@@ -6676,8 +6695,6 @@ class TradingAgent:
                 crypto_symbols.append(symbol)
             else:
                 nse_symbols.append(symbol)
-
-        prices: Dict[str, float] = {}
 
         if nse_symbols:
             if not self.fyers_client.is_authenticated:
@@ -6712,6 +6729,18 @@ class TradingAgent:
             prices.update(await self._fetch_crypto_live_prices(crypto_symbols))
 
         return prices
+
+    def _latest_stream_price(self, symbol: str) -> float | None:
+        if self._tick_broker is None:
+            return None
+        payload = self._tick_broker.latest(symbol)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            price = float(payload.get("ltp") or payload.get("close") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0 else None
 
     async def _fetch_us_live_prices(self, symbols: List[str]) -> Dict[str, float]:
         ticker_to_symbol = {

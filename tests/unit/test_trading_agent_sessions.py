@@ -18,6 +18,7 @@ from src.agent.trading_agent import (
 )
 from src.agent.trading_agent import AgentState
 from src.config.market_hours import IST
+from src.data.live.tick_stream import TickStreamBroker
 from src.execution.order_manager import BrokerOrderUpdateResult, Order, OrderManager, OrderSide, OrderStatus, OrderType
 from src.execution.order_submitter import OrderSubmitter
 from src.execution.position_manager import PositionManager, PositionSide
@@ -400,6 +401,72 @@ def test_periodic_scan_symbols_skip_event_driven_symbols() -> None:
     filtered = agent._periodic_scan_symbols(["NSE:NIFTY50-INDEX", "CRYPTO:BTCUSDT"])
 
     assert filtered == ["CRYPTO:BTCUSDT"]
+
+
+def test_crypto_symbol_becomes_event_driven_only_after_live_candle() -> None:
+    candle_broker = TickStreamBroker()
+    agent = TradingAgent(
+        config=AgentConfig(
+            event_driven_execution_enabled=True,
+            event_driven_markets=["CRYPTO"],
+            crypto_symbols=["CRYPTO:BTCUSDT"],
+        ),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=MagicMock(),
+        risk_manager=MagicMock(),
+        event_bus=MagicMock(),
+        fyers_client=MagicMock(),
+        candle_broker=candle_broker,
+    )
+    agent.state = AgentState.RUNNING
+    agent._warmed_symbols.add("CRYPTO:BTCUSDT")
+
+    assert agent._is_event_driven_symbol_eligible("CRYPTO:BTCUSDT") is False
+
+    candle_broker.publish(
+        {
+            "type": "candle",
+            "symbol": "CRYPTO:BTCUSDT",
+            "timeframe": "1",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 10,
+        }
+    )
+
+    assert agent._is_event_driven_symbol_eligible("CRYPTO:BTCUSDT") is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_live_prices_prefers_streamed_tick_snapshot() -> None:
+    tick_broker = TickStreamBroker()
+    tick_broker.publish(
+        {
+            "type": "tick",
+            "symbol": "CRYPTO:BTCUSDT",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "ltp": 43125.5,
+        }
+    )
+    agent = TradingAgent(
+        config=AgentConfig(crypto_symbols=["CRYPTO:BTCUSDT"]),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=MagicMock(),
+        risk_manager=MagicMock(),
+        event_bus=MagicMock(),
+        fyers_client=MagicMock(),
+        tick_broker=tick_broker,
+    )
+    agent._fetch_crypto_live_prices = AsyncMock(side_effect=AssertionError("REST fallback should not run"))
+
+    prices = await agent._fetch_live_prices(["CRYPTO:BTCUSDT"])
+
+    assert prices == {"CRYPTO:BTCUSDT": 43125.5}
 
 
 @pytest.mark.asyncio

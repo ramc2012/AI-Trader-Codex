@@ -8,6 +8,7 @@ from datetime import date, datetime
 from src.config.constants import INDEX_INSTRUMENTS, INDEX_SYMBOLS
 from src.config.market_hours import IST, is_market_day, is_pre_open_window, is_market_open
 from src.config.settings import get_settings
+from src.data.collectors.crypto_tick_collector import CryptoTickCollector
 from src.data.collectors.order_socket_collector import OrderSocketCollector
 from src.data.collectors.tick_collector import TickCollector
 from src.data.live.live_ohlc import LiveOHLCCacheBridge
@@ -46,6 +47,7 @@ class RuntimeManager:
         self._running = False
         self._tasks: dict[str, asyncio.Task] = {}
         self._tick_collector: TickCollector | None = None
+        self._crypto_tick_collector: CryptoTickCollector | None = None
         self._order_collector: OrderSocketCollector | None = None
         self._last_preopen_refresh: date | None = None
 
@@ -68,13 +70,11 @@ class RuntimeManager:
     async def start(self) -> None:
         if self._running:
             return
+
         if not self._client.is_authenticated:
             refreshed = await asyncio.to_thread(self._client.try_auto_refresh_with_saved_pin, False)
             if refreshed:
                 logger.info("runtime_token_auto_refreshed")
-            if not self._client.is_authenticated:
-                logger.warning("runtime_not_started_not_authenticated")
-                return
 
         loop = asyncio.get_running_loop()
         self._tick_broker.bind_loop(loop)
@@ -83,9 +83,13 @@ class RuntimeManager:
         self._live_ohlc.bind_loop(loop)
         self._running = True
 
-        await asyncio.to_thread(self._registry.refresh, self._client)
-        await self._start_tick_collector()
-        await self._start_order_collector()
+        await self._start_crypto_collector()
+        if self._client.is_authenticated:
+            await asyncio.to_thread(self._registry.refresh, self._client)
+            await self._start_tick_collector()
+            await self._start_order_collector()
+        else:
+            logger.warning("runtime_started_without_broker_auth")
 
         self._tasks["option_snapshot_loop"] = asyncio.create_task(self._option_snapshot_loop())
         self._tasks["instrument_refresh_loop"] = asyncio.create_task(self._instrument_refresh_loop())
@@ -109,6 +113,9 @@ class RuntimeManager:
         if self._tick_collector:
             await asyncio.to_thread(self._tick_collector.stop)
             self._tick_collector = None
+        if self._crypto_tick_collector:
+            self._crypto_tick_collector.stop()
+            self._crypto_tick_collector = None
         if self._order_collector:
             await asyncio.to_thread(self._order_collector.stop)
             self._order_collector = None
@@ -147,7 +154,7 @@ class RuntimeManager:
         self._tick_collector = TickCollector(
             access_token=access_token,
             symbols=symbols,
-            on_tick=lambda tick: self._tick_broker.publish(
+            on_tick=lambda tick: self._publish_live_tick(
                 {
                     "type": "tick",
                     "symbol": tick.symbol,
@@ -157,12 +164,31 @@ class RuntimeManager:
                     "ask": tick.ask,
                     "volume": tick.volume,
                     "cumulative_volume": tick.cumulative_volume,
+                    "source": "fyers_ws",
                 }
             ),
             on_candle=self._publish_live_candle,
         )
         self._tasks["tick_collector"] = asyncio.create_task(self._tick_collector.start_async())
         logger.info("tick_collector_started", symbols=len(symbols))
+
+    async def _start_crypto_collector(self) -> None:
+        settings = get_settings()
+        symbols = [
+            symbol.strip()
+            for symbol in str(settings.agent_crypto_symbols or "").split(",")
+            if symbol.strip()
+        ]
+        if not symbols:
+            return
+
+        self._crypto_tick_collector = CryptoTickCollector(
+            symbols=symbols,
+            on_tick=self._publish_live_tick,
+            on_candle=self._publish_live_candle,
+        )
+        self._tasks["crypto_tick_collector"] = asyncio.create_task(self._crypto_tick_collector.start_async())
+        logger.info("crypto_tick_collector_started", symbols=len(symbols))
 
     async def _start_order_collector(self) -> None:
         access_token = self._client.access_token
@@ -175,6 +201,9 @@ class RuntimeManager:
         )
         self._tasks["order_collector"] = asyncio.create_task(self._order_collector.start_async())
         logger.info("order_collector_started")
+
+    def _publish_live_tick(self, tick: dict[str, object]) -> None:
+        self._tick_broker.publish(tick)
 
     def _publish_live_candle(self, candle: dict[str, object]) -> None:
         self._live_ohlc.ingest_candle(candle)
@@ -240,6 +269,9 @@ class RuntimeManager:
     async def _option_snapshot_loop(self) -> None:
         while self._running:
             try:
+                if not self._client.is_authenticated:
+                    await asyncio.sleep(30)
+                    continue
                 if not is_market_open(datetime.now(tz=IST)):
                     await asyncio.sleep(15)
                     continue
@@ -284,6 +316,9 @@ class RuntimeManager:
     async def _instrument_refresh_loop(self) -> None:
         while self._running:
             try:
+                if not self._client.is_authenticated:
+                    await asyncio.sleep(60)
+                    continue
                 await asyncio.to_thread(self._registry.refresh, self._client)
             except asyncio.CancelledError:
                 raise
@@ -295,6 +330,9 @@ class RuntimeManager:
         """Run a once-per-day refresh before market open for symbols/expiries."""
         while self._running:
             try:
+                if not self._client.is_authenticated:
+                    await asyncio.sleep(60)
+                    continue
                 now = datetime.now(tz=IST)
                 if not is_market_day(now):
                     await asyncio.sleep(300)

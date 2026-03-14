@@ -291,6 +291,7 @@ def get_trading_agent(config: Optional[AgentConfig] = None) -> TradingAgent:
             risk_manager=get_risk_manager(),
             event_bus=get_agent_event_bus(),
             fyers_client=get_fyers_client(),
+            tick_broker=get_runtime_manager().broker,
             candle_broker=get_runtime_manager().candle_broker,
             order_event_broker=get_runtime_manager().order_broker,
         )

@@ -135,6 +135,11 @@ def test_agent_status_exposes_market_and_strategy_stats() -> None:
     assert "online_learning_active" in status
     assert "online_learning_stats" in status
     assert "strategy_reward_ema_by_market" in status
+    assert "execution_backend" in status
+    assert "execution_transport" in status
+    assert "streaming_backends" in status
+    assert "analytics_backends" in status
+    assert "execution_latency" in status
     assert set(status["market_stats"].keys()) >= {"NSE", "US", "CRYPTO"}
     assert "MP_OrderFlow_Breakout" in status["strategy_stats"]
 

@@ -153,6 +153,38 @@ class Settings(BaseSettings):
     agent_reinforcement_alpha: float = Field(default=0.2, ge=0.01, le=1.0)
     agent_reinforcement_size_boost_pct: float = Field(default=60.0, ge=0.0, le=300.0)
 
+    # --- Execution Architecture ---
+    execution_core_backend: str = "python"
+    execution_transport: str = "inmemory"
+    agent_latency_metrics_enabled: bool = True
+    agent_latency_metrics_window: int = Field(default=256, ge=32, le=4096)
+
+    # --- NATS / JetStream ---
+    nats_enabled: bool = False
+    nats_url: str = "nats://localhost:4222"
+    nats_stream_prefix: str = "ai_trader"
+
+    # --- Kafka ---
+    kafka_enabled: bool = False
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_topic_prefix: str = "ai_trader"
+
+    # --- ClickHouse ---
+    clickhouse_enabled: bool = False
+    clickhouse_host: str = "localhost"
+    clickhouse_http_port: int = 8123
+    clickhouse_native_port: int = 9000
+    clickhouse_database: str = "ai_trader"
+    clickhouse_user: str = "default"
+    clickhouse_password: str = ""
+
+    # --- QuestDB ---
+    questdb_enabled: bool = False
+    questdb_host: str = "localhost"
+    questdb_http_port: int = 9001
+    questdb_pg_port: int = 8812
+    questdb_ilp_port: int = 9009
+
     @property
     def data_path(self) -> Path:
         """Resolved Path for persistent data directory."""
@@ -199,6 +231,14 @@ class Settings(BaseSettings):
         if self.redis_password:
             return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
         return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
+
+    @property
+    def clickhouse_http_url(self) -> str:
+        return f"http://{self.clickhouse_host}:{self.clickhouse_http_port}"
+
+    @property
+    def questdb_http_url(self) -> str:
+        return f"http://{self.questdb_host}:{self.questdb_http_port}"
 
     @property
     def is_production(self) -> bool:

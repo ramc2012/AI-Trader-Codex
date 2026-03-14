@@ -715,6 +715,11 @@ class AgentStatusResponse(BaseModel):
     market_readiness: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     execution_timeframes: List[str] = Field(default_factory=list)
     reference_timeframes: List[str] = Field(default_factory=list)
+    execution_backend: str = "python"
+    execution_transport: str = "inmemory"
+    streaming_backends: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    analytics_backends: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    execution_latency: Dict[str, Any] = Field(default_factory=dict)
     telegram_status_interval_minutes: int = 30
     capital_allocations: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     total_allocated_capital_inr: float = 0.0

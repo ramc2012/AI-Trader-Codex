@@ -8,6 +8,7 @@ from datetime import date, datetime
 from src.config.constants import INDEX_INSTRUMENTS, INDEX_SYMBOLS
 from src.config.market_hours import IST, is_market_day, is_pre_open_window, is_market_open
 from src.config.settings import get_settings
+from src.data.collectors.order_socket_collector import OrderSocketCollector
 from src.data.collectors.tick_collector import TickCollector
 from src.data.live.live_ohlc import LiveOHLCCacheBridge
 from src.data.live.tick_stream import TickStreamBroker
@@ -39,11 +40,13 @@ class RuntimeManager:
         self._options_service = OptionsDataService(client)
         self._tick_broker = TickStreamBroker()
         self._candle_broker = TickStreamBroker()
+        self._order_broker = TickStreamBroker()
         self._live_ohlc = LiveOHLCCacheBridge()
 
         self._running = False
         self._tasks: dict[str, asyncio.Task] = {}
         self._tick_collector: TickCollector | None = None
+        self._order_collector: OrderSocketCollector | None = None
         self._last_preopen_refresh: date | None = None
 
     @property
@@ -53,6 +56,10 @@ class RuntimeManager:
     @property
     def candle_broker(self) -> TickStreamBroker:
         return self._candle_broker
+
+    @property
+    def order_broker(self) -> TickStreamBroker:
+        return self._order_broker
 
     @property
     def is_running(self) -> bool:
@@ -72,11 +79,13 @@ class RuntimeManager:
         loop = asyncio.get_running_loop()
         self._tick_broker.bind_loop(loop)
         self._candle_broker.bind_loop(loop)
+        self._order_broker.bind_loop(loop)
         self._live_ohlc.bind_loop(loop)
         self._running = True
 
         await asyncio.to_thread(self._registry.refresh, self._client)
         await self._start_tick_collector()
+        await self._start_order_collector()
 
         self._tasks["option_snapshot_loop"] = asyncio.create_task(self._option_snapshot_loop())
         self._tasks["instrument_refresh_loop"] = asyncio.create_task(self._instrument_refresh_loop())
@@ -100,6 +109,9 @@ class RuntimeManager:
         if self._tick_collector:
             await asyncio.to_thread(self._tick_collector.stop)
             self._tick_collector = None
+        if self._order_collector:
+            await asyncio.to_thread(self._order_collector.stop)
+            self._order_collector = None
         logger.info("runtime_manager_stopped")
 
     async def restart_if_authenticated(self) -> None:
@@ -152,6 +164,18 @@ class RuntimeManager:
         self._tasks["tick_collector"] = asyncio.create_task(self._tick_collector.start_async())
         logger.info("tick_collector_started", symbols=len(symbols))
 
+    async def _start_order_collector(self) -> None:
+        access_token = self._client.access_token
+        if not access_token:
+            return
+
+        self._order_collector = OrderSocketCollector(
+            access_token=access_token,
+            on_event=self._publish_order_event,
+        )
+        self._tasks["order_collector"] = asyncio.create_task(self._order_collector.start_async())
+        logger.info("order_collector_started")
+
     def _publish_live_candle(self, candle: dict[str, object]) -> None:
         self._live_ohlc.ingest_candle(candle)
         self._candle_broker.publish(
@@ -167,6 +191,9 @@ class RuntimeManager:
                 "volume": candle.get("volume"),
             }
         )
+
+    def _publish_order_event(self, payload: dict[str, object]) -> None:
+        self._order_broker.publish(payload)
 
     async def _tick_watchdog(self) -> None:
         """Monitor the tick-collector task and restart it if it exits.

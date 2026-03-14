@@ -726,6 +726,8 @@ class AgentStatusResponse(BaseModel):
     event_driven_markets: List[str] = Field(default_factory=list)
     event_driven_debounce_ms: int = 1000
     event_driven_batch_size: int = 8
+    pending_live_entries: int = 0
+    pending_live_exits: int = 0
     execution_backend: str = "python"
     execution_transport: str = "inmemory"
     streaming_backends: Dict[str, Dict[str, Any]] = Field(default_factory=dict)

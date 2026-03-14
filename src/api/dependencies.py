@@ -288,6 +288,7 @@ def get_trading_agent(config: Optional[AgentConfig] = None) -> TradingAgent:
             event_bus=get_agent_event_bus(),
             fyers_client=get_fyers_client(),
             candle_broker=get_runtime_manager().candle_broker,
+            order_event_broker=get_runtime_manager().order_broker,
         )
     return _trading_agent
 

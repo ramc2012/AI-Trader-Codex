@@ -1,5 +1,7 @@
 """Tests for the order management system."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from src.execution.order_manager import (
@@ -314,6 +316,112 @@ class TestOrderManagerLive:
         om = OrderManager(paper_mode=False)
         om.set_client("mock_client")
         assert om._fyers_client == "mock_client"
+
+    def test_apply_broker_order_update_tracks_cumulative_fill_delta(self) -> None:
+        om = OrderManager(paper_mode=False)
+        client = MagicMock()
+        client.place_order.return_value = {"s": "ok", "id": "FY123"}
+        om.set_client(client)
+
+        placed = om.place_order(
+            Order(symbol="NSE:NIFTY", quantity=10, side=OrderSide.BUY, order_type=OrderType.MARKET)
+        )
+        assert placed.success is True
+
+        partial = om.apply_broker_order_update(
+            {
+                "orders": {
+                    "id": "FY123",
+                    "qty": 10,
+                    "filledQty": 4,
+                    "tradedPrice": 100.0,
+                    "status": "OPEN",
+                    "message": "open",
+                }
+            }
+        )
+        assert partial.updated is True
+        assert partial.order is not None
+        assert partial.order.status == OrderStatus.PARTIALLY_FILLED
+        assert partial.order.fill_quantity == 4
+        assert partial.fill_delta_quantity == 4
+        assert partial.fill_delta_price == pytest.approx(100.0)
+
+        complete = om.apply_broker_order_update(
+            {
+                "orders": {
+                    "id": "FY123",
+                    "qty": 10,
+                    "filledQty": 10,
+                    "tradedPrice": 102.0,
+                    "status": "COMPLETE",
+                    "message": "filled",
+                }
+            }
+        )
+        assert complete.updated is True
+        assert complete.order is not None
+        assert complete.order.status == OrderStatus.FILLED
+        assert complete.order.fill_quantity == 10
+        assert complete.fill_delta_quantity == 6
+        assert complete.fill_delta_price == pytest.approx((102.0 * 10 - 100.0 * 4) / 6)
+
+    def test_apply_broker_trade_update_dedupes_trade_ids_and_rolls_average_price(self) -> None:
+        om = OrderManager(paper_mode=False)
+        client = MagicMock()
+        client.place_order.return_value = {"s": "ok", "id": "FY456"}
+        om.set_client(client)
+
+        placed = om.place_order(
+            Order(symbol="NSE:NIFTY", quantity=10, side=OrderSide.BUY, order_type=OrderType.MARKET)
+        )
+        assert placed.success is True
+
+        first_fill = om.apply_broker_trade_update(
+            {
+                "trades": {
+                    "orderNumber": "FY456",
+                    "tradeNumber": "TRD-1",
+                    "tradedQty": 3,
+                    "tradePrice": 101.0,
+                }
+            }
+        )
+        assert first_fill.updated is True
+        assert first_fill.order is not None
+        assert first_fill.order.status == OrderStatus.PARTIALLY_FILLED
+        assert first_fill.order.fill_quantity == 3
+        assert first_fill.order.fill_price == pytest.approx(101.0)
+
+        duplicate = om.apply_broker_trade_update(
+            {
+                "trades": {
+                    "orderNumber": "FY456",
+                    "tradeNumber": "TRD-1",
+                    "tradedQty": 3,
+                    "tradePrice": 101.0,
+                }
+            }
+        )
+        assert duplicate.updated is False
+        assert duplicate.order is not None
+        assert duplicate.order.fill_quantity == 3
+
+        second_fill = om.apply_broker_trade_update(
+            {
+                "trades": {
+                    "orderNumber": "FY456",
+                    "tradeNumber": "TRD-2",
+                    "tradedQty": 7,
+                    "tradePrice": 99.0,
+                }
+            }
+        )
+        assert second_fill.updated is True
+        assert second_fill.order is not None
+        assert second_fill.order.status == OrderStatus.FILLED
+        assert second_fill.order.fill_quantity == 10
+        assert second_fill.order.fill_price == pytest.approx(((3 * 101.0) + (7 * 99.0)) / 10)
 
 
 # =========================================================================

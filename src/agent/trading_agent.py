@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 import math
+from numbers import Real
 from pathlib import Path
 import re
 import time
@@ -40,7 +41,15 @@ from src.config.market_hours import (
 )
 from src.config.fno_constants import get_instrument as get_fno_instrument, get_lot_size
 from src.config.settings import get_settings
-from src.execution.order_manager import Order, OrderManager, OrderSide, OrderStatus, OrderType, ProductType
+from src.execution.order_manager import (
+    BrokerOrderUpdateResult,
+    Order,
+    OrderManager,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    ProductType,
+)
 from src.execution.position_manager import PositionManager, PositionSide
 from src.execution.strategy_executor import StrategyExecutor
 from src.integrations.fyers_client import FyersClient
@@ -183,6 +192,43 @@ class OptionExitPlan:
     signal_id: str = ""
 
 
+@dataclass
+class PendingLiveEntryOrder:
+    """Locally tracked live entry order awaiting broker fills."""
+
+    order_id: str
+    symbol: str
+    underlying_symbol: str
+    short_name: str
+    execution_short_name: str
+    quantity: int
+    side: OrderSide
+    strategy: str
+    market: str
+    execution_timeframe: str
+    entry_price_hint: float
+    stop_loss: float
+    target: float
+    signal_id: str
+    option_contract: Optional[OptionContract] = None
+    trade_counted: bool = False
+
+
+@dataclass
+class PendingLiveExitOrder:
+    """Locally tracked live exit order awaiting broker fills."""
+
+    order_id: str
+    symbol: str
+    short_name: str
+    quantity: int
+    reason: str
+    avg_price: float
+    entry_value: float
+    exit_price_hint: float
+    plan: Optional[OptionExitPlan] = None
+
+
 class TradingAgent:
     """Autonomous trading agent that runs strategies and executes trades.
 
@@ -201,6 +247,7 @@ class TradingAgent:
         event_bus: AgentEventBus,
         fyers_client: FyersClient,
         candle_broker: Any | None = None,
+        order_event_broker: Any | None = None,
     ) -> None:
         self.config = config
         self.executor = strategy_executor
@@ -210,6 +257,7 @@ class TradingAgent:
         self.event_bus = event_bus
         self.fyers_client = fyers_client
         self._candle_broker = candle_broker
+        self._order_event_broker = order_event_broker
         runtime_settings = get_settings()
         self.position_sizer = PositionSizer(capital=config.capital)
         self.options_service = OptionsDataService(fyers_client)
@@ -240,7 +288,10 @@ class TradingAgent:
             max_samples=runtime_settings.agent_latency_metrics_window,
         )
         self._event_driven_task: Optional[asyncio.Task[None]] = None
+        self._order_event_task: Optional[asyncio.Task[None]] = None
         self._symbol_scan_locks: Dict[str, asyncio.Lock] = {}
+        self._pending_live_entries: Dict[str, PendingLiveEntryOrder] = {}
+        self._pending_live_exits: Dict[str, PendingLiveExitOrder] = {}
 
         self.state = AgentState.IDLE
         self._task: Optional[asyncio.Task[None]] = None
@@ -293,6 +344,12 @@ class TradingAgent:
         self._strategy_trade_counts.clear()
         self._market_signal_counts.clear()
         self._market_trade_counts.clear()
+        self._pending_live_entries.clear()
+        self._pending_live_exits.clear()
+
+        self.order_manager.paper_mode = self.config.paper_mode
+        self.executor.paper_mode = self.config.paper_mode
+        self.order_manager.set_client(self.fyers_client)
 
         # Register strategies
         self._register_strategies()
@@ -332,6 +389,8 @@ class TradingAgent:
             self._task = asyncio.create_task(self._main_loop())
             if self._candle_broker is not None and self.config.event_driven_execution_enabled:
                 self._event_driven_task = asyncio.create_task(self._event_driven_loop())
+            if self._order_event_broker is not None and not self.config.paper_mode:
+                self._order_event_task = asyncio.create_task(self._order_event_loop())
             logger.info("trading_agent_started", config=self.config.__dict__)
         except Exception as exc:
             self.state = AgentState.ERROR
@@ -366,6 +425,13 @@ class TradingAgent:
             except asyncio.CancelledError:
                 pass
         self._event_driven_task = None
+        if self._order_event_task and not self._order_event_task.done():
+            self._order_event_task.cancel()
+            try:
+                await self._order_event_task
+            except asyncio.CancelledError:
+                pass
+        self._order_event_task = None
 
         self.executor.stop()
         self._strategy_perf_tracker._persist_state()
@@ -461,6 +527,341 @@ class TradingAgent:
             raise
         finally:
             self._candle_broker.unsubscribe("*", queue)
+
+    def _symbol_has_pending_live_order(self, symbol: str) -> bool:
+        token = str(symbol or "").strip()
+        if not token:
+            return False
+        return any(context.symbol == token for context in self._pending_live_entries.values()) or any(
+            context.symbol == token for context in self._pending_live_exits.values()
+        )
+
+    @staticmethod
+    def _resolved_fill_quantity(value: Any, fallback: int) -> int:
+        if isinstance(value, Real) and not isinstance(value, bool):
+            quantity = int(value)
+        elif isinstance(value, str):
+            try:
+                quantity = int(float(value))
+            except ValueError:
+                quantity = 0
+        else:
+            quantity = 0
+        return quantity if quantity > 0 else int(fallback)
+
+    async def _order_event_loop(self) -> None:
+        if self._order_event_broker is None:
+            return
+
+        queue = self._order_event_broker.subscribe("*")
+        try:
+            while self.state == AgentState.RUNNING:
+                payload = await queue.get()
+                await self._handle_broker_execution_event(payload)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._order_event_broker.unsubscribe("*", queue)
+
+    async def _handle_broker_execution_event(self, payload: Dict[str, Any]) -> None:
+        event_kind = str(payload.get("event_kind") or "").strip().lower()
+        raw_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+
+        if event_kind == "trade":
+            result = self.order_manager.apply_broker_trade_update(raw_payload)
+        elif event_kind == "order":
+            result = self.order_manager.apply_broker_order_update(raw_payload)
+        else:
+            return
+
+        await self._apply_broker_reconciliation(
+            event_kind=event_kind,
+            result=result,
+        )
+
+    async def _apply_broker_reconciliation(
+        self,
+        *,
+        event_kind: str,
+        result: BrokerOrderUpdateResult,
+    ) -> None:
+        order = result.order
+        if order is None or not result.updated:
+            return
+
+        order_id = str(order.order_id or "").strip()
+        if not order_id:
+            return
+
+        if result.fill_delta_quantity > 0 and result.fill_delta_price is not None and result.fill_delta_price > 0:
+            entry_context = self._pending_live_entries.get(order_id)
+            if entry_context is not None:
+                await self._finalize_live_entry_fill(
+                    context=entry_context,
+                    order=order,
+                    fill_quantity=result.fill_delta_quantity,
+                    fill_price=float(result.fill_delta_price),
+                )
+            exit_context = self._pending_live_exits.get(order_id)
+            if exit_context is not None:
+                await self._finalize_live_exit_fill(
+                    context=exit_context,
+                    order=order,
+                    fill_quantity=result.fill_delta_quantity,
+                    fill_price=float(result.fill_delta_price),
+                )
+
+        if order.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.FAILED):
+            entry_context = self._pending_live_entries.pop(order_id, None)
+            if entry_context is not None:
+                reason = order.rejection_reason or result.message or order.status.value
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.ORDER_REJECTED,
+                    title=f"Order {order.status.value.title()} — {entry_context.short_name}",
+                    message=f"Live entry order {order.status.value}. Reason: {reason}.",
+                    severity="error" if order.status != OrderStatus.CANCELLED else "warning",
+                    metadata={
+                        "symbol": entry_context.symbol,
+                        "underlying_symbol": entry_context.underlying_symbol,
+                        "status": order.status.value,
+                        "reason": reason,
+                        "order_id": order_id,
+                        "strategy": entry_context.strategy,
+                    },
+                ))
+
+            exit_context = self._pending_live_exits.pop(order_id, None)
+            if exit_context is not None:
+                reason = order.rejection_reason or result.message or order.status.value
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.ORDER_REJECTED,
+                    title=f"Exit {order.status.value.title()} — {exit_context.short_name}",
+                    message=f"Live exit order {order.status.value}. Reason: {reason}.",
+                    severity="error" if order.status != OrderStatus.CANCELLED else "warning",
+                    metadata={
+                        "symbol": exit_context.symbol,
+                        "underlying_symbol": (exit_context.plan.underlying_symbol if exit_context.plan else exit_context.symbol),
+                        "status": order.status.value,
+                        "reason": reason,
+                        "order_id": order_id,
+                        "strategy": (exit_context.plan.strategy if exit_context.plan else ""),
+                    },
+                ))
+            return
+
+        if order.status == OrderStatus.FILLED:
+            self._pending_live_entries.pop(order_id, None)
+            self._pending_live_exits.pop(order_id, None)
+
+    async def _finalize_live_entry_fill(
+        self,
+        *,
+        context: PendingLiveEntryOrder,
+        order: Order,
+        fill_quantity: int,
+        fill_price: float,
+    ) -> None:
+        fill_quantity = max(int(fill_quantity), 0)
+        fill_price = float(fill_price or 0.0)
+        if fill_quantity <= 0 or fill_price <= 0:
+            return
+
+        if not context.trade_counted:
+            self._total_trades += 1
+            self._strategy_trade_counts[context.strategy] = self._strategy_trade_counts.get(context.strategy, 0) + 1
+            self._market_trade_counts[context.market] = self._market_trade_counts.get(context.market, 0) + 1
+            context.trade_counted = True
+
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_FILLED,
+            title=(
+                f"Order {'Filled' if order.status == OrderStatus.FILLED else 'Partially Filled'} "
+                f"— {context.short_name}"
+            ),
+            message=(
+                f"{context.side.name} {fill_quantity} x {context.execution_short_name} @ {fill_price:,.2f}. "
+                f"Order: {order.order_id}."
+            ),
+            severity="success",
+            metadata={
+                "symbol": context.symbol,
+                "underlying_symbol": context.underlying_symbol,
+                "side": context.side.name,
+                "quantity": fill_quantity,
+                "fill_price": fill_price,
+                "order_id": order.order_id,
+                "strategy": context.strategy,
+                "status": order.status.value,
+            },
+        ))
+
+        realized_before = self.position_manager.total_realized_pnl
+        self.position_manager.open_position(
+            symbol=context.symbol,
+            quantity=fill_quantity,
+            side=PositionSide.LONG if context.side == OrderSide.BUY else PositionSide.SHORT,
+            price=fill_price,
+            strategy_tag=context.strategy,
+            order_id=order.order_id or "",
+        )
+        realized_after = self.position_manager.total_realized_pnl
+        realized_delta = realized_after - realized_before
+        if abs(realized_delta) > 1e-9:
+            self.risk_manager.record_trade_result(realized_delta)
+
+        position = self.position_manager.get_position(context.symbol)
+        if position is None:
+            self.risk_manager.sync_position_value(context.symbol, 0.0)
+        else:
+            self.risk_manager.sync_position_value(
+                symbol=context.symbol,
+                position_value=position.quantity * max(position.current_price or fill_price, fill_price),
+            )
+
+        if context.option_contract is not None:
+            self._upsert_option_exit_plan(
+                symbol=context.symbol,
+                underlying_symbol=context.underlying_symbol,
+                strategy=context.strategy,
+                quantity=fill_quantity,
+                execution_timeframe=context.execution_timeframe,
+                entry_price=fill_price,
+                stop_loss=context.stop_loss,
+                target=context.target,
+                signal_id=context.signal_id,
+            )
+
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.POSITION_OPENED,
+            title=f"Position Opened — {context.short_name}",
+            message=(
+                f"{context.side.name} {fill_quantity} x {context.execution_short_name} @ {fill_price:,.2f}. "
+                f"SL: {context.stop_loss:,.2f}. Target: {context.target:,.2f}."
+            ),
+            severity="success",
+            metadata={
+                "symbol": context.symbol,
+                "underlying_symbol": context.underlying_symbol,
+                "side": context.side.name,
+                "quantity": fill_quantity,
+                "entry_price": fill_price,
+                "stop_loss": context.stop_loss,
+                "target": context.target,
+                "order_id": order.order_id,
+                "strategy": context.strategy,
+                "status": order.status.value,
+            },
+        ))
+
+    async def _finalize_live_exit_fill(
+        self,
+        *,
+        context: PendingLiveExitOrder,
+        order: Order,
+        fill_quantity: int,
+        fill_price: float,
+    ) -> None:
+        fill_quantity = max(int(fill_quantity), 0)
+        fill_price = float(fill_price or 0.0)
+        if fill_quantity <= 0 or fill_price <= 0:
+            return
+
+        strategy_tag = context.plan.strategy if context.plan is not None else None
+        try:
+            realized = self.position_manager.close_position(
+                context.symbol,
+                fill_price,
+                quantity=fill_quantity,
+                strategy_tag=strategy_tag,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "live_exit_position_mismatch",
+                symbol=context.symbol,
+                quantity=fill_quantity,
+                strategy=strategy_tag,
+                error=str(exc),
+            )
+            self._pending_live_exits.pop(context.order_id, None)
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.AGENT_ERROR,
+                title=f"Exit State Mismatch — {context.short_name}",
+                message=str(exc),
+                severity="warning",
+                metadata={
+                    "symbol": context.symbol,
+                    "strategy": strategy_tag,
+                    "reason": context.reason,
+                    "quantity": fill_quantity,
+                },
+            ))
+            return
+
+        self.risk_manager.record_trade_result(realized)
+        remaining_pos = self.position_manager.get_position(context.symbol)
+        if remaining_pos is None:
+            self.risk_manager.sync_position_value(context.symbol, 0.0)
+        else:
+            self.risk_manager.sync_position_value(
+                context.symbol,
+                remaining_pos.quantity * max(remaining_pos.current_price or fill_price, fill_price),
+            )
+
+        remaining_strategy_qty = self._remaining_strategy_position_quantity(
+            context.symbol,
+            strategy_tag,
+        )
+        plan_fully_closed = strategy_tag is None or remaining_strategy_qty <= 0
+        if strategy_tag is not None:
+            self._update_exit_plan_remaining_quantity(
+                context.symbol,
+                strategy_tag,
+                remaining_quantity=remaining_strategy_qty,
+            )
+
+        pnl_pct = (realized / max(context.avg_price * fill_quantity, 1e-6)) * 100.0
+        if context.plan is not None and plan_fully_closed:
+            reinforcement_market = self._symbol_market(
+                context.plan.underlying_symbol if context.plan.underlying_symbol else context.symbol
+            )
+            self._record_reinforcement(context.plan.strategy, pnl_pct, market=reinforcement_market)
+            engine = self._online_learning_engine
+            if engine is not None and context.plan.signal_id:
+                asyncio.ensure_future(
+                    engine.label_outcome(
+                        signal_id=context.plan.signal_id,
+                        pnl_pct=pnl_pct,
+                        exit_timestamp=datetime.now(tz=IST),
+                    )
+                )
+
+        if order.status == OrderStatus.FILLED or plan_fully_closed:
+            self._pending_live_exits.pop(context.order_id, None)
+
+        event_type = AgentEventType.POSITION_CLOSED if plan_fully_closed else AgentEventType.POSITION_UPDATE
+        title = "Position Closed" if plan_fully_closed else "Position Reduced"
+        await self.event_bus.emit(AgentEvent(
+            event_type=event_type,
+            title=f"{title} — {context.short_name}",
+            message=(
+                f"Exit: {context.reason}. Qty: {fill_quantity}. "
+                f"Entry: {context.avg_price:,.2f} | Exit: {fill_price:,.2f} | "
+                f"PnL: {realized:+,.2f} ({pnl_pct:+.2f}%)."
+            ),
+            severity="success" if realized >= 0 else "warning",
+            metadata={
+                "symbol": context.symbol,
+                "underlying_symbol": (context.plan.underlying_symbol if context.plan is not None else context.symbol),
+                "reason": context.reason,
+                "quantity": fill_quantity,
+                "entry_price": context.avg_price,
+                "exit_price": fill_price,
+                "pnl": realized,
+                "pnl_pct": pnl_pct,
+                "strategy": (context.plan.strategy if context.plan else ""),
+                "status": order.status.value,
+            },
+        ))
 
     # ------------------------------------------------------------------
     # Online Learning Initialisation
@@ -756,6 +1157,8 @@ class TradingAgent:
             "event_driven_markets": [market.upper() for market in self.config.event_driven_markets],
             "event_driven_debounce_ms": int(self.config.event_driven_debounce_ms),
             "event_driven_batch_size": int(self.config.event_driven_batch_size),
+            "pending_live_entries": len(self._pending_live_entries),
+            "pending_live_exits": len(self._pending_live_exits),
             "execution_backend": settings.execution_core_backend,
             "execution_transport": settings.execution_transport,
             "streaming_backends": {
@@ -934,6 +1337,36 @@ class TradingAgent:
         strategy_map.pop(strategy, None)
         if not strategy_map:
             self._option_exit_plans.pop(symbol, None)
+
+    def _remaining_strategy_position_quantity(self, symbol: str, strategy: Optional[str]) -> int:
+        if strategy is None:
+            position = self.position_manager.get_position(symbol)
+            return int(position.quantity) if position is not None else 0
+        return sum(
+            int(view.quantity)
+            for view in self.position_manager.get_position_views(
+                symbol=symbol,
+                strategy_tag=strategy,
+            )
+        )
+
+    def _update_exit_plan_remaining_quantity(
+        self,
+        symbol: str,
+        strategy: str,
+        *,
+        remaining_quantity: int,
+    ) -> None:
+        strategy_map = self._option_exit_plans.get(symbol)
+        if not strategy_map:
+            return
+        plan = strategy_map.get(strategy)
+        if plan is None:
+            return
+        if remaining_quantity <= 0:
+            self._remove_exit_plan(symbol, strategy)
+            return
+        plan.quantity = int(remaining_quantity)
 
     @staticmethod
     def _to_ist(value: Optional[datetime]) -> datetime:
@@ -2156,6 +2589,24 @@ class TradingAgent:
             ))
             return
 
+        if not self.config.paper_mode and self._symbol_has_pending_live_order(execution_symbol):
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Order Deferred — {short_name}",
+                message=(
+                    f"A live order for {execution_short_name if 'execution_short_name' in locals() else execution_symbol} "
+                    "is still pending broker fills. Skipping duplicate entry."
+                ),
+                severity="warning",
+                metadata={
+                    "symbol": execution_symbol,
+                    "underlying_symbol": underlying_symbol,
+                    "strategy": strat_name,
+                    "pending_live_order": True,
+                },
+            ))
+            return
+
         if option_contract is not None:
             sl_price, target_price = self._derive_option_levels(signal, entry_price)
         else:
@@ -2443,7 +2894,10 @@ class TradingAgent:
             effective_max_position_size_inr / max(self.total_allocated_capital_inr(), 1.0)
         )
         market_open_positions = self._market_open_position_count(execution_market)
-        position_would_increase_count = self.position_manager.get_position(execution_symbol) is None
+        position_would_increase_count = (
+            self.position_manager.get_position(execution_symbol) is None
+            and not self._symbol_has_pending_live_order(execution_symbol)
+        )
         with self._temporary_risk_overrides(
             max_position_size=effective_max_position_size_inr,
             max_risk_per_trade_pct=effective_max_risk_per_trade_pct,
@@ -2530,7 +2984,10 @@ class TradingAgent:
                 market=execution_market,
                 strategy=strat_name,
             ):
-                placed = self.order_manager.place_order(order)
+                if self.config.paper_mode:
+                    placed = self.order_manager.place_order(order)
+                else:
+                    placed = await asyncio.to_thread(self.order_manager.place_order, order)
 
             executed_order = placed.order
             if placed.success and executed_order is not None and executed_order.status in (
@@ -2538,74 +2995,78 @@ class TradingAgent:
                 OrderStatus.PLACED,
                 OrderStatus.PARTIALLY_FILLED,
             ):
-                self._total_trades += 1
-                self._strategy_trade_counts[strat_name] = self._strategy_trade_counts.get(strat_name, 0) + 1
-                self._market_trade_counts[execution_market] = self._market_trade_counts.get(execution_market, 0) + 1
-                fill_price = float(executed_order.fill_price or entry_price)
                 order_id = executed_order.order_id or ""
-
-                await self.event_bus.emit(AgentEvent(
-                    event_type=AgentEventType.ORDER_PLACED,
-                    title=f"Order Filled — {short_name}",
-                    message=(
-                        f"{side.name} {quantity} x {execution_short_name} @ {fill_price:,.2f}. "
-                        f"SL: {format_price(sl_price)}. "
-                        f"Target: {format_price(target_price)}."
-                    ),
-                    severity="success",
-                    metadata={
-                        "symbol": execution_symbol,
-                        "underlying_symbol": underlying_symbol,
-                        "side": side.name,
-                        "quantity": quantity,
-                        "fill_price": fill_price,
-                        "stop_loss": sl_price,
-                        "target": target_price,
-                        "order_id": order_id,
-                        "strategy": strat_name,
-                    },
-                ))
-
-                # Track in position manager
-                pos_side = PositionSide.LONG if side == OrderSide.BUY else PositionSide.SHORT
-                realized_before = self.position_manager.total_realized_pnl
-                self.position_manager.open_position(
-                    symbol=execution_symbol,
-                    quantity=quantity,
-                    side=pos_side,
-                    price=fill_price,
-                    strategy_tag=strat_name,
-                    order_id=order_id,
-                )
-
-                # Track realized PnL changes (partial closes / flips).
-                realized_after = self.position_manager.total_realized_pnl
-                realized_delta = realized_after - realized_before
-                if abs(realized_delta) > 1e-9:
-                    self.risk_manager.record_trade_result(realized_delta)
-
-                # Sync current symbol exposure for concentration/open-position checks.
-                pos = self.position_manager.get_position(execution_symbol)
-                if pos is None:
-                    self.risk_manager.sync_position_value(execution_symbol, 0.0)
-                else:
-                    self.risk_manager.sync_position_value(
-                        symbol=execution_symbol,
-                        position_value=pos.quantity * max(pos.current_price, fill_price),
+                if self.config.paper_mode:
+                    fill_price = float(executed_order.fill_price or entry_price)
+                    await self._finalize_live_entry_fill(
+                        context=PendingLiveEntryOrder(
+                            order_id=order_id,
+                            symbol=execution_symbol,
+                            underlying_symbol=underlying_symbol,
+                            short_name=short_name,
+                            execution_short_name=execution_short_name,
+                            quantity=quantity,
+                            side=side,
+                            strategy=strat_name,
+                            market=execution_market,
+                            execution_timeframe=execution_timeframe or self.config.timeframe,
+                            entry_price_hint=entry_price,
+                            stop_loss=sl_price,
+                            target=target_price,
+                            signal_id=signal_id,
+                            option_contract=option_contract,
+                        ),
+                        order=executed_order,
+                        fill_quantity=self._resolved_fill_quantity(executed_order.fill_quantity, quantity),
+                        fill_price=fill_price,
                     )
-
-                if option_contract is not None:
-                    self._upsert_option_exit_plan(
+                else:
+                    self._pending_live_entries[order_id] = PendingLiveEntryOrder(
+                        order_id=order_id,
                         symbol=execution_symbol,
                         underlying_symbol=underlying_symbol,
-                        strategy=strat_name,
+                        short_name=short_name,
+                        execution_short_name=execution_short_name,
                         quantity=quantity,
+                        side=side,
+                        strategy=strat_name,
+                        market=execution_market,
                         execution_timeframe=execution_timeframe or self.config.timeframe,
-                        entry_price=fill_price,
+                        entry_price_hint=entry_price,
                         stop_loss=sl_price,
                         target=target_price,
                         signal_id=signal_id,
+                        option_contract=option_contract,
                     )
+                    await self.event_bus.emit(AgentEvent(
+                        event_type=AgentEventType.ORDER_PLACED,
+                        title=f"Order Submitted — {short_name}",
+                        message=(
+                            f"{side.name} {quantity} x {execution_short_name}. "
+                            "Waiting for broker fill confirmation."
+                        ),
+                        severity="success",
+                        metadata={
+                            "symbol": execution_symbol,
+                            "underlying_symbol": underlying_symbol,
+                            "side": side.name,
+                            "quantity": quantity,
+                            "stop_loss": sl_price,
+                            "target": target_price,
+                            "order_id": order_id,
+                            "strategy": strat_name,
+                            "status": executed_order.status.value,
+                        },
+                    ))
+                    if int(executed_order.fill_quantity or 0) > 0:
+                        await self._finalize_live_entry_fill(
+                            context=self._pending_live_entries[order_id],
+                            order=executed_order,
+                            fill_quantity=int(executed_order.fill_quantity),
+                            fill_price=float(executed_order.fill_price or entry_price),
+                        )
+                        if executed_order.status == OrderStatus.FILLED:
+                            self._pending_live_entries.pop(order_id, None)
             else:
                 status = executed_order.status.value if executed_order is not None else "rejected"
                 reason = (
@@ -5639,6 +6100,15 @@ class TradingAgent:
         qty = max(min(qty, eligible_qty), 1)
         avg_price = float(plan.entry_price) if plan is not None else float(pos_obj.avg_price)
         entry_value = max(avg_price * qty, 1e-6)
+        if not self.config.paper_mode and self._symbol_has_pending_live_order(symbol):
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Exit Deferred — {short_name}",
+                message="A live broker order for this symbol is still pending. Waiting before sending another exit.",
+                severity="warning",
+                metadata={"symbol": symbol, "reason": reason, "pending_live_order": True},
+            ))
+            return
         close_side = OrderSide.SELL if pos_obj.side == PositionSide.LONG else OrderSide.BUY
         order = Order(
             symbol=symbol,
@@ -5663,7 +6133,10 @@ class TradingAgent:
             },
         ))
 
-        placed = self.order_manager.place_order(order)
+        if self.config.paper_mode:
+            placed = self.order_manager.place_order(order)
+        else:
+            placed = await asyncio.to_thread(self.order_manager.place_order, order)
         executed = placed.order
         if not placed.success or executed is None or executed.status not in (
             OrderStatus.FILLED,
@@ -5685,82 +6158,59 @@ class TradingAgent:
             ))
             return
 
-        fill_price = float(executed.fill_price or current_price)
-        try:
-            realized = self.position_manager.close_position(
-                symbol,
-                fill_price,
-                quantity=qty,
-                strategy_tag=(plan.strategy if plan is not None else None),
+        if self.config.paper_mode:
+            await self._finalize_live_exit_fill(
+                context=PendingLiveExitOrder(
+                    order_id=str(executed.order_id or ""),
+                    symbol=symbol,
+                    short_name=short_name,
+                    quantity=qty,
+                    reason=reason,
+                    avg_price=avg_price,
+                    entry_value=entry_value,
+                    exit_price_hint=current_price,
+                    plan=plan,
+                ),
+                order=executed,
+                fill_quantity=self._resolved_fill_quantity(executed.fill_quantity, qty),
+                fill_price=float(executed.fill_price or current_price),
             )
-        except ValueError as exc:
-            logger.warning(
-                "position_close_mismatch",
+        else:
+            order_id = str(executed.order_id or "")
+            self._pending_live_exits[order_id] = PendingLiveExitOrder(
+                order_id=order_id,
                 symbol=symbol,
-                strategy=(plan.strategy if plan is not None else None),
+                short_name=short_name,
                 quantity=qty,
-                error=str(exc),
+                reason=reason,
+                avg_price=avg_price,
+                entry_value=entry_value,
+                exit_price_hint=current_price,
+                plan=plan,
             )
-            self._remove_exit_plan(symbol, plan.strategy if plan is not None else None)
             await self.event_bus.emit(AgentEvent(
-                event_type=AgentEventType.AGENT_ERROR,
-                title=f"Exit State Mismatch — {short_name}",
-                message=str(exc),
-                severity="warning",
+                event_type=AgentEventType.ORDER_PLACED,
+                title=f"Exit Submitted — {short_name}",
+                message=f"{close_side.name} {qty} units submitted. Waiting for broker fill confirmation.",
+                severity="success",
                 metadata={
                     "symbol": symbol,
-                    "strategy": (plan.strategy if plan is not None else None),
+                    "underlying_symbol": (plan.underlying_symbol if plan is not None else symbol),
                     "reason": reason,
                     "quantity": qty,
+                    "order_id": order_id,
+                    "status": executed.status.value,
                 },
             ))
-            return
-        self.risk_manager.record_trade_result(realized)
-        remaining_pos = self.position_manager.get_position(symbol)
-        if remaining_pos is None:
-            self.risk_manager.sync_position_value(symbol, 0.0)
-        else:
-            self.risk_manager.sync_position_value(
-                symbol,
-                remaining_pos.quantity * max(remaining_pos.current_price or fill_price, fill_price),
-            )
-        self._remove_exit_plan(symbol, plan.strategy if plan is not None else None)
-
-        pnl_pct = (realized / entry_value) * 100.0
-        if plan is not None:
-            reinforcement_market = self._symbol_market(plan.underlying_symbol if plan.underlying_symbol else symbol)
-            self._record_reinforcement(plan.strategy, pnl_pct, market=reinforcement_market)
-            engine = self._online_learning_engine
-            if engine is not None and plan.signal_id:
-                asyncio.ensure_future(
-                    engine.label_outcome(
-                        signal_id=plan.signal_id,
-                        pnl_pct=pnl_pct,
-                        exit_timestamp=datetime.now(tz=IST),
-                    )
+            if int(executed.fill_quantity or 0) > 0:
+                await self._finalize_live_exit_fill(
+                    context=self._pending_live_exits[order_id],
+                    order=executed,
+                    fill_quantity=int(executed.fill_quantity),
+                    fill_price=float(executed.fill_price or current_price),
                 )
-
-        await self.event_bus.emit(AgentEvent(
-            event_type=AgentEventType.POSITION_CLOSED,
-            title=f"Position Closed — {short_name}",
-            message=(
-                f"Exit: {reason}. Qty: {qty}. "
-                f"Entry: {avg_price:,.2f} | Exit: {fill_price:,.2f} | "
-                f"PnL: {realized:+,.2f} ({pnl_pct:+.2f}%)."
-            ),
-            severity="success" if realized >= 0 else "warning",
-            metadata={
-                "symbol": symbol,
-                "underlying_symbol": (plan.underlying_symbol if plan is not None else symbol),
-                "reason": reason,
-                "quantity": qty,
-                "entry_price": avg_price,
-                "exit_price": fill_price,
-                "pnl": realized,
-                "pnl_pct": pnl_pct,
-                "strategy": (plan.strategy if plan else ""),
-            },
-        ))
+                if executed.status == OrderStatus.FILLED:
+                    self._pending_live_exits.pop(order_id, None)
 
     # ------------------------------------------------------------------
     # Exit Condition Checks

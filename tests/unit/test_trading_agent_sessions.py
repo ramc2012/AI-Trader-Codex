@@ -8,11 +8,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pandas as pd
 import pytest
 
-from src.agent.trading_agent import AgentConfig, OptionExitPlan, TradingAgent
+from src.agent.trading_agent import AgentConfig, OptionContract, OptionExitPlan, PendingLiveEntryOrder, TradingAgent
 from src.agent.trading_agent import AgentState
 from src.config.market_hours import IST
-from src.execution.order_manager import OrderSide
-from src.execution.order_manager import OrderStatus
+from src.execution.order_manager import BrokerOrderUpdateResult, Order, OrderSide, OrderStatus, OrderType
 from src.execution.position_manager import PositionManager, PositionSide
 from src.strategies.base import Signal, SignalStrength, SignalType
 
@@ -636,3 +635,104 @@ async def test_close_position_caps_exit_quantity_to_strategy_slice() -> None:
     remaining_views = position_manager.get_position_views(symbol="CRYPTO:ADAUSDT", strategy_tag="RSI_Reversal")
     assert len(remaining_views) == 1
     assert remaining_views[0].quantity == 10
+
+
+@pytest.mark.asyncio
+async def test_live_entry_position_opens_only_after_broker_fill() -> None:
+    position_manager = PositionManager()
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+
+    agent = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent._pending_live_entries["LIVE-1"] = PendingLiveEntryOrder(
+        order_id="LIVE-1",
+        symbol="NSE:NIFTY26MAR22500CE",
+        underlying_symbol="NSE:NIFTY50-INDEX",
+        short_name="NIFTY",
+        execution_short_name="NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        strategy="EMA_Crossover",
+        market="NSE",
+        execution_timeframe="5",
+        entry_price_hint=100.0,
+        stop_loss=95.0,
+        target=110.0,
+        signal_id="sig-1",
+        option_contract=OptionContract(
+            underlying_symbol="NSE:NIFTY50-INDEX",
+            option_symbol="NSE:NIFTY26MAR22500CE",
+            option_type="CE",
+            strike=22500.0,
+            expiry="2026-03-26",
+            ltp=100.0,
+            lot_size=25,
+        ),
+    )
+
+    first_order = Order(
+        symbol="NSE:NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        order_id="LIVE-1",
+        status=OrderStatus.PARTIALLY_FILLED,
+        fill_price=100.0,
+        fill_quantity=4,
+        tag="EMA_Crossover",
+    )
+    await agent._apply_broker_reconciliation(
+        event_kind="trade",
+        result=BrokerOrderUpdateResult(
+            updated=True,
+            order=first_order,
+            message="partial fill",
+            fill_delta_quantity=4,
+            fill_delta_price=100.0,
+            status_changed=True,
+        ),
+    )
+
+    partial_position = position_manager.get_position("NSE:NIFTY26MAR22500CE")
+    assert partial_position is not None
+    assert partial_position.quantity == 4
+    assert "LIVE-1" in agent._pending_live_entries
+    assert agent._symbol_exit_plans("NSE:NIFTY26MAR22500CE")[0].quantity == 4
+
+    second_order = Order(
+        symbol="NSE:NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        order_id="LIVE-1",
+        status=OrderStatus.FILLED,
+        fill_price=101.0,
+        fill_quantity=10,
+        tag="EMA_Crossover",
+    )
+    await agent._apply_broker_reconciliation(
+        event_kind="trade",
+        result=BrokerOrderUpdateResult(
+            updated=True,
+            order=second_order,
+            message="filled",
+            fill_delta_quantity=6,
+            fill_delta_price=101.0,
+            status_changed=True,
+        ),
+    )
+
+    final_position = position_manager.get_position("NSE:NIFTY26MAR22500CE")
+    assert final_position is not None
+    assert final_position.quantity == 10
+    assert "LIVE-1" not in agent._pending_live_entries
+    assert agent._symbol_exit_plans("NSE:NIFTY26MAR22500CE")[0].quantity == 10

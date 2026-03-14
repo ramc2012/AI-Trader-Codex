@@ -158,6 +158,18 @@ class OrderResult:
     order: Optional[Order] = None
 
 
+@dataclass
+class BrokerOrderUpdateResult:
+    """Delta returned after reconciling a broker order/trade event."""
+
+    updated: bool
+    order: Optional[Order] = None
+    message: str = ""
+    fill_delta_quantity: int = 0
+    fill_delta_price: Optional[float] = None
+    status_changed: bool = False
+
+
 class OrderManager:
     """Manage order lifecycle -- placement, tracking, modification, cancellation.
 
@@ -173,6 +185,7 @@ class OrderManager:
         self._orders: Dict[str, Order] = {}
         self._order_counter: int = 0
         self._fyers_client: Any = None
+        self._seen_trade_ids: set[str] = set()
         if state_path is not None:
             self._state_path: Path | None = Path(state_path)
         elif os.environ.get("PYTEST_CURRENT_TEST"):
@@ -393,6 +406,170 @@ class OrderManager:
             List of orders matching the tag.
         """
         return [o for o in self._orders.values() if o.tag == tag]
+
+    def apply_broker_order_update(self, payload: Dict[str, Any]) -> BrokerOrderUpdateResult:
+        """Reconcile a live broker order-status update against the local order book."""
+        raw = payload.get("orders") if isinstance(payload, dict) else None
+        if not isinstance(raw, dict):
+            raw = payload
+        if not isinstance(raw, dict):
+            return BrokerOrderUpdateResult(updated=False, message="Invalid broker order payload.")
+
+        order_id = str(raw.get("id") or raw.get("orderNumber") or "").strip()
+        if not order_id:
+            return BrokerOrderUpdateResult(updated=False, message="Broker order update missing order id.")
+
+        order = self._orders.get(order_id)
+        if order is None:
+            return BrokerOrderUpdateResult(updated=False, message=f"Unknown order id: {order_id}.")
+
+        previous_status = order.status
+        previous_fill_quantity = int(order.fill_quantity or 0)
+        previous_avg_fill_price = float(order.fill_price or 0.0)
+
+        broker_quantity = self._safe_int(raw.get("qty"), fallback=order.quantity)
+        if broker_quantity > 0:
+            order.quantity = broker_quantity
+
+        broker_filled_quantity = min(
+            max(self._safe_int(raw.get("filledQty"), fallback=previous_fill_quantity), previous_fill_quantity),
+            max(int(order.quantity or 0), previous_fill_quantity),
+        )
+        cumulative_avg_fill_price = self._safe_float(raw.get("tradedPrice"), fallback=order.fill_price)
+        fill_delta_quantity = max(broker_filled_quantity - previous_fill_quantity, 0)
+        fill_delta_price: Optional[float] = None
+
+        if fill_delta_quantity > 0 and cumulative_avg_fill_price is not None and cumulative_avg_fill_price > 0:
+            if previous_fill_quantity > 0 and previous_avg_fill_price > 0:
+                fill_delta_value = (
+                    float(cumulative_avg_fill_price) * broker_filled_quantity
+                ) - (previous_avg_fill_price * previous_fill_quantity)
+                fill_delta_price = fill_delta_value / max(fill_delta_quantity, 1)
+            else:
+                fill_delta_price = float(cumulative_avg_fill_price)
+
+        if broker_filled_quantity > 0:
+            order.fill_quantity = broker_filled_quantity
+        if cumulative_avg_fill_price is not None and cumulative_avg_fill_price > 0:
+            order.fill_price = float(cumulative_avg_fill_price)
+
+        mapped_status = self._map_broker_status(
+            raw_status=raw.get("status"),
+            filled_quantity=order.fill_quantity,
+            total_quantity=order.quantity,
+            message=raw.get("message"),
+        )
+        if mapped_status is not None:
+            order.status = mapped_status
+
+        broker_message = str(raw.get("message") or "").strip()
+        if order.status == OrderStatus.REJECTED:
+            order.rejection_reason = broker_message or order.rejection_reason or "Broker rejected order."
+        elif order.status == OrderStatus.CANCELLED and broker_message:
+            order.rejection_reason = broker_message
+
+        if order.fill_quantity >= int(order.quantity or 0) > 0:
+            order.status = OrderStatus.FILLED
+            if order.filled_at is None:
+                order.filled_at = datetime.now(tz=IST)
+        elif order.fill_quantity > 0 and order.status not in (OrderStatus.CANCELLED, OrderStatus.REJECTED):
+            order.status = OrderStatus.PARTIALLY_FILLED
+
+        status_changed = order.status != previous_status
+        updated = status_changed or fill_delta_quantity > 0 or (
+            broker_message and broker_message != str(order.rejection_reason or "")
+        )
+        if updated:
+            self._persist_state()
+            logger.info(
+                "broker_order_reconciled",
+                order_id=order_id,
+                status=order.status.value,
+                fill_quantity=order.fill_quantity,
+                fill_delta_quantity=fill_delta_quantity,
+            )
+
+        return BrokerOrderUpdateResult(
+            updated=updated,
+            order=order,
+            message=broker_message or f"Order status is {order.status.value}.",
+            fill_delta_quantity=fill_delta_quantity,
+            fill_delta_price=fill_delta_price,
+            status_changed=status_changed,
+        )
+
+    def apply_broker_trade_update(self, payload: Dict[str, Any]) -> BrokerOrderUpdateResult:
+        """Reconcile a live broker trade/fill event against the local order book."""
+        raw = payload.get("trades") if isinstance(payload, dict) else None
+        if not isinstance(raw, dict):
+            raw = payload
+        if not isinstance(raw, dict):
+            return BrokerOrderUpdateResult(updated=False, message="Invalid broker trade payload.")
+
+        order_id = str(raw.get("orderNumber") or raw.get("id") or "").strip()
+        if not order_id:
+            return BrokerOrderUpdateResult(updated=False, message="Broker trade update missing order id.")
+
+        order = self._orders.get(order_id)
+        if order is None:
+            return BrokerOrderUpdateResult(updated=False, message=f"Unknown order id: {order_id}.")
+
+        trade_id = str(raw.get("tradeNumber") or "").strip()
+        if trade_id and trade_id in self._seen_trade_ids:
+            return BrokerOrderUpdateResult(updated=False, order=order, message="Duplicate trade update ignored.")
+
+        traded_quantity = self._safe_int(raw.get("tradedQty"), fallback=0)
+        traded_price = self._safe_float(raw.get("tradePrice"), fallback=order.fill_price)
+        if traded_quantity <= 0 or traded_price is None or traded_price <= 0:
+            return BrokerOrderUpdateResult(updated=False, order=order, message="Trade payload missing quantity/price.")
+
+        previous_fill_quantity = int(order.fill_quantity or 0)
+        previous_avg_fill_price = float(order.fill_price or 0.0)
+        applied_fill_quantity = min(
+            traded_quantity,
+            max(int(order.quantity or traded_quantity) - previous_fill_quantity, 0),
+        )
+        if trade_id:
+            self._seen_trade_ids.add(trade_id)
+
+        if applied_fill_quantity <= 0:
+            return BrokerOrderUpdateResult(
+                updated=False,
+                order=order,
+                message="Trade update was already reflected in cumulative fill quantity.",
+            )
+
+        new_fill_quantity = previous_fill_quantity + applied_fill_quantity
+        if previous_fill_quantity > 0 and previous_avg_fill_price > 0:
+            total_value = (previous_avg_fill_price * previous_fill_quantity) + (float(traded_price) * applied_fill_quantity)
+            order.fill_price = total_value / max(new_fill_quantity, 1)
+        else:
+            order.fill_price = float(traded_price)
+        order.fill_quantity = new_fill_quantity
+        if order.fill_quantity >= int(order.quantity or 0) > 0:
+            order.status = OrderStatus.FILLED
+            order.filled_at = order.filled_at or datetime.now(tz=IST)
+        else:
+            order.status = OrderStatus.PARTIALLY_FILLED
+
+        self._persist_state()
+        logger.info(
+            "broker_trade_reconciled",
+            order_id=order_id,
+            trade_id=trade_id or None,
+            fill_quantity=order.fill_quantity,
+            fill_delta_quantity=applied_fill_quantity,
+            fill_delta_price=traded_price,
+            status=order.status.value,
+        )
+        return BrokerOrderUpdateResult(
+            updated=True,
+            order=order,
+            message="Trade update applied.",
+            fill_delta_quantity=applied_fill_quantity,
+            fill_delta_price=float(traded_price),
+            status_changed=True,
+        )
 
     # =========================================================================
     # Paper Trading Simulation
@@ -717,6 +894,67 @@ class OrderManager:
         """
         self._order_counter += 1
         return f"PAPER-{self._order_counter:04d}"
+
+    @staticmethod
+    def _safe_int(value: Any, fallback: int = 0) -> int:
+        try:
+            if value in (None, ""):
+                return int(fallback)
+            return int(float(value))
+        except (TypeError, ValueError):
+            return int(fallback)
+
+    @staticmethod
+    def _safe_float(value: Any, fallback: Optional[float] = None) -> Optional[float]:
+        try:
+            if value in (None, ""):
+                return fallback
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    def _map_broker_status(
+        self,
+        *,
+        raw_status: Any,
+        filled_quantity: int,
+        total_quantity: int,
+        message: Any,
+    ) -> Optional[OrderStatus]:
+        if total_quantity > 0 and filled_quantity >= total_quantity:
+            return OrderStatus.FILLED
+        if filled_quantity > 0:
+            return OrderStatus.PARTIALLY_FILLED
+
+        token = str(raw_status or "").strip()
+        token_upper = token.upper()
+        message_upper = str(message or "").strip().upper()
+
+        if "REJECT" in token_upper or "REJECT" in message_upper:
+            return OrderStatus.REJECTED
+        if "CANCEL" in token_upper or "CANCEL" in message_upper:
+            return OrderStatus.CANCELLED
+        if any(keyword in token_upper for keyword in ("FILL", "TRADE", "COMPLETE", "EXECUT")):
+            return OrderStatus.FILLED
+        if "PART" in token_upper:
+            return OrderStatus.PARTIALLY_FILLED
+        if any(keyword in token_upper for keyword in ("PEND", "TRANSIT", "OPEN")):
+            return OrderStatus.PLACED
+
+        numeric_map = {
+            "1": OrderStatus.CANCELLED,
+            "2": OrderStatus.FILLED,
+            "4": OrderStatus.PLACED,
+            "5": OrderStatus.REJECTED,
+            "6": OrderStatus.PLACED,
+            "7": OrderStatus.CANCELLED,
+            "8": OrderStatus.REJECTED,
+            "9": OrderStatus.PARTIALLY_FILLED,
+        }
+        if token in numeric_map:
+            return numeric_map[token]
+
+        return None
 
     def _persist_state(self) -> None:
         if self._state_path is None:

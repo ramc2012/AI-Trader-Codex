@@ -21,6 +21,9 @@ class TestSettings:
         assert settings.clickhouse_enabled is False
         assert settings.questdb_enabled is False
         assert settings.agent_event_driven_enabled is False
+        assert settings.event_direct_analytics_write_enabled is True
+        assert settings.analytics_consumer_enabled is False
+        assert settings.analytics_consumer_source == "kafka"
 
     def test_database_url(self) -> None:
         settings = Settings(

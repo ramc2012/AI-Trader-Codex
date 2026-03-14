@@ -16,6 +16,7 @@ from src.api.dependencies import (
     get_runtime_manager,
     get_telegram_notifier,
     get_tick_aggregator,
+    get_transport_analytics_consumer,
     get_trading_agent,
 )
 from src.api.routes.backtest import router as backtest_router
@@ -182,6 +183,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     runtime_manager = get_runtime_manager()
     asyncio.create_task(runtime_manager.start())
     asyncio.create_task(get_execution_event_publisher().start())
+    asyncio.create_task(get_transport_analytics_consumer().start())
     asyncio.create_task(warm_global_watchlist_cache())
     # Start real-time tick aggregator (footprint/orderflow)
     aggregator = get_tick_aggregator()
@@ -217,6 +219,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     try:
         await get_execution_event_publisher().stop()
+    except Exception:
+        pass
+
+    try:
+        await get_transport_analytics_consumer().stop()
     except Exception:
         pass
 

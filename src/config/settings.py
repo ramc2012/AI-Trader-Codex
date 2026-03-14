@@ -162,6 +162,10 @@ class Settings(BaseSettings):
     execution_transport: str = "inmemory"
     agent_latency_metrics_enabled: bool = True
     agent_latency_metrics_window: int = Field(default=256, ge=32, le=4096)
+    event_direct_analytics_write_enabled: bool = True
+    analytics_consumer_enabled: bool = False
+    analytics_consumer_source: str = "kafka"
+    analytics_consumer_group_id: str = "ai_trader_analytics"
 
     # --- NATS / JetStream ---
     nats_enabled: bool = False

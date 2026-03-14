@@ -13,6 +13,7 @@ import httpx
 from src.agent.events import AgentEvent, AgentEventBus, AgentEventType
 from src.config.settings import Settings, get_settings
 from src.data.live.tick_stream import TickStreamBroker
+from src.streaming.event_analytics_sink import EventAnalyticsSink
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -74,9 +75,7 @@ class ExecutionEventPublisher:
         self._publish_task: asyncio.Task[None] | None = None
         self._nats_client: Any = None
         self._kafka_producer: Any = None
-        self._http_client: httpx.AsyncClient | None = None
-        self._questdb_writer: asyncio.StreamWriter | None = None
-        self._questdb_lock = asyncio.Lock()
+        self._analytics_sink = EventAnalyticsSink(self._settings)
         self.stats = PublisherStats()
 
     async def start(self) -> None:
@@ -208,17 +207,11 @@ class ExecutionEventPublisher:
                 await self._connect_kafka()
             except Exception as exc:
                 logger.warning("execution_event_kafka_connect_failed", error=str(exc))
-        if self._settings.clickhouse_enabled:
+        if self._settings.event_direct_analytics_write_enabled and self._analytics_sink.enabled:
             try:
-                self._http_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0))
-                await self._ensure_clickhouse_tables()
+                await self._analytics_sink.start()
             except Exception as exc:
-                logger.warning("execution_event_clickhouse_init_failed", error=str(exc))
-                if self._http_client is not None:
-                    await self._http_client.aclose()
-                self._http_client = None
-        elif self._settings.questdb_enabled:
-            self._http_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0))
+                logger.warning("execution_event_analytics_sink_init_failed", error=str(exc))
 
     async def _close_backends(self) -> None:
         if self._nats_client is not None:
@@ -233,16 +226,7 @@ class ExecutionEventPublisher:
             except Exception:
                 pass
             self._kafka_producer = None
-        if self._questdb_writer is not None:
-            try:
-                self._questdb_writer.close()
-                await self._questdb_writer.wait_closed()
-            except Exception:
-                pass
-            self._questdb_writer = None
-        if self._http_client is not None:
-            await self._http_client.aclose()
-            self._http_client = None
+        await self._analytics_sink.stop()
 
     async def _connect_nats(self) -> None:
         try:
@@ -275,10 +259,8 @@ class ExecutionEventPublisher:
             tasks.append(asyncio.create_task(self._nats_client.publish(nats_subject, self._dumps_bytes(envelope))))
         if self._kafka_producer is not None:
             tasks.append(asyncio.create_task(self._kafka_producer.send_and_wait(kafka_topic, envelope)))
-        if self._settings.clickhouse_enabled:
-            tasks.append(asyncio.create_task(self._write_clickhouse(envelope)))
-        if self._settings.questdb_enabled:
-            tasks.append(asyncio.create_task(self._write_questdb(envelope)))
+        if self._settings.event_direct_analytics_write_enabled and self._analytics_sink.enabled:
+            tasks.append(asyncio.create_task(self._analytics_sink.write_envelope(envelope)))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=False)
 

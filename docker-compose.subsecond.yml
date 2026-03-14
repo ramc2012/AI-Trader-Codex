@@ -1,0 +1,228 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    restart: unless-stopped
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+      - "${NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - nats_data:/data
+    networks:
+      - nifty-network
+
+  kafka:
+    image: bitnami/kafka:3.8
+    restart: unless-stopped
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    environment:
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_KRAFT_CLUSTER_ID: ${KAFKA_KRAFT_CLUSTER_ID:-abcdefghijklmnopqrstuv}
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes:
+      - kafka_data:/bitnami/kafka
+    networks:
+      - nifty-network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-ai_trader}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - nifty-network
+
+  questdb:
+    image: questdb/questdb:9.0.3
+    restart: unless-stopped
+    ports:
+      - "${QUESTDB_HTTP_PORT:-9001}:9000"
+      - "${QUESTDB_PG_PORT:-8812}:8812"
+      - "${QUESTDB_ILP_PORT:-9009}:9009"
+    volumes:
+      - questdb_data:/var/lib/questdb
+    networks:
+      - nifty-network
+
+  execution-core:
+    build:
+      context: ./execution-core
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${EXECUTION_CORE_PORT:-8081}:8081"
+    environment:
+      RUST_LOG: ${EXECUTION_CORE_RUST_LOG:-info}
+      EXECUTION_CORE_BIND_ADDR: 0.0.0.0
+      EXECUTION_CORE_PORT: 8081
+      EXECUTION_CORE_MAX_TRACKED_SYMBOLS: ${EXECUTION_CORE_MAX_TRACKED_SYMBOLS:-256}
+      EXECUTION_CORE_SIGNAL_TIMEFRAMES: ${EXECUTION_CORE_SIGNAL_TIMEFRAMES:-1,3,5}
+      EXECUTION_CORE_EMA_FAST_PERIOD: ${EXECUTION_CORE_EMA_FAST_PERIOD:-5}
+      EXECUTION_CORE_EMA_SLOW_PERIOD: ${EXECUTION_CORE_EMA_SLOW_PERIOD:-9}
+      EXECUTION_CORE_SIGNAL_COOLDOWN_SECONDS: ${EXECUTION_CORE_SIGNAL_COOLDOWN_SECONDS:-30}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      NATS_STREAM_PREFIX: ${NATS_STREAM_PREFIX:-ai_trader}
+    depends_on:
+      nats:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 20s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    networks:
+      - nifty-network
+
+  backend:
+    environment:
+      EXECUTION_CORE_BACKEND: ${EXECUTION_CORE_BACKEND:-rust}
+      EXECUTION_CORE_STATUS_URL: ${EXECUTION_CORE_STATUS_URL:-http://execution-core:8081}
+      EXECUTION_TRANSPORT: ${EXECUTION_TRANSPORT:-nats}
+      TRANSPORT_MIRROR_ENABLED: ${TRANSPORT_MIRROR_ENABLED:-true}
+      TRANSPORT_MIRROR_EMBEDDED_ENABLED: ${TRANSPORT_MIRROR_EMBEDDED_ENABLED:-false}
+      AGENT_LATENCY_METRICS_ENABLED: ${AGENT_LATENCY_METRICS_ENABLED:-true}
+      AGENT_LATENCY_METRICS_WINDOW: ${AGENT_LATENCY_METRICS_WINDOW:-512}
+      EVENT_DIRECT_ANALYTICS_WRITE_ENABLED: ${EVENT_DIRECT_ANALYTICS_WRITE_ENABLED:-false}
+      ANALYTICS_CONSUMER_ENABLED: ${ANALYTICS_CONSUMER_ENABLED:-true}
+      ANALYTICS_CONSUMER_EMBEDDED_ENABLED: ${ANALYTICS_CONSUMER_EMBEDDED_ENABLED:-false}
+      ANALYTICS_CONSUMER_SOURCE: ${ANALYTICS_CONSUMER_SOURCE:-kafka}
+      ANALYTICS_CONSUMER_GROUP_ID: ${ANALYTICS_CONSUMER_GROUP_ID:-ai_trader_analytics}
+      AGENT_EVENT_DRIVEN_ENABLED: ${AGENT_EVENT_DRIVEN_ENABLED:-true}
+      AGENT_EVENT_DRIVEN_MARKETS: ${AGENT_EVENT_DRIVEN_MARKETS:-NSE,CRYPTO}
+      AGENT_EVENT_DRIVEN_DEBOUNCE_MS: ${AGENT_EVENT_DRIVEN_DEBOUNCE_MS:-750}
+      AGENT_EVENT_DRIVEN_BATCH_SIZE: ${AGENT_EVENT_DRIVEN_BATCH_SIZE:-6}
+      NATS_ENABLED: ${NATS_ENABLED:-true}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      NATS_STREAM_PREFIX: ${NATS_STREAM_PREFIX:-ai_trader}
+      KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-ai_trader}
+      CLICKHOUSE_ENABLED: ${CLICKHOUSE_ENABLED:-true}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+      CLICKHOUSE_NATIVE_PORT: ${CLICKHOUSE_NATIVE_PORT:-9000}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ai_trader}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      QUESTDB_ENABLED: ${QUESTDB_ENABLED:-true}
+      QUESTDB_HOST: ${QUESTDB_HOST:-questdb}
+      QUESTDB_HTTP_PORT: ${QUESTDB_HTTP_PORT:-9000}
+      QUESTDB_PG_PORT: ${QUESTDB_PG_PORT:-8812}
+      QUESTDB_ILP_PORT: ${QUESTDB_ILP_PORT:-9009}
+    depends_on:
+      nats:
+        condition: service_started
+      kafka:
+        condition: service_started
+      clickhouse:
+        condition: service_started
+      questdb:
+        condition: service_started
+      execution-core:
+        condition: service_started
+
+  analytics-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "src.streaming.analytics_consumer_service"]
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      DATA_DIR: /app/data
+      EXECUTION_CORE_BACKEND: ${EXECUTION_CORE_BACKEND:-python}
+      EXECUTION_TRANSPORT: ${EXECUTION_TRANSPORT:-nats}
+      EVENT_DIRECT_ANALYTICS_WRITE_ENABLED: ${EVENT_DIRECT_ANALYTICS_WRITE_ENABLED:-false}
+      ANALYTICS_CONSUMER_ENABLED: ${ANALYTICS_CONSUMER_ENABLED:-true}
+      ANALYTICS_CONSUMER_EMBEDDED_ENABLED: ${ANALYTICS_CONSUMER_EMBEDDED_ENABLED:-false}
+      ANALYTICS_CONSUMER_SOURCE: ${ANALYTICS_CONSUMER_SOURCE:-kafka}
+      ANALYTICS_CONSUMER_GROUP_ID: ${ANALYTICS_CONSUMER_GROUP_ID:-ai_trader_analytics}
+      NATS_ENABLED: ${NATS_ENABLED:-true}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      NATS_STREAM_PREFIX: ${NATS_STREAM_PREFIX:-ai_trader}
+      KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-ai_trader}
+      CLICKHOUSE_ENABLED: ${CLICKHOUSE_ENABLED:-true}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+      CLICKHOUSE_NATIVE_PORT: ${CLICKHOUSE_NATIVE_PORT:-9000}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-ai_trader}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      QUESTDB_ENABLED: ${QUESTDB_ENABLED:-true}
+      QUESTDB_HOST: ${QUESTDB_HOST:-questdb}
+      QUESTDB_HTTP_PORT: ${QUESTDB_HTTP_PORT:-9000}
+      QUESTDB_PG_PORT: ${QUESTDB_PG_PORT:-8812}
+      QUESTDB_ILP_PORT: ${QUESTDB_ILP_PORT:-9009}
+    volumes:
+      - ./.env:/app/.env
+      - agent_data:/app/data
+    depends_on:
+      nats:
+        condition: service_started
+      kafka:
+        condition: service_started
+      clickhouse:
+        condition: service_started
+      questdb:
+        condition: service_started
+    networks:
+      - nifty-network
+
+  transport-mirror:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "src.streaming.transport_mirror_service"]
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-INFO}
+      EXECUTION_TRANSPORT: ${EXECUTION_TRANSPORT:-nats}
+      TRANSPORT_MIRROR_ENABLED: ${TRANSPORT_MIRROR_ENABLED:-true}
+      TRANSPORT_MIRROR_EMBEDDED_ENABLED: ${TRANSPORT_MIRROR_EMBEDDED_ENABLED:-false}
+      NATS_ENABLED: ${NATS_ENABLED:-true}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      NATS_STREAM_PREFIX: ${NATS_STREAM_PREFIX:-ai_trader}
+      KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX:-ai_trader}
+    depends_on:
+      nats:
+        condition: service_started
+      kafka:
+        condition: service_started
+    networks:
+      - nifty-network
+
+networks:
+  nifty-network:
+    driver: bridge
+
+volumes:
+  nats_data:
+    driver: local
+  kafka_data:
+    driver: local
+  clickhouse_data:
+    driver: local
+  questdb_data:
+    driver: local

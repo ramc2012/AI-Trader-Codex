@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
 import pytest
 
-from src.agent.trading_agent import AgentConfig, OptionExitPlan, TradingAgent
+from src.agent.trading_agent import (
+    AgentConfig,
+    OptionContract,
+    OptionExitPlan,
+    PendingLiveEntryOrder,
+    PendingLiveEntrySubmission,
+    TradingAgent,
+)
+from src.agent.events import AgentEventType
 from src.agent.trading_agent import AgentState
 from src.config.market_hours import IST
-from src.execution.order_manager import OrderSide
-from src.execution.order_manager import OrderStatus
+from src.data.live.tick_stream import TickStreamBroker
+from src.execution.order_manager import BrokerOrderUpdateResult, Order, OrderManager, OrderSide, OrderStatus, OrderType
+from src.execution.order_submitter import OrderSubmitter
 from src.execution.position_manager import PositionManager, PositionSide
 from src.strategies.base import Signal, SignalStrength, SignalType
 
@@ -137,6 +147,14 @@ def test_agent_status_exposes_market_and_strategy_stats() -> None:
     assert "online_learning_active" in status
     assert "online_learning_stats" in status
     assert "strategy_reward_ema_by_market" in status
+    assert "execution_backend" in status
+    assert "execution_signal_lane" in status
+    assert "execution_transport" in status
+    assert "event_driven_enabled" in status
+    assert "event_driven_markets" in status
+    assert "streaming_backends" in status
+    assert "analytics_backends" in status
+    assert "execution_latency" in status
     assert set(status["market_stats"].keys()) >= {"NSE", "US", "CRYPTO"}
     assert "MP_OrderFlow_Breakout" in status["strategy_stats"]
 
@@ -356,6 +374,301 @@ async def test_fetch_market_data_prefers_newer_stale_db_frame_when_market_closed
 
     assert frame is not None
     assert pd.to_datetime(frame["timestamp"].iloc[-1]) == pd.to_datetime(newer_db_frame["timestamp"].iloc[-1])
+
+
+@pytest.mark.asyncio
+async def test_fetch_market_data_live_only_skips_db_and_rest_fallbacks(monkeypatch) -> None:
+    agent = _build_agent(AgentConfig())
+    stale_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(days=2))
+
+    class _Cache:
+        def as_dataframe(self, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+            return stale_frame.set_index("timestamp")
+
+    monkeypatch.setattr("src.data.ohlc_cache.get_ohlc_cache", lambda: _Cache())
+    agent._requires_live_bars = MagicMock(return_value=True)
+    agent._fetch_database_market_data = AsyncMock(return_value=_frame_with_end(datetime.now(tz=IST)))
+    agent._fetch_fyers_market_data = AsyncMock(return_value=_frame_with_end(datetime.now(tz=IST)))
+
+    frame = await agent._fetch_market_data("NSE:NIFTY50-INDEX", timeframe="3", live_only=True)
+
+    assert frame is None
+    agent._fetch_database_market_data.assert_not_called()
+    agent._fetch_fyers_market_data.assert_not_called()
+
+
+def test_periodic_scan_symbols_skip_event_driven_symbols() -> None:
+    agent = _build_agent(AgentConfig(event_driven_execution_enabled=True))
+    agent._candle_broker = MagicMock()
+    agent._is_event_driven_symbol_eligible = MagicMock(
+        side_effect=lambda symbol: symbol == "NSE:NIFTY50-INDEX"
+    )
+
+    filtered = agent._periodic_scan_symbols(["NSE:NIFTY50-INDEX", "CRYPTO:BTCUSDT"])
+
+    assert filtered == ["CRYPTO:BTCUSDT"]
+
+
+def test_periodic_scan_symbols_skip_execution_core_lane_symbols() -> None:
+    agent = _build_agent(
+        AgentConfig(
+            event_driven_markets=["CRYPTO"],
+            crypto_symbols=["CRYPTO:BTCUSDT"],
+            us_symbols=["US:SPY"],
+        )
+    )
+    agent._runtime_settings = SimpleNamespace(nats_enabled=True)
+    agent._execution_core_backend = "rust"
+
+    filtered = agent._periodic_scan_symbols(["CRYPTO:BTCUSDT", "US:SPY"])
+
+    assert filtered == ["US:SPY"]
+
+
+def test_crypto_symbol_becomes_event_driven_only_after_live_candle() -> None:
+    candle_broker = TickStreamBroker()
+    agent = TradingAgent(
+        config=AgentConfig(
+            event_driven_execution_enabled=True,
+            event_driven_markets=["CRYPTO"],
+            crypto_symbols=["CRYPTO:BTCUSDT"],
+        ),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=MagicMock(),
+        risk_manager=MagicMock(),
+        event_bus=MagicMock(),
+        fyers_client=MagicMock(),
+        candle_broker=candle_broker,
+    )
+    agent.state = AgentState.RUNNING
+    agent._warmed_symbols.add("CRYPTO:BTCUSDT")
+
+    assert agent._is_event_driven_symbol_eligible("CRYPTO:BTCUSDT") is False
+
+    candle_broker.publish(
+        {
+            "type": "candle",
+            "symbol": "CRYPTO:BTCUSDT",
+            "timeframe": "1",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 10,
+        }
+    )
+
+    assert agent._is_event_driven_symbol_eligible("CRYPTO:BTCUSDT") is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_live_prices_prefers_streamed_tick_snapshot() -> None:
+    tick_broker = TickStreamBroker()
+    tick_broker.publish(
+        {
+            "type": "tick",
+            "symbol": "CRYPTO:BTCUSDT",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "ltp": 43125.5,
+        }
+    )
+    agent = TradingAgent(
+        config=AgentConfig(crypto_symbols=["CRYPTO:BTCUSDT"]),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=MagicMock(),
+        risk_manager=MagicMock(),
+        event_bus=MagicMock(),
+        fyers_client=MagicMock(),
+        tick_broker=tick_broker,
+    )
+    agent._fetch_crypto_live_prices = AsyncMock(side_effect=AssertionError("REST fallback should not run"))
+
+    prices = await agent._fetch_live_prices(["CRYPTO:BTCUSDT"])
+
+    assert prices == {"CRYPTO:BTCUSDT": 43125.5}
+
+
+def test_event_driven_exit_symbol_requires_position_and_live_tick() -> None:
+    tick_broker = TickStreamBroker()
+    position_manager = PositionManager()
+    agent = TradingAgent(
+        config=AgentConfig(
+            event_driven_execution_enabled=True,
+            event_driven_markets=["CRYPTO"],
+            crypto_symbols=["CRYPTO:BTCUSDT"],
+        ),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=position_manager,
+        risk_manager=MagicMock(),
+        event_bus=MagicMock(),
+        fyers_client=MagicMock(),
+        tick_broker=tick_broker,
+    )
+    agent.state = AgentState.RUNNING
+
+    assert agent._is_event_driven_exit_symbol_eligible("CRYPTO:BTCUSDT") is False
+
+    position_manager.open_position(
+        symbol="CRYPTO:BTCUSDT",
+        quantity=2,
+        side=PositionSide.LONG,
+        price=43000.0,
+        strategy_tag="EMA_Crossover",
+    )
+    assert agent._is_event_driven_exit_symbol_eligible("CRYPTO:BTCUSDT") is False
+
+    tick_broker.publish(
+        {
+            "type": "tick",
+            "symbol": "CRYPTO:BTCUSDT",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "ltp": 43125.5,
+        }
+    )
+
+    assert agent._is_event_driven_exit_symbol_eligible("CRYPTO:BTCUSDT") is True
+
+
+@pytest.mark.asyncio
+async def test_check_position_exit_closes_target_without_position_update_event() -> None:
+    position_manager = PositionManager()
+    position_manager.open_position(
+        symbol="CRYPTO:ADAUSDT",
+        quantity=10,
+        side=PositionSide.LONG,
+        price=1.0,
+        strategy_tag="EMA_Crossover",
+    )
+
+    placed_order = MagicMock()
+    placed_order.status = OrderStatus.FILLED
+    placed_order.fill_price = 1.2
+    order_manager = MagicMock()
+    order_manager.place_order.return_value = MagicMock(success=True, order=placed_order)
+
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+    risk_manager.config.time_based_exit_minutes = 5
+
+    agent = TradingAgent(
+        config=AgentConfig(),
+        strategy_executor=MagicMock(),
+        order_manager=order_manager,
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent._upsert_option_exit_plan(
+        symbol="CRYPTO:ADAUSDT",
+        underlying_symbol="CRYPTO:ADAUSDT",
+        strategy="EMA_Crossover",
+        quantity=10,
+        execution_timeframe="5",
+        entry_price=1.0,
+        stop_loss=0.9,
+        target=1.1,
+        signal_id="sig-1",
+    )
+    agent._apply_stream_mark_price("CRYPTO:ADAUSDT", 1.2)
+
+    triggered = await agent._check_position_exit(
+        "CRYPTO:ADAUSDT",
+        now=datetime.now(tz=IST),
+        eod_buffer_minutes=5,
+        emit_position_update=False,
+    )
+
+    assert triggered is True
+    assert position_manager.get_position("CRYPTO:ADAUSDT") is None
+    emitted_types = [call.args[0].event_type for call in event_bus.emit.await_args_list]
+    assert AgentEventType.POSITION_UPDATE not in emitted_types
+
+
+@pytest.mark.asyncio
+async def test_live_only_scan_suppresses_verbose_info_events() -> None:
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    executor = MagicMock()
+    executor._strategies = {"EMA_Crossover": object()}
+    executor.process_data.return_value = []
+
+    agent = TradingAgent(
+        config=AgentConfig(
+            strategies=["EMA_Crossover"],
+            execution_timeframes=["3"],
+            liberal_bootstrap_enabled=False,
+        ),
+        strategy_executor=executor,
+        order_manager=MagicMock(),
+        position_manager=MagicMock(),
+        risk_manager=MagicMock(),
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent._fetch_market_data = AsyncMock(return_value=_frame_with_end(datetime.now(tz=IST), minutes=3, bars=30))
+
+    await agent._scan_symbol_unlocked("NSE:NIFTY50-INDEX", live_only=True)
+
+    event_bus.emit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execution_core_signal_dispatches_into_process_signal_once() -> None:
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    agent = TradingAgent(
+        config=AgentConfig(
+            event_driven_markets=["CRYPTO"],
+            crypto_symbols=["CRYPTO:BTCUSDT"],
+        ),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=MagicMock(),
+        risk_manager=MagicMock(),
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent.state = AgentState.RUNNING
+    agent._runtime_settings = SimpleNamespace(nats_enabled=True)
+    agent._execution_core_backend = "rust"
+    agent._execution_core_signal_subject = "test_stream.execution.signals"
+    agent._reset_execution_core_signal_state()
+    agent._process_signal = AsyncMock()
+
+    payload = {
+        "stream": "execution_signals",
+        "event_time": datetime.now(tz=IST).isoformat(),
+        "event_id": "sig-rust-1",
+        "source": "execution_core",
+        "event_type": "signal_candidate",
+        "signal_type": "BUY",
+        "symbol": "CRYPTO:BTCUSDT",
+        "market": "CRYPTO",
+        "timeframe": "1",
+        "strategy": "Rust_EMA_Crossover",
+        "price": 64000.0,
+        "payload": {"ema_fast": 63990.0, "ema_slow": 63970.0},
+    }
+
+    await agent._handle_execution_core_signal(payload)
+    await agent._handle_execution_core_signal(payload)
+
+    assert agent._process_signal.await_count == 1
+    dispatched_signal = agent._process_signal.await_args.args[0]
+    assert dispatched_signal.symbol == "CRYPTO:BTCUSDT"
+    assert dispatched_signal.signal_type == SignalType.BUY
+    assert dispatched_signal.metadata["signal_source"] == "execution_core"
+    assert agent._total_signals == 1
+    assert agent._strategy_signal_counts["Rust_EMA_Crossover"] == 1
+    assert agent._market_signal_counts["CRYPTO"] == 1
+    assert agent._execution_core_signal_stats["accepted"] == 1
+    assert agent._execution_core_signal_stats["rejected"] == 1
 
 
 def test_signal_priority_score_penalizes_small_timeframe_in_trend() -> None:
@@ -661,3 +974,339 @@ async def test_close_position_caps_exit_quantity_to_strategy_slice() -> None:
     remaining_views = position_manager.get_position_views(symbol="CRYPTO:ADAUSDT", strategy_tag="RSI_Reversal")
     assert len(remaining_views) == 1
     assert remaining_views[0].quantity == 10
+
+
+@pytest.mark.asyncio
+async def test_close_position_queues_live_exit_submission_without_direct_place_call() -> None:
+    position_manager = PositionManager()
+    position_manager.open_position(
+        symbol="CRYPTO:ADAUSDT",
+        quantity=10,
+        side=PositionSide.LONG,
+        price=1.0,
+        strategy_tag="EMA_Crossover",
+    )
+
+    order_manager = MagicMock()
+    submitter = MagicMock(spec=OrderSubmitter)
+    submitter.submit = AsyncMock(return_value=True)
+    submitter.snapshot.return_value = {}
+
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+
+    agent = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=order_manager,
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+        order_submitter=submitter,
+    )
+
+    await agent._close_position(
+        symbol="CRYPTO:ADAUSDT",
+        short_name="ADAUSDT",
+        current_price=1.2,
+        reason="target",
+        plan=None,
+    )
+
+    order_manager.place_order.assert_not_called()
+    submitter.submit.assert_awaited_once()
+    assert len(agent._pending_live_exit_submissions) == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_entry_submit_result_promotes_submission_to_pending_live_entry() -> None:
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+    order_manager = OrderManager(paper_mode=False)
+
+    order = Order(
+        symbol="NSE:NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        tag="EMA_Crossover",
+    )
+    order.order_id = "LIVE-ACK-1"
+    order.status = OrderStatus.PLACED
+    order_manager._orders[order.order_id] = order
+
+    agent = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=order_manager,
+        position_manager=PositionManager(),
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent._pending_live_entry_submissions["sub-1"] = PendingLiveEntrySubmission(
+        submission_id="sub-1",
+        symbol="NSE:NIFTY26MAR22500CE",
+        underlying_symbol="NSE:NIFTY50-INDEX",
+        short_name="NIFTY",
+        execution_short_name="NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        strategy="EMA_Crossover",
+        market="NSE",
+        execution_timeframe="5",
+        entry_price_hint=100.0,
+        stop_loss=95.0,
+        target=110.0,
+        signal_id="sig-1",
+        option_contract=None,
+    )
+
+    await agent._handle_order_submit_result(
+        {
+            "type": "order_submission_result",
+            "submission_id": "sub-1",
+            "success": True,
+            "message": "ok",
+            "order_id": "LIVE-ACK-1",
+            "status": OrderStatus.PLACED.value,
+            "symbol": "NSE:NIFTY26MAR22500CE",
+            "order_snapshot": {
+                "symbol": "NSE:NIFTY26MAR22500CE",
+                "quantity": 10,
+                "side": "BUY",
+                "order_type": "MARKET",
+                "product_type": "INTRADAY",
+                "tag": "EMA_Crossover",
+                "order_id": "LIVE-ACK-1",
+                "status": OrderStatus.PLACED.value,
+                "fill_price": None,
+                "fill_quantity": 0,
+                "rejection_reason": None,
+                "limit_price": None,
+                "stop_price": None,
+                "market_price_hint": 100.0,
+                "placed_at": None,
+                "filled_at": None,
+            },
+        }
+    )
+
+    assert "sub-1" not in agent._pending_live_entry_submissions
+    assert "LIVE-ACK-1" in agent._pending_live_entries
+
+
+@pytest.mark.asyncio
+async def test_live_entry_position_opens_only_after_broker_fill() -> None:
+    position_manager = PositionManager()
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+
+    agent = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent._pending_live_entries["LIVE-1"] = PendingLiveEntryOrder(
+        order_id="LIVE-1",
+        symbol="NSE:NIFTY26MAR22500CE",
+        underlying_symbol="NSE:NIFTY50-INDEX",
+        short_name="NIFTY",
+        execution_short_name="NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        strategy="EMA_Crossover",
+        market="NSE",
+        execution_timeframe="5",
+        entry_price_hint=100.0,
+        stop_loss=95.0,
+        target=110.0,
+        signal_id="sig-1",
+        option_contract=OptionContract(
+            underlying_symbol="NSE:NIFTY50-INDEX",
+            option_symbol="NSE:NIFTY26MAR22500CE",
+            option_type="CE",
+            strike=22500.0,
+            expiry="2026-03-26",
+            ltp=100.0,
+            lot_size=25,
+        ),
+    )
+
+    first_order = Order(
+        symbol="NSE:NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        order_id="LIVE-1",
+        status=OrderStatus.PARTIALLY_FILLED,
+        fill_price=100.0,
+        fill_quantity=4,
+        tag="EMA_Crossover",
+    )
+    await agent._apply_broker_reconciliation(
+        event_kind="trade",
+        result=BrokerOrderUpdateResult(
+            updated=True,
+            order=first_order,
+            message="partial fill",
+            fill_delta_quantity=4,
+            fill_delta_price=100.0,
+            status_changed=True,
+        ),
+    )
+
+    partial_position = position_manager.get_position("NSE:NIFTY26MAR22500CE")
+    assert partial_position is not None
+    assert partial_position.quantity == 4
+    assert "LIVE-1" in agent._pending_live_entries
+    assert agent._symbol_exit_plans("NSE:NIFTY26MAR22500CE")[0].quantity == 4
+
+    second_order = Order(
+        symbol="NSE:NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        order_id="LIVE-1",
+        status=OrderStatus.FILLED,
+        fill_price=101.0,
+        fill_quantity=10,
+        tag="EMA_Crossover",
+    )
+    await agent._apply_broker_reconciliation(
+        event_kind="trade",
+        result=BrokerOrderUpdateResult(
+            updated=True,
+            order=second_order,
+            message="filled",
+            fill_delta_quantity=6,
+            fill_delta_price=101.0,
+            status_changed=True,
+        ),
+    )
+
+    final_position = position_manager.get_position("NSE:NIFTY26MAR22500CE")
+    assert final_position is not None
+    assert final_position.quantity == 10
+    assert "LIVE-1" not in agent._pending_live_entries
+    assert agent._symbol_exit_plans("NSE:NIFTY26MAR22500CE")[0].quantity == 10
+
+
+@pytest.mark.asyncio
+async def test_recover_live_broker_state_rehydrates_pending_entry_and_position(tmp_path) -> None:
+    order_manager = OrderManager(paper_mode=False, state_path=tmp_path / "orders.json")
+    position_manager = PositionManager(state_path=tmp_path / "positions.json")
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+
+    fyers_client = MagicMock()
+    fyers_client.is_authenticated = True
+    fyers_client.get_orders.return_value = {
+        "orderBook": [
+            {
+                "id": "LIVE-RECOVERY-1",
+                "symbol": "NSE:NIFTY26MAR22500CE",
+                "qty": 10,
+                "filledQty": 4,
+                "remainingQuantity": 6,
+                "tradedPrice": 100.0,
+                "status": 4,
+                "side": 1,
+                "type": 1,
+                "productType": "INTRADAY",
+                "orderTag": "EMA_Crossover",
+            }
+        ]
+    }
+    fyers_client.get_tradebook.return_value = {
+        "tradeBook": [
+            {
+                "orderNumber": "LIVE-RECOVERY-1",
+                "tradeNumber": "TRD-RECOVERY-1",
+                "symbol": "NSE:NIFTY26MAR22500CE",
+                "tradedQty": 4,
+                "tradePrice": 100.0,
+                "side": 1,
+                "orderType": 1,
+                "productType": "INTRADAY",
+                "orderTag": "EMA_Crossover",
+                "orderDateTime": "2026-03-14T09:20:00+05:30",
+            }
+        ]
+    }
+    fyers_client.get_positions.return_value = {
+        "netPositions": [
+            {
+                "symbol": "NSE:NIFTY26MAR22500CE",
+                "netQty": 4,
+                "side": 1,
+                "netAvg": 100.0,
+            }
+        ]
+    }
+
+    agent = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=order_manager,
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=fyers_client,
+    )
+    agent._runtime_state_path = tmp_path / "agent_live_state.json"
+    agent._pending_live_entries["LIVE-RECOVERY-1"] = PendingLiveEntryOrder(
+        order_id="LIVE-RECOVERY-1",
+        symbol="NSE:NIFTY26MAR22500CE",
+        underlying_symbol="NSE:NIFTY50-INDEX",
+        short_name="NIFTY",
+        execution_short_name="NSE:NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        strategy="EMA_Crossover",
+        market="NSE",
+        execution_timeframe="5",
+        entry_price_hint=100.0,
+        stop_loss=95.0,
+        target=110.0,
+        signal_id="sig-recovery",
+        option_contract=OptionContract(
+            underlying_symbol="NSE:NIFTY50-INDEX",
+            option_symbol="NSE:NIFTY26MAR22500CE",
+            option_type="CE",
+            strike=22500.0,
+            expiry="2026-03-26",
+            ltp=100.0,
+            lot_size=25,
+        ),
+    )
+    agent._persist_live_runtime_state()
+
+    restarted = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=OrderManager(paper_mode=False, state_path=tmp_path / "orders.json"),
+        position_manager=PositionManager(state_path=tmp_path / "positions.json"),
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=fyers_client,
+    )
+    restarted._runtime_state_path = tmp_path / "agent_live_state.json"
+    restarted._load_live_runtime_state()
+
+    await restarted._recover_live_broker_state()
+
+    recovered_position = restarted.position_manager.get_position("NSE:NIFTY26MAR22500CE")
+    assert recovered_position is not None
+    assert recovered_position.quantity == 4
+    assert "LIVE-RECOVERY-1" in restarted._pending_live_entries
+    assert restarted._symbol_exit_plans("NSE:NIFTY26MAR22500CE")[0].quantity == 4

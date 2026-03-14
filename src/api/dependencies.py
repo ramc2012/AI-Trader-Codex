@@ -23,6 +23,9 @@ from src.monitoring.health import ComponentHealth, HealthMonitor, HealthStatus
 from src.risk.risk_calculator import RiskCalculator
 from src.risk.risk_manager import RiskConfig, RiskManager
 from src.config.settings import get_settings
+from src.streaming.execution_event_publisher import ExecutionEventPublisher
+from src.streaming.transport_analytics_consumer import TransportAnalyticsConsumer
+from src.streaming.transport_mirror import TransportMirror
 from src.watchlist.instrument_registry_service import InstrumentRegistryService
 
 
@@ -64,6 +67,9 @@ _trading_agent: Optional[TradingAgent] = None
 _telegram_notifier: Optional[TelegramNotifier] = None
 _tick_aggregator: Optional[RealTimeAggregator] = None
 _fractal_scan_notifier: Optional[FractalScanNotifier] = None
+_execution_event_publisher: Optional[ExecutionEventPublisher] = None
+_transport_analytics_consumer: Optional[TransportAnalyticsConsumer] = None
+_transport_mirror: Optional[TransportMirror] = None
 
 
 def _agent_total_capital_inr(config: AgentConfig) -> float:
@@ -104,6 +110,14 @@ def _agent_config_from_settings() -> AgentConfig:
         trade_us_when_open=settings.agent_trade_us_when_open,
         trade_us_options=settings.agent_trade_us_options,
         trade_crypto_24x7=settings.agent_trade_crypto_24x7,
+        event_driven_execution_enabled=settings.agent_event_driven_enabled,
+        event_driven_markets=[
+            market.strip().upper()
+            for market in settings.agent_event_driven_markets.split(",")
+            if market.strip()
+        ],
+        event_driven_debounce_ms=settings.agent_event_driven_debounce_ms,
+        event_driven_batch_size=settings.agent_event_driven_batch_size,
         capital=_agent_total_capital_inr(
             AgentConfig(
                 india_capital=settings.agent_india_capital,
@@ -330,6 +344,9 @@ def get_trading_agent(config: Optional[AgentConfig] = None) -> TradingAgent:
             risk_manager=get_risk_manager(),
             event_bus=get_agent_event_bus(),
             fyers_client=get_fyers_client(),
+            tick_broker=get_runtime_manager().broker,
+            candle_broker=get_runtime_manager().candle_broker,
+            order_event_broker=get_runtime_manager().order_broker,
         )
     return _trading_agent
 
@@ -372,6 +389,37 @@ def get_telegram_notifier() -> TelegramNotifier:
     return _telegram_notifier
 
 
+def get_execution_event_publisher() -> ExecutionEventPublisher:
+    """Get or create the singleton execution-event publisher."""
+    global _execution_event_publisher
+    if _execution_event_publisher is None:
+        runtime = get_runtime_manager()
+        _execution_event_publisher = ExecutionEventPublisher(
+            settings=get_settings(),
+            agent_event_bus=get_agent_event_bus(),
+            broker_event_broker=runtime.order_broker,
+            tick_broker=runtime.broker,
+            candle_broker=runtime.candle_broker,
+        )
+    return _execution_event_publisher
+
+
+def get_transport_analytics_consumer() -> TransportAnalyticsConsumer:
+    """Get or create the singleton transport analytics consumer."""
+    global _transport_analytics_consumer
+    if _transport_analytics_consumer is None:
+        _transport_analytics_consumer = TransportAnalyticsConsumer(settings=get_settings())
+    return _transport_analytics_consumer
+
+
+def get_transport_mirror() -> TransportMirror:
+    """Get or create the singleton NATS-to-Kafka transport mirror."""
+    global _transport_mirror
+    if _transport_mirror is None:
+        _transport_mirror = TransportMirror(settings=get_settings())
+    return _transport_mirror
+
+
 def get_fractal_scan_notifier() -> FractalScanNotifier:
     """Get or create the singleton fractal scan notifier."""
     global _fractal_scan_notifier
@@ -393,9 +441,15 @@ def reset_fyers_client() -> None:
     global _fyers_client
     global _instrument_registry
     global _runtime_manager
+    global _execution_event_publisher
+    global _transport_analytics_consumer
+    global _transport_mirror
     _fyers_client = None
     _instrument_registry = None
     _runtime_manager = None
+    _execution_event_publisher = None
+    _transport_analytics_consumer = None
+    _transport_mirror = None
 
 
 def reset_managers() -> None:
@@ -403,6 +457,7 @@ def reset_managers() -> None:
     global _order_manager, _position_manager, _strategy_executor
     global _risk_manager, _risk_calculator, _health_monitor, _alert_manager
     global _fyers_client, _agent_event_bus, _trading_agent, _telegram_notifier, _fractal_scan_notifier
+    global _execution_event_publisher, _transport_analytics_consumer, _transport_mirror
 
     _order_manager = None
     _position_manager = None
@@ -418,3 +473,6 @@ def reset_managers() -> None:
     _trading_agent = None
     _telegram_notifier = None
     _fractal_scan_notifier = None
+    _execution_event_publisher = None
+    _transport_analytics_consumer = None
+    _transport_mirror = None

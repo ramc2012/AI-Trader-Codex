@@ -135,6 +135,10 @@ class Settings(BaseSettings):
     agent_default_timeframe: str = "5"
     agent_execution_timeframes: str = "3,5,15"
     agent_reference_timeframes: str = "60,D"
+    agent_event_driven_enabled: bool = False
+    agent_event_driven_markets: str = "NSE"
+    agent_event_driven_debounce_ms: int = Field(default=1000, ge=100, le=5000)
+    agent_event_driven_batch_size: int = Field(default=8, ge=1, le=50)
     agent_default_symbols: str = to_csv(DEFAULT_AGENT_NSE_SYMBOLS)
     agent_us_symbols: str = to_csv(DEFAULT_AGENT_US_SYMBOLS)
     agent_crypto_symbols: str = to_csv(DEFAULT_AGENT_CRYPTO_SYMBOLS)
@@ -162,6 +166,46 @@ class Settings(BaseSettings):
     agent_reinforcement_enabled: bool = True
     agent_reinforcement_alpha: float = Field(default=0.2, ge=0.01, le=1.0)
     agent_reinforcement_size_boost_pct: float = Field(default=60.0, ge=0.0, le=300.0)
+
+    # --- Execution Architecture ---
+    execution_core_backend: str = "python"
+    execution_core_status_url: str = "http://localhost:8081"
+    execution_transport: str = "inmemory"
+    transport_mirror_enabled: bool = False
+    transport_mirror_embedded_enabled: bool = True
+    agent_latency_metrics_enabled: bool = True
+    agent_latency_metrics_window: int = Field(default=256, ge=32, le=4096)
+    event_direct_analytics_write_enabled: bool = True
+    analytics_consumer_enabled: bool = False
+    analytics_consumer_embedded_enabled: bool = True
+    analytics_consumer_source: str = "kafka"
+    analytics_consumer_group_id: str = "ai_trader_analytics"
+
+    # --- NATS / JetStream ---
+    nats_enabled: bool = False
+    nats_url: str = "nats://localhost:4222"
+    nats_stream_prefix: str = "ai_trader"
+
+    # --- Kafka ---
+    kafka_enabled: bool = False
+    kafka_bootstrap_servers: str = "localhost:9092"
+    kafka_topic_prefix: str = "ai_trader"
+
+    # --- ClickHouse ---
+    clickhouse_enabled: bool = False
+    clickhouse_host: str = "localhost"
+    clickhouse_http_port: int = 8123
+    clickhouse_native_port: int = 9000
+    clickhouse_database: str = "ai_trader"
+    clickhouse_user: str = "default"
+    clickhouse_password: str = ""
+
+    # --- QuestDB ---
+    questdb_enabled: bool = False
+    questdb_host: str = "localhost"
+    questdb_http_port: int = 9001
+    questdb_pg_port: int = 8812
+    questdb_ilp_port: int = 9009
 
     @property
     def data_path(self) -> Path:
@@ -209,6 +253,14 @@ class Settings(BaseSettings):
         if self.redis_password:
             return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
         return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
+
+    @property
+    def clickhouse_http_url(self) -> str:
+        return f"http://{self.clickhouse_host}:{self.clickhouse_http_port}"
+
+    @property
+    def questdb_http_url(self) -> str:
+        return f"http://{self.questdb_host}:{self.questdb_http_port}"
 
     @property
     def is_production(self) -> bool:

@@ -98,9 +98,8 @@ class OHLCCache:
             for c in new_candles:
                 ts: str = c["timestamp"]
                 if ts in tail_ts:
-                    for i, e in enumerate(
-                        existing[-50:], start=len(existing) - 50
-                    ):
+                    start_index = max(len(existing) - 50, 0)
+                    for i, e in enumerate(existing[start_index:], start=start_index):
                         if e["timestamp"] == ts:
                             existing[i] = c
                             break

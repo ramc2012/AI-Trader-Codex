@@ -8,14 +8,18 @@ at every decision point for the live UI and Telegram.
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
+import json
 import math
+from numbers import Real
+import os
 from pathlib import Path
 import re
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,7 +43,16 @@ from src.config.market_hours import (
 )
 from src.config.fno_constants import get_instrument as get_fno_instrument, get_lot_size
 from src.config.settings import get_settings
-from src.execution.order_manager import Order, OrderManager, OrderSide, OrderStatus, OrderType, ProductType
+from src.execution.order_manager import (
+    BrokerOrderUpdateResult,
+    Order,
+    OrderManager,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    ProductType,
+)
+from src.execution.order_submitter import OrderSubmitter
 from src.execution.position_manager import PositionManager, PositionSide
 from src.execution.strategy_executor import StrategyExecutor
 from src.integrations.fyers_client import FyersClient
@@ -55,6 +68,7 @@ from src.strategies.directional.ml_ensemble import MLEnsembleStrategy
 from src.strategies.directional.rsi_reversal import RSIReversalStrategy
 from src.ml.online.learning_engine import OnlineLearningEngine
 from src.ml.online.strategy_performance_tracker import StrategyPerformanceTracker
+from src.monitoring.latency import ExecutionLatencyTracker
 from src.strategies.directional.supertrend_strategy import SupertrendStrategy
 from src.utils.logger import get_logger
 from src.utils.market_symbols import parse_currency_context
@@ -130,6 +144,10 @@ class AgentConfig:
     timeframe: str = "5"
     execution_timeframes: List[str] = field(default_factory=lambda: ["3", "5", "15"])
     reference_timeframes: List[str] = field(default_factory=lambda: ["60", "D"])
+    event_driven_execution_enabled: bool = False
+    event_driven_markets: List[str] = field(default_factory=lambda: ["NSE"])
+    event_driven_debounce_ms: int = 1000
+    event_driven_batch_size: int = 8
     liberal_bootstrap_enabled: bool = True
     bootstrap_cycles: int = 300
     bootstrap_size_multiplier: float = 2.0
@@ -177,6 +195,79 @@ class OptionExitPlan:
     signal_id: str = ""
 
 
+@dataclass
+class PendingLiveEntryOrder:
+    """Locally tracked live entry order awaiting broker fills."""
+
+    order_id: str
+    symbol: str
+    underlying_symbol: str
+    short_name: str
+    execution_short_name: str
+    quantity: int
+    side: OrderSide
+    strategy: str
+    market: str
+    execution_timeframe: str
+    entry_price_hint: float
+    stop_loss: float
+    target: float
+    signal_id: str
+    option_contract: Optional[OptionContract] = None
+    trade_counted: bool = False
+
+
+@dataclass
+class PendingLiveEntrySubmission:
+    """Queued live entry awaiting broker acknowledgement."""
+
+    submission_id: str
+    symbol: str
+    underlying_symbol: str
+    short_name: str
+    execution_short_name: str
+    quantity: int
+    side: OrderSide
+    strategy: str
+    market: str
+    execution_timeframe: str
+    entry_price_hint: float
+    stop_loss: float
+    target: float
+    signal_id: str
+    option_contract: Optional[OptionContract] = None
+
+
+@dataclass
+class PendingLiveExitOrder:
+    """Locally tracked live exit order awaiting broker fills."""
+
+    order_id: str
+    symbol: str
+    short_name: str
+    quantity: int
+    reason: str
+    avg_price: float
+    entry_value: float
+    exit_price_hint: float
+    plan: Optional[OptionExitPlan] = None
+
+
+@dataclass
+class PendingLiveExitSubmission:
+    """Queued live exit awaiting broker acknowledgement."""
+
+    submission_id: str
+    symbol: str
+    short_name: str
+    quantity: int
+    reason: str
+    avg_price: float
+    entry_value: float
+    exit_price_hint: float
+    plan: Optional[OptionExitPlan] = None
+
+
 class TradingAgent:
     """Autonomous trading agent that runs strategies and executes trades.
 
@@ -194,6 +285,10 @@ class TradingAgent:
         risk_manager: RiskManager,
         event_bus: AgentEventBus,
         fyers_client: FyersClient,
+        tick_broker: Any | None = None,
+        candle_broker: Any | None = None,
+        order_event_broker: Any | None = None,
+        order_submitter: OrderSubmitter | None = None,
     ) -> None:
         self.config = config
         self.executor = strategy_executor
@@ -202,6 +297,16 @@ class TradingAgent:
         self.risk_manager = risk_manager
         self.event_bus = event_bus
         self.fyers_client = fyers_client
+        self._tick_broker = tick_broker
+        self._candle_broker = candle_broker
+        self._order_event_broker = order_event_broker
+        self._order_submitter = order_submitter or OrderSubmitter(order_manager)
+        runtime_settings = get_settings()
+        self._runtime_state_path: Path | None = (
+            None
+            if os.environ.get("PYTEST_CURRENT_TEST")
+            else runtime_settings.data_path / "trading_agent_live_runtime.json"
+        )
         self.position_sizer = PositionSizer(capital=config.capital)
         self.options_service = OptionsDataService(fyers_client)
         self._spot_to_index_name = {item.spot_symbol: name for name, item in INDEX_INSTRUMENTS.items()}
@@ -226,6 +331,26 @@ class TradingAgent:
         self._market_signal_counts: Dict[str, int] = {}
         self._market_trade_counts: Dict[str, int] = {}
         self._strategy_param_overrides: Dict[str, Dict[str, Any]] = {}
+        self._latency_tracker = ExecutionLatencyTracker(
+            enabled=runtime_settings.agent_latency_metrics_enabled,
+            max_samples=runtime_settings.agent_latency_metrics_window,
+        )
+        self._runtime_settings = runtime_settings
+        self._execution_core_backend = str(runtime_settings.execution_core_backend or "python").strip().lower()
+        self._execution_core_signal_subject = f"{runtime_settings.nats_stream_prefix}.execution.signals"
+        self._execution_core_signal_task: Optional[asyncio.Task[None]] = None
+        self._execution_core_signal_stats: Dict[str, Any] = {}
+        self._execution_core_seen_signal_ids: deque[str] = deque(maxlen=1024)
+        self._execution_core_seen_signal_lookup: set[str] = set()
+        self._event_driven_task: Optional[asyncio.Task[None]] = None
+        self._event_driven_exit_task: Optional[asyncio.Task[None]] = None
+        self._order_event_task: Optional[asyncio.Task[None]] = None
+        self._order_submit_task: Optional[asyncio.Task[None]] = None
+        self._symbol_scan_locks: Dict[str, asyncio.Lock] = {}
+        self._pending_live_entries: Dict[str, PendingLiveEntryOrder] = {}
+        self._pending_live_exits: Dict[str, PendingLiveExitOrder] = {}
+        self._pending_live_entry_submissions: Dict[str, PendingLiveEntrySubmission] = {}
+        self._pending_live_exit_submissions: Dict[str, PendingLiveExitSubmission] = {}
 
         self.state = AgentState.IDLE
         self._task: Optional[asyncio.Task[None]] = None
@@ -245,6 +370,7 @@ class TradingAgent:
         self._warmed_symbols: set[str] = set()
         self._stale_data_keys: set[Tuple[str, str]] = set()
         self._circuit_breaker_notified = False
+        self._reset_execution_core_signal_state()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -274,10 +400,20 @@ class TradingAgent:
         self._us_daily_cache.clear()
         self._stale_data_keys.clear()
         self._circuit_breaker_notified = False
+        self._reset_execution_core_signal_state()
         self._strategy_signal_counts.clear()
         self._strategy_trade_counts.clear()
         self._market_signal_counts.clear()
         self._market_trade_counts.clear()
+        self._pending_live_entries.clear()
+        self._pending_live_exits.clear()
+        self._pending_live_entry_submissions.clear()
+        self._pending_live_exit_submissions.clear()
+
+        self.order_manager.paper_mode = self.config.paper_mode
+        self.executor.paper_mode = self.config.paper_mode
+        self.order_manager.set_client(self.fyers_client)
+        self._load_live_runtime_state()
 
         # Register strategies
         self._register_strategies()
@@ -314,7 +450,22 @@ class TradingAgent:
 
         try:
             await self._init_online_learning()
+            if self._execution_core_backend == "rust" and not self._runtime_settings.nats_enabled:
+                raise RuntimeError("execution_core_backend=rust requires NATS_ENABLED=true")
+            if not self.config.paper_mode:
+                await self._recover_live_broker_state()
+                await self._order_submitter.start()
             self._task = asyncio.create_task(self._main_loop())
+            if self._candle_broker is not None and self.config.event_driven_execution_enabled:
+                self._event_driven_task = asyncio.create_task(self._event_driven_loop())
+            if self._tick_broker is not None and self.config.event_driven_execution_enabled:
+                self._event_driven_exit_task = asyncio.create_task(self._event_driven_exit_loop())
+            if self._order_event_broker is not None and not self.config.paper_mode:
+                self._order_event_task = asyncio.create_task(self._order_event_loop())
+            if not self.config.paper_mode:
+                self._order_submit_task = asyncio.create_task(self._order_submit_result_loop())
+            if self._execution_core_signal_lane_enabled():
+                self._execution_core_signal_task = asyncio.create_task(self._execution_core_signal_loop())
             logger.info("trading_agent_started", config=self.config.__dict__)
         except Exception as exc:
             self.state = AgentState.ERROR
@@ -342,9 +493,47 @@ class TradingAgent:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        if self._event_driven_task and not self._event_driven_task.done():
+            self._event_driven_task.cancel()
+            try:
+                await self._event_driven_task
+            except asyncio.CancelledError:
+                pass
+        self._event_driven_task = None
+        if self._event_driven_exit_task and not self._event_driven_exit_task.done():
+            self._event_driven_exit_task.cancel()
+            try:
+                await self._event_driven_exit_task
+            except asyncio.CancelledError:
+                pass
+        self._event_driven_exit_task = None
+        if self._order_event_task and not self._order_event_task.done():
+            self._order_event_task.cancel()
+            try:
+                await self._order_event_task
+            except asyncio.CancelledError:
+                pass
+        self._order_event_task = None
+        if self._order_submit_task and not self._order_submit_task.done():
+            self._order_submit_task.cancel()
+            try:
+                await self._order_submit_task
+            except asyncio.CancelledError:
+                pass
+        self._order_submit_task = None
+        if self._execution_core_signal_task and not self._execution_core_signal_task.done():
+            self._execution_core_signal_task.cancel()
+            try:
+                await self._execution_core_signal_task
+            except asyncio.CancelledError:
+                pass
+        self._execution_core_signal_task = None
+        if self._order_submitter is not None:
+            await self._order_submitter.stop()
 
         self.executor.stop()
         self._strategy_perf_tracker._persist_state()
+        self._persist_live_runtime_state()
 
         await self.event_bus.emit(AgentEvent(
             event_type=AgentEventType.AGENT_STOPPED,
@@ -354,6 +543,1274 @@ class TradingAgent:
             metadata={"cycles": self._cycle_count, "trades": self._total_trades, "pnl": self._daily_pnl},
         ))
         logger.info("trading_agent_stopped")
+
+    def _scan_lock(self, symbol: str) -> asyncio.Lock:
+        lock = self._symbol_scan_locks.get(symbol)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._symbol_scan_locks[symbol] = lock
+        return lock
+
+    def _event_driven_market_enabled(self, market: str) -> bool:
+        if not self.config.event_driven_execution_enabled:
+            return False
+        configured = {str(token or "").strip().upper() for token in self.config.event_driven_markets}
+        return str(market or "").strip().upper() in configured
+
+    def _execution_core_signal_lane_enabled(self) -> bool:
+        return self._execution_core_backend == "rust" and bool(self._runtime_settings.nats_enabled)
+
+    def _execution_core_market_enabled(self, market: str) -> bool:
+        if not self._execution_core_signal_lane_enabled():
+            return False
+        configured = {str(token or "").strip().upper() for token in self.config.event_driven_markets}
+        return str(market or "").strip().upper() in configured
+
+    def _should_use_execution_core_signal_lane(self, symbol: str) -> bool:
+        token = str(symbol or "").strip()
+        if not token:
+            return False
+        market = self._symbol_market(token)
+        if not self._execution_core_market_enabled(market):
+            return False
+        now = datetime.now(tz=IST)
+        if market == "NSE":
+            return token in self.config.symbols and self.config.trade_nse_when_open and is_market_open(now)
+        if market == "US":
+            return token in self.config.us_symbols and self.config.trade_us_when_open and is_us_market_open(now)
+        if market == "CRYPTO":
+            return token in self.config.crypto_symbols and bool(self.config.trade_crypto_24x7)
+        return False
+
+    def _is_event_driven_symbol_eligible(self, symbol: str) -> bool:
+        token = str(symbol or "").strip()
+        if not token or self.state != AgentState.RUNNING:
+            return False
+        if self._should_use_execution_core_signal_lane(token):
+            return False
+        market = self._symbol_market(token)
+        if not self._event_driven_market_enabled(market):
+            return False
+        if token not in self._warmed_symbols:
+            return False
+        if self._candle_broker is None or self._candle_broker.latest(token) is None:
+            return False
+
+        now = datetime.now(tz=IST)
+        if market == "NSE":
+            return token in self.config.symbols and is_market_open(now)
+        if market == "US":
+            return token in self.config.us_symbols and is_us_market_open(now)
+        if market == "CRYPTO":
+            return token in self.config.crypto_symbols and bool(self.config.trade_crypto_24x7)
+        return False
+
+    def _is_event_driven_exit_symbol_eligible(self, symbol: str) -> bool:
+        token = str(symbol or "").strip()
+        if not token or self.state != AgentState.RUNNING:
+            return False
+        if not self._event_driven_market_enabled(self._symbol_market(token)):
+            return False
+        if self.position_manager.get_position(token) is None:
+            return False
+        if self._symbol_has_pending_live_order(token):
+            return False
+        return self._latest_stream_price(token) is not None
+
+    def _reset_execution_core_signal_state(self) -> None:
+        self._execution_core_seen_signal_ids.clear()
+        self._execution_core_seen_signal_lookup.clear()
+        self._execution_core_signal_stats = {
+            "enabled": self._execution_core_signal_lane_enabled(),
+            "backend": self._execution_core_backend,
+            "subject": self._execution_core_signal_subject,
+            "consumed": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "errors": 0,
+            "running": False,
+            "last_signal_id": None,
+            "last_signal_time": None,
+            "last_symbol": None,
+        }
+
+    def _execution_core_signal_lane_snapshot(self) -> Dict[str, Any]:
+        return dict(self._execution_core_signal_stats)
+
+    def _remember_execution_core_signal_id(self, event_id: str) -> bool:
+        token = str(event_id or "").strip()
+        if not token:
+            return False
+        if token in self._execution_core_seen_signal_lookup:
+            return False
+        if self._execution_core_seen_signal_ids.maxlen and len(self._execution_core_seen_signal_ids) >= self._execution_core_seen_signal_ids.maxlen:
+            oldest = self._execution_core_seen_signal_ids.popleft()
+            self._execution_core_seen_signal_lookup.discard(oldest)
+        self._execution_core_seen_signal_ids.append(token)
+        self._execution_core_seen_signal_lookup.add(token)
+        return True
+
+    def _execution_core_signal_strength(self, payload: Dict[str, Any], price: float) -> SignalStrength:
+        inner = payload.get("payload")
+        details = inner if isinstance(inner, dict) else {}
+        confidence = self._safe_float(payload.get("confidence"))
+        if confidence is not None:
+            if confidence >= 80.0:
+                return SignalStrength.STRONG
+            if confidence >= 60.0:
+                return SignalStrength.MODERATE
+            return SignalStrength.WEAK
+        ema_fast = self._safe_float(details.get("ema_fast"))
+        ema_slow = self._safe_float(details.get("ema_slow"))
+        if ema_fast is None or ema_slow is None or price <= 0:
+            return SignalStrength.MODERATE
+        gap_pct = abs(ema_fast - ema_slow) / max(abs(price), 1e-6)
+        if gap_pct >= 0.003:
+            return SignalStrength.STRONG
+        if gap_pct >= 0.001:
+            return SignalStrength.MODERATE
+        return SignalStrength.WEAK
+
+    def _build_execution_core_signal(self, payload: Dict[str, Any]) -> tuple[Signal, str, str] | None:
+        symbol = str(payload.get("symbol") or "").strip()
+        if not symbol or not self._should_use_execution_core_signal_lane(symbol):
+            return None
+
+        signal_type_token = str(payload.get("signal_type") or "").strip().upper()
+        try:
+            signal_type = SignalType[signal_type_token]
+        except KeyError:
+            return None
+        price = self._safe_float(payload.get("price"), fallback=self._safe_float(payload.get("close")))
+        if price is None or price <= 0:
+            return None
+
+        timestamp = self._coerce_ist_timestamp(payload.get("event_time")) or datetime.now(tz=IST)
+        timeframe = str(payload.get("timeframe") or self.config.timeframe).strip().upper() or self.config.timeframe
+        strategy_name = str(payload.get("strategy") or "Rust_EMA_Crossover").strip() or "Rust_EMA_Crossover"
+        inner = payload.get("payload")
+        signal_metadata = {
+            "market": str(payload.get("market") or self._symbol_market(symbol)).upper(),
+            "execution_backend": self._execution_core_backend,
+            "signal_source": "execution_core",
+            "execution_core_event_id": str(payload.get("event_id") or ""),
+            "execution_core_event_type": str(payload.get("event_type") or ""),
+            "execution_timeframe": timeframe,
+            "execution_core_payload": inner if isinstance(inner, dict) else {},
+        }
+        stop_loss = self._safe_float(payload.get("stop_loss"))
+        target = self._safe_float(payload.get("target"))
+        signal = Signal(
+            timestamp=timestamp,
+            symbol=symbol,
+            signal_type=signal_type,
+            strength=self._execution_core_signal_strength(payload, price),
+            price=float(price),
+            stop_loss=stop_loss,
+            target=target,
+            strategy_name=strategy_name,
+            metadata=signal_metadata,
+        )
+        return signal, strategy_name, timeframe
+
+    async def _handle_execution_core_signal(self, payload: Dict[str, Any]) -> None:
+        self._execution_core_signal_stats["consumed"] += 1
+        if not isinstance(payload, dict):
+            self._execution_core_signal_stats["rejected"] += 1
+            return
+        if str(payload.get("event_type") or "").strip().lower() != "signal_candidate":
+            self._execution_core_signal_stats["rejected"] += 1
+            return
+        event_id = str(payload.get("event_id") or "").strip()
+        if event_id and not self._remember_execution_core_signal_id(event_id):
+            self._execution_core_signal_stats["rejected"] += 1
+            return
+        built = self._build_execution_core_signal(payload)
+        if built is None:
+            self._execution_core_signal_stats["rejected"] += 1
+            return
+
+        signal, strategy_name, timeframe = built
+        symbol_market = self._symbol_market(signal.symbol)
+        short_name = signal.symbol.split(":")[-1].split("-")[0]
+        started = time.perf_counter()
+        self._total_signals += 1
+        self._strategy_signal_counts[strategy_name] = self._strategy_signal_counts.get(strategy_name, 0) + 1
+        self._market_signal_counts[symbol_market] = self._market_signal_counts.get(symbol_market, 0) + 1
+        try:
+            await self._process_signal(
+                signal,
+                strategy_name,
+                short_name,
+                default_symbol=signal.symbol,
+                execution_timeframe=timeframe,
+                df_for_signal=None,
+            )
+        except Exception as exc:
+            self._execution_core_signal_stats["errors"] += 1
+            logger.exception("execution_core_signal_processing_failed", symbol=signal.symbol, error=str(exc))
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.AGENT_ERROR,
+                title="Execution Core Signal Failed",
+                message=f"Failed to process execution-core signal for {short_name}: {exc}",
+                severity="error",
+                metadata={
+                    "symbol": signal.symbol,
+                    "strategy": strategy_name,
+                    "execution_backend": self._execution_core_backend,
+                    "event_id": event_id,
+                },
+            ))
+            return
+        self._execution_core_signal_stats["accepted"] += 1
+        self._execution_core_signal_stats["last_signal_id"] = event_id or None
+        self._execution_core_signal_stats["last_signal_time"] = str(payload.get("event_time") or signal.timestamp.isoformat())
+        self._execution_core_signal_stats["last_symbol"] = signal.symbol
+        self._latency_tracker.record(
+            "execution_core_signal_process_ms",
+            (time.perf_counter() - started) * 1000.0,
+            symbol=signal.symbol,
+            market=symbol_market,
+            strategy=strategy_name,
+        )
+
+    async def _execution_core_signal_loop(self) -> None:
+        try:
+            import nats  # type: ignore[import-not-found]
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("nats-py is required for execution_core_backend=rust") from exc
+
+        client = await nats.connect(self._runtime_settings.nats_url)
+        subscription = await client.subscribe(self._execution_core_signal_subject)
+        self._execution_core_signal_stats["running"] = True
+        logger.info(
+            "execution_core_signal_lane_started",
+            subject=self._execution_core_signal_subject,
+            url=self._runtime_settings.nats_url,
+        )
+        try:
+            while self.state == AgentState.RUNNING:
+                try:
+                    message = await subscription.next_msg(timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    payload = json.loads(message.data.decode("utf-8"))
+                except Exception as exc:
+                    self._execution_core_signal_stats["errors"] += 1
+                    logger.warning("execution_core_signal_decode_failed", error=str(exc))
+                    continue
+                await self._handle_execution_core_signal(payload)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._execution_core_signal_stats["running"] = False
+            try:
+                await subscription.unsubscribe()
+            except Exception:
+                pass
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    async def _event_driven_loop(self) -> None:
+        if self._candle_broker is None:
+            return
+
+        queue = self._candle_broker.subscribe("*")
+        pending: set[str] = set()
+        debounce_seconds = max(float(self.config.event_driven_debounce_ms) / 1000.0, 0.1)
+        batch_size = max(int(self.config.event_driven_batch_size), 1)
+        last_flush = time.monotonic()
+
+        try:
+            while self.state == AgentState.RUNNING:
+                if self.state != AgentState.RUNNING:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                timeout = 5.0
+                if pending:
+                    timeout = max(debounce_seconds - (time.monotonic() - last_flush), 0.05)
+
+                payload: Optional[Dict[str, Any]] = None
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    payload = None
+
+                if payload is not None:
+                    symbol = str(payload.get("symbol", "")).strip()
+                    if self._is_event_driven_symbol_eligible(symbol):
+                        pending.add(symbol)
+
+                should_flush = bool(pending) and (
+                    payload is None
+                    or len(pending) >= batch_size
+                    or (time.monotonic() - last_flush) >= debounce_seconds
+                )
+                if not should_flush:
+                    continue
+
+                symbols = sorted(pending)[:batch_size]
+                pending.difference_update(symbols)
+                last_flush = time.monotonic()
+                for symbol in symbols:
+                    started = time.perf_counter()
+                    await self._scan_symbol(symbol, live_only=True)
+                    self._latency_tracker.record(
+                        "event_driven_symbol_scan_ms",
+                        (time.perf_counter() - started) * 1000.0,
+                        symbol=symbol,
+                    )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._candle_broker.unsubscribe("*", queue)
+
+    async def _event_driven_exit_loop(self) -> None:
+        if self._tick_broker is None:
+            return
+
+        queue = self._tick_broker.subscribe("*")
+        pending_prices: Dict[str, float] = {}
+        debounce_seconds = max(float(self.config.event_driven_debounce_ms) / 1000.0, 0.05)
+        batch_size = max(int(self.config.event_driven_batch_size), 1)
+        last_flush = time.monotonic()
+
+        try:
+            while self.state == AgentState.RUNNING:
+                timeout = 5.0
+                if pending_prices:
+                    timeout = max(debounce_seconds - (time.monotonic() - last_flush), 0.02)
+
+                payload: Optional[Dict[str, Any]] = None
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    payload = None
+
+                if payload is not None:
+                    symbol = str(payload.get("symbol", "")).strip()
+                    try:
+                        latest_price = float(payload.get("ltp") or payload.get("close") or 0.0)
+                    except (TypeError, ValueError):
+                        latest_price = 0.0
+                    if latest_price > 0 and self._is_event_driven_exit_symbol_eligible(symbol):
+                        pending_prices[symbol] = latest_price
+
+                should_flush = bool(pending_prices) and (
+                    payload is None
+                    or len(pending_prices) >= batch_size
+                    or (time.monotonic() - last_flush) >= debounce_seconds
+                )
+                if not should_flush:
+                    continue
+
+                symbols = sorted(pending_prices.keys())[:batch_size]
+                last_flush = time.monotonic()
+                now = datetime.now(tz=IST)
+                eod_buffer_minutes = max(int(self.risk_manager.config.time_based_exit_minutes), 1)
+                for symbol in symbols:
+                    latest_price = pending_prices.pop(symbol, 0.0)
+                    if latest_price <= 0:
+                        continue
+                    started = time.perf_counter()
+                    self._apply_stream_mark_price(symbol, latest_price)
+                    await self._check_position_exit(
+                        symbol,
+                        now=now,
+                        eod_buffer_minutes=eod_buffer_minutes,
+                        emit_position_update=False,
+                    )
+                    self._latency_tracker.record(
+                        "event_driven_exit_check_ms",
+                        (time.perf_counter() - started) * 1000.0,
+                        symbol=symbol,
+                    )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._tick_broker.unsubscribe("*", queue)
+
+    def _symbol_has_pending_live_order(self, symbol: str) -> bool:
+        token = str(symbol or "").strip()
+        if not token:
+            return False
+        return any(context.symbol == token for context in self._pending_live_entries.values()) or any(
+            context.symbol == token for context in self._pending_live_exits.values()
+        ) or any(
+            context.symbol == token for context in self._pending_live_entry_submissions.values()
+        ) or any(
+            context.symbol == token for context in self._pending_live_exit_submissions.values()
+        )
+
+    @staticmethod
+    def _resolved_fill_quantity(value: Any, fallback: int) -> int:
+        if isinstance(value, Real) and not isinstance(value, bool):
+            quantity = int(value)
+        elif isinstance(value, str):
+            try:
+                quantity = int(float(value))
+            except ValueError:
+                quantity = 0
+        else:
+            quantity = 0
+        return quantity if quantity > 0 else int(fallback)
+
+    @staticmethod
+    def _safe_int(value: Any, fallback: int = 0) -> int:
+        try:
+            if value in (None, ""):
+                return int(fallback)
+            return int(float(value))
+        except (TypeError, ValueError):
+            return int(fallback)
+
+    @staticmethod
+    def _safe_float(value: Any, fallback: float | None = None) -> float | None:
+        try:
+            if value in (None, ""):
+                return fallback
+            return float(value)
+        except (TypeError, ValueError):
+            return fallback
+
+    async def _order_event_loop(self) -> None:
+        if self._order_event_broker is None:
+            return
+
+        queue = self._order_event_broker.subscribe("*")
+        try:
+            while self.state == AgentState.RUNNING:
+                payload = await queue.get()
+                await self._handle_broker_execution_event(payload)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._order_event_broker.unsubscribe("*", queue)
+
+    async def _order_submit_result_loop(self) -> None:
+        broker = self._order_submitter.result_broker
+        queue = broker.subscribe("*")
+        try:
+            while self.state == AgentState.RUNNING:
+                payload = await queue.get()
+                await self._handle_order_submit_result(payload)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            broker.unsubscribe("*", queue)
+
+    async def _handle_order_submit_result(self, payload: Dict[str, Any]) -> None:
+        if str(payload.get("type") or "").strip() != "order_submission_result":
+            return
+        submission_id = str(payload.get("submission_id") or "").strip()
+        if not submission_id:
+            return
+        if submission_id in self._pending_live_entry_submissions:
+            await self._handle_entry_submit_result(submission_id, payload)
+            return
+        if submission_id in self._pending_live_exit_submissions:
+            await self._handle_exit_submit_result(submission_id, payload)
+
+    @staticmethod
+    def _order_from_submission_payload(payload: Dict[str, Any]) -> Optional[Order]:
+        snapshot = payload.get("order_snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        try:
+            order = Order(
+                symbol=str(snapshot.get("symbol") or ""),
+                quantity=int(snapshot.get("quantity") or 0),
+                side=OrderSide[str(snapshot.get("side") or "BUY")],
+                order_type=OrderType[str(snapshot.get("order_type") or "MARKET")],
+                product_type=ProductType(str(snapshot.get("product_type") or ProductType.INTRADAY.value)),
+                limit_price=(
+                    float(snapshot["limit_price"])
+                    if snapshot.get("limit_price") not in (None, "")
+                    else None
+                ),
+                stop_price=(
+                    float(snapshot["stop_price"])
+                    if snapshot.get("stop_price") not in (None, "")
+                    else None
+                ),
+                market_price_hint=(
+                    float(snapshot["market_price_hint"])
+                    if snapshot.get("market_price_hint") not in (None, "")
+                    else None
+                ),
+                tag=str(snapshot.get("tag") or ""),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        order.order_id = str(snapshot.get("order_id") or "") or None
+        status_token = str(snapshot.get("status") or "").strip().lower()
+        if status_token:
+            try:
+                order.status = OrderStatus(status_token)
+            except ValueError:
+                pass
+        order.fill_price = TradingAgent._safe_float(snapshot.get("fill_price"))
+        order.fill_quantity = int(snapshot.get("fill_quantity") or 0)
+        order.rejection_reason = str(snapshot.get("rejection_reason") or "") or None
+        placed_at = snapshot.get("placed_at")
+        if placed_at:
+            order.placed_at = datetime.fromisoformat(str(placed_at))
+        filled_at = snapshot.get("filled_at")
+        if filled_at:
+            order.filled_at = datetime.fromisoformat(str(filled_at))
+        return order
+
+    async def _handle_entry_submit_result(self, submission_id: str, payload: Dict[str, Any]) -> None:
+        context = self._pending_live_entry_submissions.pop(submission_id, None)
+        if context is None:
+            return
+        order_id = str(payload.get("order_id") or "").strip()
+        order = self.order_manager.get_order(order_id) if order_id else None
+        if order is None:
+            order = self._order_from_submission_payload(payload)
+        if order is None:
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Order Failed — {context.short_name}",
+                message=str(payload.get("message") or "Order submission failed."),
+                severity="error",
+                metadata={"symbol": context.symbol, "underlying_symbol": context.underlying_symbol},
+            ))
+            return
+
+        if bool(payload.get("success")) and order.status in (
+            OrderStatus.FILLED,
+            OrderStatus.PLACED,
+            OrderStatus.PARTIALLY_FILLED,
+        ):
+            resolved_order_id = str(order.order_id or submission_id)
+            self._pending_live_entries[resolved_order_id] = PendingLiveEntryOrder(
+                order_id=resolved_order_id,
+                symbol=context.symbol,
+                underlying_symbol=context.underlying_symbol,
+                short_name=context.short_name,
+                execution_short_name=context.execution_short_name,
+                quantity=context.quantity,
+                side=context.side,
+                strategy=context.strategy,
+                market=context.market,
+                execution_timeframe=context.execution_timeframe,
+                entry_price_hint=context.entry_price_hint,
+                stop_loss=context.stop_loss,
+                target=context.target,
+                signal_id=context.signal_id,
+                option_contract=context.option_contract,
+            )
+            self._persist_live_runtime_state()
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_PLACED,
+                title=f"Order Submitted — {context.short_name}",
+                message=(
+                    f"{context.side.name} {context.quantity} x {context.execution_short_name}. "
+                    "Waiting for broker fill confirmation."
+                ),
+                severity="success",
+                metadata={
+                    "symbol": context.symbol,
+                    "underlying_symbol": context.underlying_symbol,
+                    "side": context.side.name,
+                    "quantity": context.quantity,
+                    "stop_loss": context.stop_loss,
+                    "target": context.target,
+                    "order_id": resolved_order_id,
+                    "strategy": context.strategy,
+                    "status": order.status.value,
+                    "submission_id": submission_id,
+                },
+            ))
+            if int(order.fill_quantity or 0) > 0:
+                await self._finalize_live_entry_fill(
+                    context=self._pending_live_entries[resolved_order_id],
+                    order=order,
+                    fill_quantity=int(order.fill_quantity),
+                    fill_price=float(order.fill_price or context.entry_price_hint),
+                )
+                if order.status == OrderStatus.FILLED:
+                    self._pending_live_entries.pop(resolved_order_id, None)
+                    self._persist_live_runtime_state()
+            return
+
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_REJECTED,
+            title=f"Order Rejected — {context.short_name}",
+            message=(
+                f"Order was {order.status.value}. Reason: "
+                f"{order.rejection_reason or payload.get('message') or 'unknown'}."
+            ),
+            severity="error",
+            metadata={
+                "symbol": context.symbol,
+                "underlying_symbol": context.underlying_symbol,
+                "status": order.status.value,
+                "reason": order.rejection_reason or payload.get("message") or "unknown",
+                "submission_id": submission_id,
+            },
+        ))
+
+    async def _handle_exit_submit_result(self, submission_id: str, payload: Dict[str, Any]) -> None:
+        context = self._pending_live_exit_submissions.pop(submission_id, None)
+        if context is None:
+            return
+        order_id = str(payload.get("order_id") or "").strip()
+        order = self.order_manager.get_order(order_id) if order_id else None
+        if order is None:
+            order = self._order_from_submission_payload(payload)
+        if order is None:
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Exit Failed — {context.short_name}",
+                message=str(payload.get("message") or "Exit submission failed."),
+                severity="error",
+                metadata={"symbol": context.symbol, "reason": context.reason},
+            ))
+            return
+
+        if bool(payload.get("success")) and order.status in (
+            OrderStatus.FILLED,
+            OrderStatus.PLACED,
+            OrderStatus.PARTIALLY_FILLED,
+        ):
+            resolved_order_id = str(order.order_id or submission_id)
+            self._pending_live_exits[resolved_order_id] = PendingLiveExitOrder(
+                order_id=resolved_order_id,
+                symbol=context.symbol,
+                short_name=context.short_name,
+                quantity=context.quantity,
+                reason=context.reason,
+                avg_price=context.avg_price,
+                entry_value=context.entry_value,
+                exit_price_hint=context.exit_price_hint,
+                plan=context.plan,
+            )
+            self._persist_live_runtime_state()
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_PLACED,
+                title=f"Exit Submitted — {context.short_name}",
+                message=f"{order.side.name} {context.quantity} units submitted. Waiting for broker fill confirmation.",
+                severity="success",
+                metadata={
+                    "symbol": context.symbol,
+                    "underlying_symbol": (context.plan.underlying_symbol if context.plan is not None else context.symbol),
+                    "reason": context.reason,
+                    "quantity": context.quantity,
+                    "order_id": resolved_order_id,
+                    "status": order.status.value,
+                    "submission_id": submission_id,
+                },
+            ))
+            if int(order.fill_quantity or 0) > 0:
+                await self._finalize_live_exit_fill(
+                    context=self._pending_live_exits[resolved_order_id],
+                    order=order,
+                    fill_quantity=int(order.fill_quantity),
+                    fill_price=float(order.fill_price or context.exit_price_hint),
+                )
+                if order.status == OrderStatus.FILLED:
+                    self._pending_live_exits.pop(resolved_order_id, None)
+                    self._persist_live_runtime_state()
+            return
+
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_REJECTED,
+            title=f"Exit Rejected — {context.short_name}",
+            message=(
+                f"Exit {order.status.value}. Reason: "
+                f"{order.rejection_reason or payload.get('message') or 'unknown'}."
+            ),
+            severity="error",
+            metadata={
+                "symbol": context.symbol,
+                "reason": context.reason,
+                "status": order.status.value,
+                "reject_reason": order.rejection_reason or payload.get("message") or "unknown",
+                "submission_id": submission_id,
+            },
+        ))
+
+    async def _queue_live_entry_submission(
+        self,
+        *,
+        order: Order,
+        short_name: str,
+        execution_short_name: str,
+        execution_symbol: str,
+        underlying_symbol: str,
+        quantity: int,
+        side: OrderSide,
+        strat_name: str,
+        execution_market: str,
+        execution_timeframe: str,
+        entry_price: float,
+        sl_price: float,
+        target_price: float,
+        signal_id: str,
+        option_contract: OptionContract | None,
+    ) -> bool:
+        submission_id = f"entry-{uuid.uuid4().hex[:12]}"
+        self._pending_live_entry_submissions[submission_id] = PendingLiveEntrySubmission(
+            submission_id=submission_id,
+            symbol=execution_symbol,
+            underlying_symbol=underlying_symbol,
+            short_name=short_name,
+            execution_short_name=execution_short_name,
+            quantity=quantity,
+            side=side,
+            strategy=strat_name,
+            market=execution_market,
+            execution_timeframe=execution_timeframe,
+            entry_price_hint=entry_price,
+            stop_loss=sl_price,
+            target=target_price,
+            signal_id=signal_id,
+            option_contract=option_contract,
+        )
+        accepted = await self._order_submitter.submit(
+            submission_id=submission_id,
+            order=order,
+            metadata={"kind": "entry", "strategy": strat_name},
+        )
+        if accepted:
+            return True
+        self._pending_live_entry_submissions.pop(submission_id, None)
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_REJECTED,
+            title=f"Order Rejected — {short_name}",
+            message="Live submit queue is full. Order was not sent to broker.",
+            severity="error",
+            metadata={
+                "symbol": execution_symbol,
+                "underlying_symbol": underlying_symbol,
+                "strategy": strat_name,
+                "reason": "submit_queue_full",
+            },
+        ))
+        return False
+
+    async def _queue_live_exit_submission(
+        self,
+        *,
+        order: Order,
+        symbol: str,
+        short_name: str,
+        quantity: int,
+        reason: str,
+        avg_price: float,
+        entry_value: float,
+        current_price: float,
+        plan: OptionExitPlan | None,
+    ) -> bool:
+        submission_id = f"exit-{uuid.uuid4().hex[:12]}"
+        self._pending_live_exit_submissions[submission_id] = PendingLiveExitSubmission(
+            submission_id=submission_id,
+            symbol=symbol,
+            short_name=short_name,
+            quantity=quantity,
+            reason=reason,
+            avg_price=avg_price,
+            entry_value=entry_value,
+            exit_price_hint=current_price,
+            plan=plan,
+        )
+        accepted = await self._order_submitter.submit(
+            submission_id=submission_id,
+            order=order,
+            metadata={"kind": "exit", "reason": reason},
+        )
+        if accepted:
+            return True
+        self._pending_live_exit_submissions.pop(submission_id, None)
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_REJECTED,
+            title=f"Exit Rejected — {short_name}",
+            message="Live submit queue is full. Exit order was not sent to broker.",
+            severity="error",
+            metadata={"symbol": symbol, "reason": reason, "reject_reason": "submit_queue_full"},
+        ))
+        return False
+
+    async def _handle_broker_execution_event(self, payload: Dict[str, Any]) -> None:
+        event_kind = str(payload.get("event_kind") or "").strip().lower()
+        raw_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+
+        if event_kind == "trade":
+            result = self.order_manager.apply_broker_trade_update(raw_payload)
+        elif event_kind == "order":
+            result = self.order_manager.apply_broker_order_update(raw_payload)
+        else:
+            return
+
+        await self._apply_broker_reconciliation(
+            event_kind=event_kind,
+            result=result,
+        )
+
+    async def _apply_broker_reconciliation(
+        self,
+        *,
+        event_kind: str,
+        result: BrokerOrderUpdateResult,
+    ) -> None:
+        order = result.order
+        if order is None or not result.updated:
+            return
+
+        order_id = str(order.order_id or "").strip()
+        if not order_id:
+            return
+
+        if result.fill_delta_quantity > 0 and result.fill_delta_price is not None and result.fill_delta_price > 0:
+            entry_context = self._pending_live_entries.get(order_id)
+            if entry_context is not None:
+                await self._finalize_live_entry_fill(
+                    context=entry_context,
+                    order=order,
+                    fill_quantity=result.fill_delta_quantity,
+                    fill_price=float(result.fill_delta_price),
+                )
+            exit_context = self._pending_live_exits.get(order_id)
+            if exit_context is not None:
+                await self._finalize_live_exit_fill(
+                    context=exit_context,
+                    order=order,
+                    fill_quantity=result.fill_delta_quantity,
+                    fill_price=float(result.fill_delta_price),
+                )
+
+        if order.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.FAILED):
+            entry_context = self._pending_live_entries.pop(order_id, None)
+            if entry_context is not None:
+                reason = order.rejection_reason or result.message or order.status.value
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.ORDER_REJECTED,
+                    title=f"Order {order.status.value.title()} — {entry_context.short_name}",
+                    message=f"Live entry order {order.status.value}. Reason: {reason}.",
+                    severity="error" if order.status != OrderStatus.CANCELLED else "warning",
+                    metadata={
+                        "symbol": entry_context.symbol,
+                        "underlying_symbol": entry_context.underlying_symbol,
+                        "status": order.status.value,
+                        "reason": reason,
+                        "order_id": order_id,
+                        "strategy": entry_context.strategy,
+                    },
+                ))
+
+            exit_context = self._pending_live_exits.pop(order_id, None)
+            if exit_context is not None:
+                reason = order.rejection_reason or result.message or order.status.value
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.ORDER_REJECTED,
+                    title=f"Exit {order.status.value.title()} — {exit_context.short_name}",
+                    message=f"Live exit order {order.status.value}. Reason: {reason}.",
+                    severity="error" if order.status != OrderStatus.CANCELLED else "warning",
+                    metadata={
+                        "symbol": exit_context.symbol,
+                        "underlying_symbol": (exit_context.plan.underlying_symbol if exit_context.plan else exit_context.symbol),
+                        "status": order.status.value,
+                        "reason": reason,
+                        "order_id": order_id,
+                        "strategy": (exit_context.plan.strategy if exit_context.plan else ""),
+                    },
+                ))
+            self._persist_live_runtime_state()
+            return
+
+        if order.status == OrderStatus.FILLED:
+            self._pending_live_entries.pop(order_id, None)
+            self._pending_live_exits.pop(order_id, None)
+            self._persist_live_runtime_state()
+
+    async def _finalize_live_entry_fill(
+        self,
+        *,
+        context: PendingLiveEntryOrder,
+        order: Order,
+        fill_quantity: int,
+        fill_price: float,
+    ) -> None:
+        fill_quantity = max(int(fill_quantity), 0)
+        fill_price = float(fill_price or 0.0)
+        if fill_quantity <= 0 or fill_price <= 0:
+            return
+
+        if not context.trade_counted:
+            self._total_trades += 1
+            self._strategy_trade_counts[context.strategy] = self._strategy_trade_counts.get(context.strategy, 0) + 1
+            self._market_trade_counts[context.market] = self._market_trade_counts.get(context.market, 0) + 1
+            context.trade_counted = True
+
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_FILLED,
+            title=(
+                f"Order {'Filled' if order.status == OrderStatus.FILLED else 'Partially Filled'} "
+                f"— {context.short_name}"
+            ),
+            message=(
+                f"{context.side.name} {fill_quantity} x {context.execution_short_name} @ {fill_price:,.2f}. "
+                f"Order: {order.order_id}."
+            ),
+            severity="success",
+            metadata={
+                "symbol": context.symbol,
+                "underlying_symbol": context.underlying_symbol,
+                "side": context.side.name,
+                "quantity": fill_quantity,
+                "fill_price": fill_price,
+                "order_id": order.order_id,
+                "strategy": context.strategy,
+                "status": order.status.value,
+            },
+        ))
+
+        realized_before = self.position_manager.total_realized_pnl
+        self.position_manager.open_position(
+            symbol=context.symbol,
+            quantity=fill_quantity,
+            side=PositionSide.LONG if context.side == OrderSide.BUY else PositionSide.SHORT,
+            price=fill_price,
+            strategy_tag=context.strategy,
+            order_id=order.order_id or "",
+        )
+        realized_after = self.position_manager.total_realized_pnl
+        realized_delta = realized_after - realized_before
+        if abs(realized_delta) > 1e-9:
+            self.risk_manager.record_trade_result(realized_delta)
+
+        position = self.position_manager.get_position(context.symbol)
+        if position is None:
+            self.risk_manager.sync_position_value(context.symbol, 0.0)
+        else:
+            self.risk_manager.sync_position_value(
+                symbol=context.symbol,
+                position_value=position.quantity * max(position.current_price or fill_price, fill_price),
+            )
+
+        if context.option_contract is not None:
+            self._upsert_option_exit_plan(
+                symbol=context.symbol,
+                underlying_symbol=context.underlying_symbol,
+                strategy=context.strategy,
+                quantity=fill_quantity,
+                execution_timeframe=context.execution_timeframe,
+                entry_price=fill_price,
+                stop_loss=context.stop_loss,
+                target=context.target,
+                signal_id=context.signal_id,
+            )
+
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.POSITION_OPENED,
+            title=f"Position Opened — {context.short_name}",
+            message=(
+                f"{context.side.name} {fill_quantity} x {context.execution_short_name} @ {fill_price:,.2f}. "
+                f"SL: {context.stop_loss:,.2f}. Target: {context.target:,.2f}."
+            ),
+            severity="success",
+            metadata={
+                "symbol": context.symbol,
+                "underlying_symbol": context.underlying_symbol,
+                "side": context.side.name,
+                "quantity": fill_quantity,
+                "entry_price": fill_price,
+                "stop_loss": context.stop_loss,
+                "target": context.target,
+                "order_id": order.order_id,
+                "strategy": context.strategy,
+                "status": order.status.value,
+            },
+        ))
+
+    async def _finalize_live_exit_fill(
+        self,
+        *,
+        context: PendingLiveExitOrder,
+        order: Order,
+        fill_quantity: int,
+        fill_price: float,
+    ) -> None:
+        fill_quantity = max(int(fill_quantity), 0)
+        fill_price = float(fill_price or 0.0)
+        if fill_quantity <= 0 or fill_price <= 0:
+            return
+
+        strategy_tag = context.plan.strategy if context.plan is not None else None
+        try:
+            realized = self.position_manager.close_position(
+                context.symbol,
+                fill_price,
+                quantity=fill_quantity,
+                strategy_tag=strategy_tag,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "live_exit_position_mismatch",
+                symbol=context.symbol,
+                quantity=fill_quantity,
+                strategy=strategy_tag,
+                error=str(exc),
+            )
+            self._pending_live_exits.pop(context.order_id, None)
+            self._persist_live_runtime_state()
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.AGENT_ERROR,
+                title=f"Exit State Mismatch — {context.short_name}",
+                message=str(exc),
+                severity="warning",
+                metadata={
+                    "symbol": context.symbol,
+                    "strategy": strategy_tag,
+                    "reason": context.reason,
+                    "quantity": fill_quantity,
+                },
+            ))
+            return
+
+        self.risk_manager.record_trade_result(realized)
+        remaining_pos = self.position_manager.get_position(context.symbol)
+        if remaining_pos is None:
+            self.risk_manager.sync_position_value(context.symbol, 0.0)
+        else:
+            self.risk_manager.sync_position_value(
+                context.symbol,
+                remaining_pos.quantity * max(remaining_pos.current_price or fill_price, fill_price),
+            )
+
+        remaining_strategy_qty = self._remaining_strategy_position_quantity(
+            context.symbol,
+            strategy_tag,
+        )
+        plan_fully_closed = strategy_tag is None or remaining_strategy_qty <= 0
+        if strategy_tag is not None:
+            self._update_exit_plan_remaining_quantity(
+                context.symbol,
+                strategy_tag,
+                remaining_quantity=remaining_strategy_qty,
+            )
+
+        pnl_pct = (realized / max(context.avg_price * fill_quantity, 1e-6)) * 100.0
+        if context.plan is not None and plan_fully_closed:
+            reinforcement_market = self._symbol_market(
+                context.plan.underlying_symbol if context.plan.underlying_symbol else context.symbol
+            )
+            self._record_reinforcement(context.plan.strategy, pnl_pct, market=reinforcement_market)
+            engine = self._online_learning_engine
+            if engine is not None and context.plan.signal_id:
+                asyncio.ensure_future(
+                    engine.label_outcome(
+                        signal_id=context.plan.signal_id,
+                        pnl_pct=pnl_pct,
+                        exit_timestamp=datetime.now(tz=IST),
+                    )
+                )
+
+        if order.status == OrderStatus.FILLED or plan_fully_closed:
+            self._pending_live_exits.pop(context.order_id, None)
+            self._persist_live_runtime_state()
+
+        event_type = AgentEventType.POSITION_CLOSED if plan_fully_closed else AgentEventType.POSITION_UPDATE
+        title = "Position Closed" if plan_fully_closed else "Position Reduced"
+        await self.event_bus.emit(AgentEvent(
+            event_type=event_type,
+            title=f"{title} — {context.short_name}",
+            message=(
+                f"Exit: {context.reason}. Qty: {fill_quantity}. "
+                f"Entry: {context.avg_price:,.2f} | Exit: {fill_price:,.2f} | "
+                f"PnL: {realized:+,.2f} ({pnl_pct:+.2f}%)."
+            ),
+            severity="success" if realized >= 0 else "warning",
+            metadata={
+                "symbol": context.symbol,
+                "underlying_symbol": (context.plan.underlying_symbol if context.plan is not None else context.symbol),
+                "reason": context.reason,
+                "quantity": fill_quantity,
+                "entry_price": context.avg_price,
+                "exit_price": fill_price,
+                "pnl": realized,
+                "pnl_pct": pnl_pct,
+                "strategy": (context.plan.strategy if context.plan else ""),
+                "status": order.status.value,
+            },
+        ))
+
+    async def _recover_live_broker_state(self) -> None:
+        if self.config.paper_mode or not self.fyers_client.is_authenticated:
+            return
+        try:
+            orders_raw, trades_raw, positions_raw = await asyncio.gather(
+                asyncio.to_thread(self.fyers_client.get_orders),
+                asyncio.to_thread(self.fyers_client.get_tradebook),
+                asyncio.to_thread(self.fyers_client.get_positions),
+            )
+        except Exception as exc:
+            logger.warning("live_state_recovery_failed", error=str(exc))
+            return
+
+        broker_orders = []
+        if isinstance(orders_raw, dict):
+            broker_orders = orders_raw.get("orderBook") or orders_raw.get("orders") or []
+
+        open_order_ids: set[str] = set()
+        for raw in broker_orders:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                order = self.order_manager.upsert_broker_order_snapshot(raw)
+            except Exception as exc:
+                logger.debug("live_order_snapshot_recovery_failed", error=str(exc))
+                continue
+            if order.status in (OrderStatus.PLACED, OrderStatus.PARTIALLY_FILLED):
+                open_order_ids.add(str(order.order_id or ""))
+
+        broker_trades = []
+        if isinstance(trades_raw, dict):
+            broker_trades = trades_raw.get("tradeBook") or trades_raw.get("trades") or []
+        broker_trades.sort(key=lambda row: str(row.get("orderDateTime") or row.get("tradeDate") or ""))
+        for raw in broker_trades:
+            if not isinstance(raw, dict):
+                continue
+            order_id = str(raw.get("orderNumber") or raw.get("id") or "").strip()
+            if not order_id:
+                continue
+            if self.order_manager.get_order(order_id) is None:
+                try:
+                    self.order_manager.upsert_broker_order_snapshot(
+                        {
+                            "id": order_id,
+                            "symbol": raw.get("symbol"),
+                            "qty": raw.get("tradedQty") or raw.get("qty"),
+                            "filledQty": raw.get("tradedQty") or raw.get("qty"),
+                            "tradedPrice": raw.get("tradePrice") or raw.get("tradedPrice"),
+                            "status": "COMPLETE",
+                            "side": raw.get("side"),
+                            "type": raw.get("orderType") or raw.get("type"),
+                            "productType": raw.get("productType"),
+                            "orderTag": raw.get("orderTag"),
+                            "orderDateTime": raw.get("orderDateTime") or raw.get("tradeDate"),
+                        }
+                    )
+                except Exception as exc:
+                    logger.debug("live_trade_snapshot_stub_failed", error=str(exc))
+                    continue
+            try:
+                await self._apply_broker_reconciliation(
+                    event_kind="trade",
+                    result=self.order_manager.apply_broker_trade_update(raw),
+                )
+            except Exception as exc:
+                logger.debug("live_trade_recovery_failed", order_id=order_id, error=str(exc))
+
+        recovered_positions = self._recover_positions_from_broker_payload(positions_raw)
+        if recovered_positions:
+            self.position_manager.replace_positions(recovered_positions)
+            for position in recovered_positions:
+                self.risk_manager.sync_position_value(
+                    position.symbol,
+                    position.quantity * max(position.current_price or position.avg_price, position.avg_price),
+                )
+
+        for order_id in list(self._pending_live_entries.keys()):
+            if order_id not in open_order_ids and self.order_manager.get_order(order_id) is None:
+                self._pending_live_entries.pop(order_id, None)
+        for order_id in list(self._pending_live_exits.keys()):
+            if order_id not in open_order_ids and self.order_manager.get_order(order_id) is None:
+                self._pending_live_exits.pop(order_id, None)
+
+        self._persist_live_runtime_state()
+        logger.info(
+            "live_state_recovered",
+            broker_orders=len(broker_orders),
+            broker_trades=len(broker_trades),
+            broker_positions=len(recovered_positions),
+            pending_entries=len(self._pending_live_entries),
+            pending_exits=len(self._pending_live_exits),
+        )
+
+    def _recover_positions_from_broker_payload(self, payload: Any) -> List[Any]:
+        if not isinstance(payload, dict):
+            return []
+        rows = payload.get("netPositions") or payload.get("positions") or payload.get("overall") or []
+        if not isinstance(rows, list):
+            return []
+        recovered = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            net_qty = self._safe_int(raw.get("netQty"), fallback=0)
+            qty = self._safe_int(raw.get("qty"), fallback=abs(net_qty))
+            side_raw = self._safe_int(raw.get("side"), fallback=1)
+            quantity = abs(net_qty) if net_qty != 0 else abs(qty)
+            if quantity <= 0:
+                continue
+            side = PositionSide.LONG if (net_qty > 0 or (net_qty == 0 and side_raw >= 0)) else PositionSide.SHORT
+            avg_price = self._safe_float(
+                raw.get("netAvg"),
+                fallback=self._safe_float(raw.get("buyAvg"), fallback=self._safe_float(raw.get("sellAvg"), fallback=0.0)),
+            )
+            symbol = str(raw.get("symbol") or "").strip()
+            if not symbol or avg_price is None or avg_price <= 0:
+                continue
+            strategy_tag = self._recovered_strategy_tag_for_symbol(symbol)
+            order_ids = self._recovered_order_ids_for_symbol(symbol)
+            recovered.append(
+                PositionManager._deserialize_position(
+                    {
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "side": side.value,
+                        "avg_price": avg_price,
+                        "current_price": avg_price,
+                        "entry_time": None,
+                        "strategy_tag": strategy_tag,
+                        "order_ids": order_ids,
+                        "lots": [
+                            {
+                                "quantity": quantity,
+                                "entry_price": avg_price,
+                                "entry_time": None,
+                                "strategy_tag": strategy_tag,
+                                "order_ids": order_ids,
+                            }
+                        ],
+                    }
+                )
+            )
+        return recovered
+
+    def _recovered_strategy_tag_for_symbol(self, symbol: str) -> str:
+        tags = {
+            context.strategy
+            for context in self._pending_live_entries.values()
+            if context.symbol == symbol and context.strategy
+        }
+        tags.update(
+            plan.strategy
+            for plan in self._symbol_exit_plans(symbol)
+            if plan.strategy and plan.strategy != "MULTI"
+        )
+        if len(tags) == 1:
+            return next(iter(tags))
+        if len(tags) > 1:
+            return "MULTI"
+        for order in self.order_manager.get_orders_by_symbol(symbol):
+            if order.tag and not order.tag.startswith("EXIT:"):
+                return order.tag
+        return ""
+
+    def _recovered_order_ids_for_symbol(self, symbol: str) -> List[str]:
+        return [
+            str(order.order_id or "")
+            for order in self.order_manager.get_orders_by_symbol(symbol)
+            if str(order.order_id or "").strip()
+        ]
 
     # ------------------------------------------------------------------
     # Online Learning Initialisation
@@ -594,6 +2051,7 @@ class TradingAgent:
 
     def get_status(self) -> Dict[str, Any]:
         """Return current agent status and metrics."""
+        settings = get_settings()
         portfolio = self.position_manager.get_portfolio_summary()
         (
             market_stats,
@@ -644,6 +2102,42 @@ class TradingAgent:
             "market_readiness": self._market_readiness,
             "execution_timeframes": self.get_execution_timeframes(),
             "reference_timeframes": self.get_reference_timeframes(),
+            "event_driven_enabled": bool(self.config.event_driven_execution_enabled),
+            "event_driven_markets": [market.upper() for market in self.config.event_driven_markets],
+            "event_driven_debounce_ms": int(self.config.event_driven_debounce_ms),
+            "event_driven_batch_size": int(self.config.event_driven_batch_size),
+            "pending_live_entries": len(self._pending_live_entries),
+            "pending_live_exits": len(self._pending_live_exits),
+            "pending_live_entry_submissions": len(self._pending_live_entry_submissions),
+            "pending_live_exit_submissions": len(self._pending_live_exit_submissions),
+            "order_submitter": self._order_submitter.snapshot() if self._order_submitter is not None else None,
+            "execution_backend": settings.execution_core_backend,
+            "execution_signal_lane": self._execution_core_signal_lane_snapshot(),
+            "execution_transport": settings.execution_transport,
+            "streaming_backends": {
+                "nats": {
+                    "enabled": bool(settings.nats_enabled),
+                    "url": settings.nats_url,
+                    "stream_prefix": settings.nats_stream_prefix,
+                },
+                "kafka": {
+                    "enabled": bool(settings.kafka_enabled),
+                    "bootstrap_servers": settings.kafka_bootstrap_servers,
+                    "topic_prefix": settings.kafka_topic_prefix,
+                },
+            },
+            "analytics_backends": {
+                "clickhouse": {
+                    "enabled": bool(settings.clickhouse_enabled),
+                    "url": settings.clickhouse_http_url,
+                    "database": settings.clickhouse_database,
+                },
+                "questdb": {
+                    "enabled": bool(settings.questdb_enabled),
+                    "url": settings.questdb_http_url,
+                },
+            },
+            "execution_latency": self._latency_tracker.snapshot(),
             "telegram_status_interval_minutes": max(int(self.config.telegram_status_interval_minutes), 0),
             "strategy_capital_bucket_enabled": bool(self.config.strategy_capital_bucket_enabled),
             "strategy_max_concurrent_positions": int(self.config.strategy_max_concurrent_positions),
@@ -791,6 +2285,7 @@ class TradingAgent:
     def _remove_exit_plan(self, symbol: str, strategy: Optional[str] = None) -> None:
         if strategy is None:
             self._option_exit_plans.pop(symbol, None)
+            self._persist_live_runtime_state()
             return
         strategy_map = self._option_exit_plans.get(symbol)
         if not strategy_map:
@@ -798,6 +2293,245 @@ class TradingAgent:
         strategy_map.pop(strategy, None)
         if not strategy_map:
             self._option_exit_plans.pop(symbol, None)
+        self._persist_live_runtime_state()
+
+    def _remaining_strategy_position_quantity(self, symbol: str, strategy: Optional[str]) -> int:
+        if strategy is None:
+            position = self.position_manager.get_position(symbol)
+            return int(position.quantity) if position is not None else 0
+        return sum(
+            int(view.quantity)
+            for view in self.position_manager.get_position_views(
+                symbol=symbol,
+                strategy_tag=strategy,
+            )
+        )
+
+    def _update_exit_plan_remaining_quantity(
+        self,
+        symbol: str,
+        strategy: str,
+        *,
+        remaining_quantity: int,
+    ) -> None:
+        strategy_map = self._option_exit_plans.get(symbol)
+        if not strategy_map:
+            return
+        plan = strategy_map.get(strategy)
+        if plan is None:
+            return
+        if remaining_quantity <= 0:
+            self._remove_exit_plan(symbol, strategy)
+            return
+        plan.quantity = int(remaining_quantity)
+        self._persist_live_runtime_state()
+
+    def _persist_live_runtime_state(self) -> None:
+        if self._runtime_state_path is None:
+            return
+        if self.config.paper_mode:
+            if self._runtime_state_path.exists():
+                try:
+                    self._runtime_state_path.unlink()
+                except OSError:
+                    pass
+            return
+
+        payload = {
+            "pending_live_entries": [
+                self._serialize_pending_live_entry(context)
+                for context in self._pending_live_entries.values()
+            ],
+            "pending_live_exits": [
+                self._serialize_pending_live_exit(context)
+                for context in self._pending_live_exits.values()
+            ],
+            "option_exit_plans": {
+                symbol: {
+                    strategy: self._serialize_option_exit_plan(plan)
+                    for strategy, plan in strategy_map.items()
+                }
+                for symbol, strategy_map in self._option_exit_plans.items()
+            },
+        }
+        try:
+            self._runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._runtime_state_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            tmp_path.replace(self._runtime_state_path)
+        except Exception as exc:
+            logger.warning("trading_agent_live_state_persist_failed", error=str(exc))
+
+    def _load_live_runtime_state(self) -> None:
+        if self._runtime_state_path is None or self.config.paper_mode or not self._runtime_state_path.exists():
+            return
+        try:
+            payload = json.loads(self._runtime_state_path.read_text(encoding="utf-8"))
+            self._pending_live_entries = {}
+            for raw in payload.get("pending_live_entries", []):
+                context = self._deserialize_pending_live_entry(raw)
+                self._pending_live_entries[context.order_id] = context
+            self._pending_live_exits = {}
+            for raw in payload.get("pending_live_exits", []):
+                context = self._deserialize_pending_live_exit(raw)
+                self._pending_live_exits[context.order_id] = context
+            self._option_exit_plans = {
+                symbol: {
+                    strategy: self._deserialize_option_exit_plan(plan_payload)
+                    for strategy, plan_payload in strategy_map.items()
+                }
+                for symbol, strategy_map in (payload.get("option_exit_plans") or {}).items()
+                if isinstance(strategy_map, dict)
+            }
+            logger.info(
+                "trading_agent_live_state_loaded",
+                pending_entries=len(self._pending_live_entries),
+                pending_exits=len(self._pending_live_exits),
+                exit_plans=len(self._option_exit_plans),
+            )
+        except Exception as exc:
+            logger.warning("trading_agent_live_state_load_failed", error=str(exc))
+
+    @staticmethod
+    def _serialize_option_contract(contract: OptionContract) -> dict[str, Any]:
+        return {
+            "underlying_symbol": contract.underlying_symbol,
+            "option_symbol": contract.option_symbol,
+            "option_type": contract.option_type,
+            "strike": float(contract.strike),
+            "expiry": contract.expiry,
+            "ltp": float(contract.ltp),
+            "lot_size": int(contract.lot_size),
+        }
+
+    @staticmethod
+    def _deserialize_option_contract(payload: dict[str, Any]) -> OptionContract:
+        return OptionContract(
+            underlying_symbol=str(payload.get("underlying_symbol") or ""),
+            option_symbol=str(payload.get("option_symbol") or ""),
+            option_type=str(payload.get("option_type") or ""),
+            strike=float(payload.get("strike") or 0.0),
+            expiry=str(payload.get("expiry") or ""),
+            ltp=float(payload.get("ltp") or 0.0),
+            lot_size=int(payload.get("lot_size") or 0),
+        )
+
+    @staticmethod
+    def _serialize_option_exit_plan(plan: OptionExitPlan) -> dict[str, Any]:
+        return {
+            "symbol": plan.symbol,
+            "underlying_symbol": plan.underlying_symbol,
+            "strategy": plan.strategy,
+            "quantity": int(plan.quantity),
+            "execution_timeframe": plan.execution_timeframe,
+            "entry_price": float(plan.entry_price),
+            "stop_loss": float(plan.stop_loss),
+            "target": float(plan.target),
+            "opened_at": plan.opened_at.isoformat(),
+            "time_exit_at": plan.time_exit_at.isoformat(),
+            "signal_id": plan.signal_id,
+        }
+
+    @staticmethod
+    def _deserialize_option_exit_plan(payload: dict[str, Any]) -> OptionExitPlan:
+        return OptionExitPlan(
+            symbol=str(payload.get("symbol") or ""),
+            underlying_symbol=str(payload.get("underlying_symbol") or ""),
+            strategy=str(payload.get("strategy") or ""),
+            quantity=int(payload.get("quantity") or 0),
+            execution_timeframe=str(payload.get("execution_timeframe") or ""),
+            entry_price=float(payload.get("entry_price") or 0.0),
+            stop_loss=float(payload.get("stop_loss") or 0.0),
+            target=float(payload.get("target") or 0.0),
+            opened_at=datetime.fromisoformat(str(payload.get("opened_at"))),
+            time_exit_at=datetime.fromisoformat(str(payload.get("time_exit_at"))),
+            signal_id=str(payload.get("signal_id") or ""),
+        )
+
+    def _serialize_pending_live_entry(self, context: PendingLiveEntryOrder) -> dict[str, Any]:
+        return {
+            "order_id": context.order_id,
+            "symbol": context.symbol,
+            "underlying_symbol": context.underlying_symbol,
+            "short_name": context.short_name,
+            "execution_short_name": context.execution_short_name,
+            "quantity": int(context.quantity),
+            "side": context.side.name,
+            "strategy": context.strategy,
+            "market": context.market,
+            "execution_timeframe": context.execution_timeframe,
+            "entry_price_hint": float(context.entry_price_hint),
+            "stop_loss": float(context.stop_loss),
+            "target": float(context.target),
+            "signal_id": context.signal_id,
+            "trade_counted": bool(context.trade_counted),
+            "option_contract": (
+                self._serialize_option_contract(context.option_contract)
+                if context.option_contract is not None
+                else None
+            ),
+        }
+
+    def _deserialize_pending_live_entry(self, payload: dict[str, Any]) -> PendingLiveEntryOrder:
+        option_contract_payload = payload.get("option_contract")
+        option_contract = (
+            self._deserialize_option_contract(option_contract_payload)
+            if isinstance(option_contract_payload, dict)
+            else None
+        )
+        return PendingLiveEntryOrder(
+            order_id=str(payload.get("order_id") or ""),
+            symbol=str(payload.get("symbol") or ""),
+            underlying_symbol=str(payload.get("underlying_symbol") or ""),
+            short_name=str(payload.get("short_name") or ""),
+            execution_short_name=str(payload.get("execution_short_name") or ""),
+            quantity=int(payload.get("quantity") or 0),
+            side=OrderSide[str(payload.get("side") or "BUY")],
+            strategy=str(payload.get("strategy") or ""),
+            market=str(payload.get("market") or ""),
+            execution_timeframe=str(payload.get("execution_timeframe") or ""),
+            entry_price_hint=float(payload.get("entry_price_hint") or 0.0),
+            stop_loss=float(payload.get("stop_loss") or 0.0),
+            target=float(payload.get("target") or 0.0),
+            signal_id=str(payload.get("signal_id") or ""),
+            option_contract=option_contract,
+            trade_counted=bool(payload.get("trade_counted")),
+        )
+
+    def _serialize_pending_live_exit(self, context: PendingLiveExitOrder) -> dict[str, Any]:
+        return {
+            "order_id": context.order_id,
+            "symbol": context.symbol,
+            "short_name": context.short_name,
+            "quantity": int(context.quantity),
+            "reason": context.reason,
+            "avg_price": float(context.avg_price),
+            "entry_value": float(context.entry_value),
+            "exit_price_hint": float(context.exit_price_hint),
+            "plan": (
+                self._serialize_option_exit_plan(context.plan)
+                if context.plan is not None
+                else None
+            ),
+        }
+
+    def _deserialize_pending_live_exit(self, payload: dict[str, Any]) -> PendingLiveExitOrder:
+        plan_payload = payload.get("plan")
+        return PendingLiveExitOrder(
+            order_id=str(payload.get("order_id") or ""),
+            symbol=str(payload.get("symbol") or ""),
+            short_name=str(payload.get("short_name") or ""),
+            quantity=int(payload.get("quantity") or 0),
+            reason=str(payload.get("reason") or ""),
+            avg_price=float(payload.get("avg_price") or 0.0),
+            entry_value=float(payload.get("entry_value") or 0.0),
+            exit_price_hint=float(payload.get("exit_price_hint") or 0.0),
+            plan=(
+                self._deserialize_option_exit_plan(plan_payload)
+                if isinstance(plan_payload, dict)
+                else None
+            ),
+        )
 
     @staticmethod
     def _to_ist(value: Optional[datetime]) -> datetime:
@@ -1128,6 +2862,7 @@ class TradingAgent:
 
                 self._cycle_count += 1
                 self._last_scan_time = datetime.now(tz=IST)
+                cycle_started = time.perf_counter()
 
                 # Ensure historical data exists for newly active NSE symbols.
                 symbols_to_warm = [symbol for symbol in active_symbols if symbol not in self._warmed_symbols]
@@ -1135,8 +2870,10 @@ class TradingAgent:
                     await self._ensure_data_available(symbols_to_warm)
                     self._warmed_symbols.update(symbols_to_warm)
 
+                periodic_scan_symbols = self._periodic_scan_symbols(active_symbols)
+
                 # Scan each symbol
-                for symbol in active_symbols:
+                for symbol in periodic_scan_symbols:
                     await self._scan_symbol(symbol)
 
                 # Check existing positions for exit conditions
@@ -1151,6 +2888,14 @@ class TradingAgent:
                 self._daily_pnl = portfolio.get("total_pnl", 0.0)
 
                 if self.risk_manager.check_circuit_breaker():
+                    self._latency_tracker.record(
+                        "agent_cycle_ms",
+                        (time.perf_counter() - cycle_started) * 1000.0,
+                        cycle=self._cycle_count,
+                        active_symbols=len(active_symbols),
+                        sessions=",".join(self._active_sessions),
+                        circuit_breaker=True,
+                    )
                     if not self._circuit_breaker_notified:
                         await self.event_bus.emit(AgentEvent(
                             event_type=AgentEventType.CIRCUIT_BREAKER,
@@ -1172,8 +2917,8 @@ class TradingAgent:
                     event_type=AgentEventType.THINKING,
                     title=f"Cycle {self._cycle_count} Complete",
                     message=(
-                        f"Scanned {len(active_symbols)} symbols "
-                        f"({', '.join(short_name(s) for s in active_symbols)}). "
+                        f"Periodic scanned {len(periodic_scan_symbols)} of {len(active_symbols)} active symbols "
+                        f"({', '.join(short_name(s) for s in periodic_scan_symbols) or 'event-driven only'}). "
                         f"Open positions: {portfolio.get('position_count', 0)}. "
                         f"Daily P&L: {self._daily_pnl:+,.0f}. "
                         f"Next scan in {self.config.scan_interval_seconds}s."
@@ -1183,11 +2928,21 @@ class TradingAgent:
                         "cycle": self._cycle_count,
                         "pnl": self._daily_pnl,
                         "active_symbols": active_symbols,
+                        "periodic_scan_symbols": periodic_scan_symbols,
                         "sessions": sessions,
                     },
                 ))
 
                 await self._maybe_emit_periodic_summary()
+                self._latency_tracker.record(
+                    "agent_cycle_ms",
+                    (time.perf_counter() - cycle_started) * 1000.0,
+                    cycle=self._cycle_count,
+                    active_symbols=len(active_symbols),
+                    periodic_scans=len(periodic_scan_symbols),
+                    sessions=",".join(self._active_sessions),
+                    circuit_breaker=False,
+                )
                 await asyncio.sleep(self.config.scan_interval_seconds)
 
         except asyncio.CancelledError:
@@ -1208,30 +2963,56 @@ class TradingAgent:
     # Symbol Scan
     # ------------------------------------------------------------------
 
-    async def _scan_symbol(self, symbol: str) -> None:
+    def _event_driven_hot_path_timeframe_supported(self, timeframe: str) -> bool:
+        token = str(timeframe or "").strip().upper()
+        return token in {"1", "3", "5", "15", "60", "D"}
+
+    def _should_use_event_driven_lane(self, symbol: str) -> bool:
+        return self._candle_broker is not None and self._is_event_driven_symbol_eligible(symbol)
+
+    def _periodic_scan_symbols(self, active_symbols: List[str]) -> List[str]:
+        return [
+            symbol
+            for symbol in active_symbols
+            if not self._should_use_event_driven_lane(symbol)
+            and not self._should_use_execution_core_signal_lane(symbol)
+        ]
+
+    async def _scan_symbol(self, symbol: str, *, live_only: bool = False) -> None:
+        async with self._scan_lock(symbol):
+            await self._scan_symbol_unlocked(symbol, live_only=live_only)
+
+    async def _scan_symbol_unlocked(self, symbol: str, *, live_only: bool = False) -> None:
         """Run all strategies on a single symbol across execution timeframes."""
+        scan_started = time.perf_counter()
         short_name = symbol.split(":")[-1].split("-")[0]
-        execution_timeframes = await self._rank_execution_timeframes(symbol, self.get_execution_timeframes())
+        emit_verbose_events = not live_only
+        execution_timeframes = await self._rank_execution_timeframes(
+            symbol,
+            self.get_execution_timeframes(),
+            live_only=live_only,
+        )
         trades_before_symbol = self._total_trades
         symbol_market = self._symbol_market(symbol)
         timeframe_frames: Dict[str, pd.DataFrame] = {}
         candidate_signals: List[Dict[str, Any]] = []
 
-        await self.event_bus.emit(AgentEvent(
-            event_type=AgentEventType.MARKET_SCAN,
-            title=f"Scanning {short_name}",
-            message=(
-                f"Fetching candles for {symbol} across "
-                f"{', '.join(execution_timeframes)}..."
-            ),
-            severity="info",
-            metadata={"symbol": symbol, "timeframes": execution_timeframes},
-        ))
+        if emit_verbose_events:
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.MARKET_SCAN,
+                title=f"Scanning {short_name}",
+                message=(
+                    f"Fetching candles for {symbol} across "
+                    f"{', '.join(execution_timeframes)}..."
+                ),
+                severity="info",
+                metadata={"symbol": symbol, "timeframes": execution_timeframes},
+            ))
 
         had_data = False
         for timeframe in execution_timeframes:
             # Fetch market data for execution timeframe
-            df = await self._fetch_market_data(symbol, timeframe=timeframe)
+            df = await self._fetch_market_data(symbol, timeframe=timeframe, live_only=live_only)
             if df is None or df.empty:
                 continue
 
@@ -1258,13 +3039,14 @@ class TradingAgent:
             regime_meta = self._market_regime_profile(df, symbol_market)
             ltp = float(df["close"].iloc[-1])
             tf_label = f"{timeframe}m" if timeframe.isdigit() else timeframe
-            await self.event_bus.emit(AgentEvent(
-                event_type=AgentEventType.MARKET_DATA_RECEIVED,
-                title=f"{short_name} LTP ({tf_label}): {ltp:,.2f}",
-                message=f"Loaded {len(df)} candles ({tf_label}). Last close: {ltp:,.2f}.",
-                severity="info",
-                metadata={"symbol": symbol, "ltp": ltp, "candles": len(df), "timeframe": timeframe},
-            ))
+            if emit_verbose_events:
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.MARKET_DATA_RECEIVED,
+                    title=f"{short_name} LTP ({tf_label}): {ltp:,.2f}",
+                    message=f"Loaded {len(df)} candles ({tf_label}). Last close: {ltp:,.2f}.",
+                    severity="info",
+                    metadata={"symbol": symbol, "ltp": ltp, "candles": len(df), "timeframe": timeframe},
+                ))
 
             # Run strategies and namespace the symbol key with timeframe so
             # dedupe state doesn't suppress valid signals across resolutions.
@@ -1277,13 +3059,14 @@ class TradingAgent:
                     logger.debug("strategy_skipped_auto_disabled", strategy=strat_name, symbol=symbol)
                     continue
 
-                await self.event_bus.emit(AgentEvent(
-                    event_type=AgentEventType.STRATEGY_ANALYZING,
-                    title=f"Running {strat_name} ({tf_label})",
-                    message=f"Analyzing {short_name} on {tf_label} with {strat_name}...",
-                    severity="info",
-                    metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe},
-                ))
+                if emit_verbose_events:
+                    await self.event_bus.emit(AgentEvent(
+                        event_type=AgentEventType.STRATEGY_ANALYZING,
+                        title=f"Running {strat_name} ({tf_label})",
+                        message=f"Analyzing {short_name} on {tf_label} with {strat_name}...",
+                        severity="info",
+                        metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe},
+                    ))
 
                 strategy_signals = [r for r in results if r.get("strategy") == strat_name]
                 actionable = [
@@ -1292,13 +3075,14 @@ class TradingAgent:
                 ]
 
                 if not actionable:
-                    await self.event_bus.emit(AgentEvent(
-                        event_type=AgentEventType.NO_SIGNAL,
-                        title=f"{strat_name}: No Signal",
-                        message=f"{strat_name} found no actionable signal for {short_name} on {tf_label}. HOLD.",
-                        severity="info",
-                        metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe},
-                    ))
+                    if emit_verbose_events:
+                        await self.event_bus.emit(AgentEvent(
+                            event_type=AgentEventType.NO_SIGNAL,
+                            title=f"{strat_name}: No Signal",
+                            message=f"{strat_name} found no actionable signal for {short_name} on {tf_label}. HOLD.",
+                            severity="info",
+                            metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe},
+                        ))
                     continue
 
                 # Process each actionable signal after higher-timeframe confirmation.
@@ -1329,23 +3113,25 @@ class TradingAgent:
                         confirmed, reference_meta = await self._confirm_reference_timeframes(
                             symbol=symbol,
                             signal_type=signal.signal_type,
+                            live_only=live_only,
                         )
                     if not confirmed:
-                        await self.event_bus.emit(AgentEvent(
-                            event_type=AgentEventType.NO_SIGNAL,
-                            title=f"{strat_name}: HTF Filter Rejected",
-                            message=(
-                                f"{signal.signal_type.value} on {tf_label} rejected by higher-timeframe "
-                                "spot confirmation."
-                            ),
-                            severity="warning",
-                            metadata={
-                                "symbol": symbol,
-                                "strategy": strat_name,
-                                "timeframe": timeframe,
-                                "reference": reference_meta,
-                            },
-                        ))
+                        if emit_verbose_events:
+                            await self.event_bus.emit(AgentEvent(
+                                event_type=AgentEventType.NO_SIGNAL,
+                                title=f"{strat_name}: HTF Filter Rejected",
+                                message=(
+                                    f"{signal.signal_type.value} on {tf_label} rejected by higher-timeframe "
+                                    "spot confirmation."
+                                ),
+                                severity="warning",
+                                metadata={
+                                    "symbol": symbol,
+                                    "strategy": strat_name,
+                                    "timeframe": timeframe,
+                                    "reference": reference_meta,
+                                },
+                            ))
                         continue
 
                     if not isinstance(signal.metadata, dict):
@@ -1371,24 +3157,25 @@ class TradingAgent:
                     signal.metadata["trade_priority_threshold"] = round(priority_threshold, 2)
 
                     if priority_score < priority_threshold:
-                        await self.event_bus.emit(AgentEvent(
-                            event_type=AgentEventType.NO_SIGNAL,
-                            title=f"{strat_name}: Priority Filtered",
-                            message=(
-                                f"{strat_name} setup on {tf_label} was skipped. "
-                                f"Priority {priority_score:.1f} < threshold {priority_threshold:.1f} "
-                                f"for {regime_meta.get('regime', 'transition')} regime."
-                            ),
-                            severity="info",
-                            metadata={
-                                "symbol": symbol,
-                                "strategy": strat_name,
-                                "timeframe": timeframe,
-                                "priority_score": round(priority_score, 2),
-                                "priority_threshold": round(priority_threshold, 2),
-                                "regime": regime_meta,
-                            },
-                        ))
+                        if emit_verbose_events:
+                            await self.event_bus.emit(AgentEvent(
+                                event_type=AgentEventType.NO_SIGNAL,
+                                title=f"{strat_name}: Priority Filtered",
+                                message=(
+                                    f"{strat_name} setup on {tf_label} was skipped. "
+                                    f"Priority {priority_score:.1f} < threshold {priority_threshold:.1f} "
+                                    f"for {regime_meta.get('regime', 'transition')} regime."
+                                ),
+                                severity="info",
+                                metadata={
+                                    "symbol": symbol,
+                                    "strategy": strat_name,
+                                    "timeframe": timeframe,
+                                    "priority_score": round(priority_score, 2),
+                                    "priority_threshold": round(priority_threshold, 2),
+                                    "regime": regime_meta,
+                                },
+                            ))
                         continue
 
                     candidate_signals.append(
@@ -1416,21 +3203,22 @@ class TradingAgent:
             )
             for index, candidate in enumerate(candidate_signals):
                 if index >= max_candidates:
-                    await self.event_bus.emit(AgentEvent(
-                        event_type=AgentEventType.NO_SIGNAL,
-                        title=f"{candidate['strategy']}: Deferred",
-                        message=(
-                            f"Higher-priority setup already selected for {short_name}. "
-                            "This candidate was deferred."
-                        ),
-                        severity="info",
-                        metadata={
-                            "symbol": symbol,
-                            "strategy": candidate["strategy"],
-                            "timeframe": candidate["timeframe"],
-                            "priority_score": round(float(candidate["priority_score"]), 2),
-                        },
-                    ))
+                    if emit_verbose_events:
+                        await self.event_bus.emit(AgentEvent(
+                            event_type=AgentEventType.NO_SIGNAL,
+                            title=f"{candidate['strategy']}: Deferred",
+                            message=(
+                                f"Higher-priority setup already selected for {short_name}. "
+                                "This candidate was deferred."
+                            ),
+                            severity="info",
+                            metadata={
+                                "symbol": symbol,
+                                "strategy": candidate["strategy"],
+                                "timeframe": candidate["timeframe"],
+                                "priority_score": round(float(candidate["priority_score"]), 2),
+                            },
+                        ))
                     continue
 
                 before_trade_count = self._total_trades
@@ -1455,6 +3243,7 @@ class TradingAgent:
                 short_name=short_name,
                 timeframe_frames=timeframe_frames,
                 execution_timeframes=execution_timeframes,
+                live_only=live_only,
             )
 
         if not had_data:
@@ -1469,86 +3258,102 @@ class TradingAgent:
                     " Configure FINNHUB_API_KEY and/or ALPHAVANTAGE_API_KEY for"
                     " primary crypto feeds; Binance remains only the fallback."
                 )
-            await self.event_bus.emit(AgentEvent(
-                event_type=AgentEventType.MARKET_DATA_RECEIVED,
-                title=f"No Data — {short_name}",
-                message=no_data_message,
-                severity="warning",
-                metadata={"symbol": symbol, "timeframes": execution_timeframes},
-            ))
+            if emit_verbose_events:
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.MARKET_DATA_RECEIVED,
+                    title=f"No Data — {short_name}",
+                    message=no_data_message,
+                    severity="warning",
+                    metadata={"symbol": symbol, "timeframes": execution_timeframes},
+                ))
+        self._latency_tracker.record(
+            "symbol_scan_ms",
+            (time.perf_counter() - scan_started) * 1000.0,
+            symbol=symbol,
+            market=symbol_market,
+            had_data=had_data,
+            traded=self._total_trades > trades_before_symbol,
+        )
 
     async def _confirm_reference_timeframes(
         self,
         symbol: str,
         signal_type: SignalType,
+        *,
+        live_only: bool = False,
     ) -> Tuple[bool, Dict[str, Any]]:
         """Confirm short-term signals using higher-timeframe spot trend bias."""
-        reference_timeframes = self.get_reference_timeframes()
-        bullish_votes = 0
-        bearish_votes = 0
-        references: Dict[str, Any] = {}
+        with self._latency_tracker.track(
+            "reference_confirm_ms",
+            symbol=symbol,
+            signal_type=signal_type.value,
+        ):
+            reference_timeframes = self.get_reference_timeframes()
+            bullish_votes = 0
+            bearish_votes = 0
+            references: Dict[str, Any] = {}
 
-        for timeframe in reference_timeframes:
-            df = await self._fetch_market_data(symbol, timeframe=timeframe)
-            if df is None or df.empty:
-                references[timeframe] = {"trend": "missing"}
-                continue
-            fresh, freshness_meta = self._data_freshness(df, timeframe)
-            if not fresh:
+            for timeframe in reference_timeframes:
+                df = await self._fetch_market_data(symbol, timeframe=timeframe, live_only=live_only)
+                if df is None or df.empty:
+                    references[timeframe] = {"trend": "missing"}
+                    continue
+                fresh, freshness_meta = self._data_freshness(df, timeframe)
+                if not fresh:
+                    references[timeframe] = {
+                        "trend": "stale",
+                        **freshness_meta,
+                    }
+                    continue
+
+                trend, close, ema = self._infer_trend(df)
                 references[timeframe] = {
-                    "trend": "stale",
-                    **freshness_meta,
+                    "trend": trend,
+                    "close": round(close, 2),
+                    "ema20": round(ema, 2),
                 }
-                continue
 
-            trend, close, ema = self._infer_trend(df)
-            references[timeframe] = {
-                "trend": trend,
-                "close": round(close, 2),
-                "ema20": round(ema, 2),
-            }
+                if trend == "bullish":
+                    bullish_votes += 1
+                elif trend == "bearish":
+                    bearish_votes += 1
 
-            if trend == "bullish":
-                bullish_votes += 1
-            elif trend == "bearish":
-                bearish_votes += 1
+            # If reference data is missing entirely, avoid blind execution.
+            total_votes = bullish_votes + bearish_votes
+            dominant_trend = "neutral"
+            if bullish_votes > bearish_votes:
+                dominant_trend = "bullish"
+            elif bearish_votes > bullish_votes:
+                dominant_trend = "bearish"
+            confidence_pct = (max(bullish_votes, bearish_votes) / total_votes * 100.0) if total_votes > 0 else 0.0
 
-        # If reference data is missing entirely, avoid blind execution.
-        total_votes = bullish_votes + bearish_votes
-        dominant_trend = "neutral"
-        if bullish_votes > bearish_votes:
-            dominant_trend = "bullish"
-        elif bearish_votes > bullish_votes:
-            dominant_trend = "bearish"
-        confidence_pct = (max(bullish_votes, bearish_votes) / total_votes * 100.0) if total_votes > 0 else 0.0
+            if bullish_votes == 0 and bearish_votes == 0:
+                return False, {
+                    "timeframes": references,
+                    "bullish_votes": bullish_votes,
+                    "bearish_votes": bearish_votes,
+                    "dominant_trend": dominant_trend,
+                    "confidence_pct": round(confidence_pct, 2),
+                    "reason": "no_reference_bias",
+                }
 
-        if bullish_votes == 0 and bearish_votes == 0:
-            return False, {
+            if signal_type == SignalType.BUY:
+                confirmed = bullish_votes > bearish_votes
+                if not confirmed and self._is_bootstrap_phase():
+                    confirmed = bullish_votes > 0 and bullish_votes >= bearish_votes
+            else:
+                confirmed = bearish_votes > bullish_votes
+                if not confirmed and self._is_bootstrap_phase():
+                    confirmed = bearish_votes > 0 and bearish_votes >= bullish_votes
+
+            return confirmed, {
                 "timeframes": references,
                 "bullish_votes": bullish_votes,
                 "bearish_votes": bearish_votes,
                 "dominant_trend": dominant_trend,
                 "confidence_pct": round(confidence_pct, 2),
-                "reason": "no_reference_bias",
+                "signal": signal_type.value,
             }
-
-        if signal_type == SignalType.BUY:
-            confirmed = bullish_votes > bearish_votes
-            if not confirmed and self._is_bootstrap_phase():
-                confirmed = bullish_votes > 0 and bullish_votes >= bearish_votes
-        else:
-            confirmed = bearish_votes > bullish_votes
-            if not confirmed and self._is_bootstrap_phase():
-                confirmed = bearish_votes > 0 and bearish_votes >= bullish_votes
-
-        return confirmed, {
-            "timeframes": references,
-            "bullish_votes": bullish_votes,
-            "bearish_votes": bearish_votes,
-            "dominant_trend": dominant_trend,
-            "confidence_pct": round(confidence_pct, 2),
-            "signal": signal_type.value,
-        }
 
     async def _attempt_bootstrap_exploration(
         self,
@@ -1556,6 +3361,8 @@ class TradingAgent:
         short_name: str,
         timeframe_frames: Dict[str, pd.DataFrame],
         execution_timeframes: List[str],
+        *,
+        live_only: bool = False,
     ) -> None:
         """Enter one exploratory bootstrap trade when no normal trade fired."""
         # Keep one active option position per underlying in bootstrap.
@@ -1581,6 +3388,7 @@ class TradingAgent:
         confirmed, reference_meta = await self._confirm_reference_timeframes(
             symbol=symbol,
             signal_type=exploratory_signal.signal_type,
+            live_only=live_only,
         )
         if not confirmed:
             # If higher-timeframe data is missing, allow exploratory trade
@@ -1769,6 +3577,8 @@ class TradingAgent:
         self,
         symbol: str,
         execution_timeframes: List[str],
+        *,
+        live_only: bool = False,
     ) -> List[str]:
         ordered: List[str] = []
         seen: set[str] = set()
@@ -1782,7 +3592,7 @@ class TradingAgent:
             return ordered
 
         baseline = "15" if "15" in ordered else ordered[min(len(ordered) - 1, 1)]
-        frame = await self._fetch_market_data(symbol, timeframe=baseline)
+        frame = await self._fetch_market_data(symbol, timeframe=baseline, live_only=live_only)
         if frame is None or frame.empty or "close" not in frame.columns:
             return ordered
 
@@ -1993,6 +3803,24 @@ class TradingAgent:
                     "strategy": strat_name,
                     "entry_price": signal.price,
                     "option_ltp": (option_contract.ltp if option_contract else None),
+                },
+            ))
+            return
+
+        if not self.config.paper_mode and self._symbol_has_pending_live_order(execution_symbol):
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Order Deferred — {short_name}",
+                message=(
+                    f"A live order for {execution_short_name if 'execution_short_name' in locals() else execution_symbol} "
+                    "is still pending broker fills. Skipping duplicate entry."
+                ),
+                severity="warning",
+                metadata={
+                    "symbol": execution_symbol,
+                    "underlying_symbol": underlying_symbol,
+                    "strategy": strat_name,
+                    "pending_live_order": True,
                 },
             ))
             return
@@ -2284,7 +4112,10 @@ class TradingAgent:
             effective_max_position_size_inr / max(self.total_allocated_capital_inr(), 1.0)
         )
         market_open_positions = self._market_open_position_count(execution_market)
-        position_would_increase_count = self.position_manager.get_position(execution_symbol) is None
+        position_would_increase_count = (
+            self.position_manager.get_position(execution_symbol) is None
+            and not self._symbol_has_pending_live_order(execution_symbol)
+        )
         with self._temporary_risk_overrides(
             max_position_size=effective_max_position_size_inr,
             max_risk_per_trade_pct=effective_max_risk_per_trade_pct,
@@ -2365,7 +4196,33 @@ class TradingAgent:
         ))
 
         try:
-            placed = self.order_manager.place_order(order)
+            with self._latency_tracker.track(
+                "order_submit_ms",
+                symbol=execution_symbol,
+                market=execution_market,
+                strategy=strat_name,
+            ):
+                if self.config.paper_mode:
+                    placed = self.order_manager.place_order(order)
+                else:
+                    await self._queue_live_entry_submission(
+                        order=order,
+                        short_name=short_name,
+                        execution_short_name=execution_short_name,
+                        execution_symbol=execution_symbol,
+                        underlying_symbol=underlying_symbol,
+                        quantity=quantity,
+                        side=side,
+                        strat_name=strat_name,
+                        execution_market=execution_market,
+                        execution_timeframe=execution_timeframe or self.config.timeframe,
+                        entry_price=entry_price,
+                        sl_price=sl_price,
+                        target_price=target_price,
+                        signal_id=signal_id,
+                        option_contract=option_contract,
+                    )
+                    return
 
             executed_order = placed.order
             if placed.success and executed_order is not None and executed_order.status in (
@@ -2373,74 +4230,80 @@ class TradingAgent:
                 OrderStatus.PLACED,
                 OrderStatus.PARTIALLY_FILLED,
             ):
-                self._total_trades += 1
-                self._strategy_trade_counts[strat_name] = self._strategy_trade_counts.get(strat_name, 0) + 1
-                self._market_trade_counts[execution_market] = self._market_trade_counts.get(execution_market, 0) + 1
-                fill_price = float(executed_order.fill_price or entry_price)
                 order_id = executed_order.order_id or ""
-
-                await self.event_bus.emit(AgentEvent(
-                    event_type=AgentEventType.ORDER_PLACED,
-                    title=f"Order Filled — {short_name}",
-                    message=(
-                        f"{side.name} {quantity} x {execution_short_name} @ {fill_price:,.2f}. "
-                        f"SL: {format_price(sl_price)}. "
-                        f"Target: {format_price(target_price)}."
-                    ),
-                    severity="success",
-                    metadata={
-                        "symbol": execution_symbol,
-                        "underlying_symbol": underlying_symbol,
-                        "side": side.name,
-                        "quantity": quantity,
-                        "fill_price": fill_price,
-                        "stop_loss": sl_price,
-                        "target": target_price,
-                        "order_id": order_id,
-                        "strategy": strat_name,
-                    },
-                ))
-
-                # Track in position manager
-                pos_side = PositionSide.LONG if side == OrderSide.BUY else PositionSide.SHORT
-                realized_before = self.position_manager.total_realized_pnl
-                self.position_manager.open_position(
-                    symbol=execution_symbol,
-                    quantity=quantity,
-                    side=pos_side,
-                    price=fill_price,
-                    strategy_tag=strat_name,
-                    order_id=order_id,
-                )
-
-                # Track realized PnL changes (partial closes / flips).
-                realized_after = self.position_manager.total_realized_pnl
-                realized_delta = realized_after - realized_before
-                if abs(realized_delta) > 1e-9:
-                    self.risk_manager.record_trade_result(realized_delta)
-
-                # Sync current symbol exposure for concentration/open-position checks.
-                pos = self.position_manager.get_position(execution_symbol)
-                if pos is None:
-                    self.risk_manager.sync_position_value(execution_symbol, 0.0)
-                else:
-                    self.risk_manager.sync_position_value(
-                        symbol=execution_symbol,
-                        position_value=pos.quantity * max(pos.current_price, fill_price),
+                if self.config.paper_mode:
+                    fill_price = float(executed_order.fill_price or entry_price)
+                    await self._finalize_live_entry_fill(
+                        context=PendingLiveEntryOrder(
+                            order_id=order_id,
+                            symbol=execution_symbol,
+                            underlying_symbol=underlying_symbol,
+                            short_name=short_name,
+                            execution_short_name=execution_short_name,
+                            quantity=quantity,
+                            side=side,
+                            strategy=strat_name,
+                            market=execution_market,
+                            execution_timeframe=execution_timeframe or self.config.timeframe,
+                            entry_price_hint=entry_price,
+                            stop_loss=sl_price,
+                            target=target_price,
+                            signal_id=signal_id,
+                            option_contract=option_contract,
+                        ),
+                        order=executed_order,
+                        fill_quantity=self._resolved_fill_quantity(executed_order.fill_quantity, quantity),
+                        fill_price=fill_price,
                     )
-
-                if option_contract is not None:
-                    self._upsert_option_exit_plan(
+                else:
+                    self._pending_live_entries[order_id] = PendingLiveEntryOrder(
+                        order_id=order_id,
                         symbol=execution_symbol,
                         underlying_symbol=underlying_symbol,
-                        strategy=strat_name,
+                        short_name=short_name,
+                        execution_short_name=execution_short_name,
                         quantity=quantity,
+                        side=side,
+                        strategy=strat_name,
+                        market=execution_market,
                         execution_timeframe=execution_timeframe or self.config.timeframe,
-                        entry_price=fill_price,
+                        entry_price_hint=entry_price,
                         stop_loss=sl_price,
                         target=target_price,
                         signal_id=signal_id,
+                        option_contract=option_contract,
                     )
+                    self._persist_live_runtime_state()
+                    await self.event_bus.emit(AgentEvent(
+                        event_type=AgentEventType.ORDER_PLACED,
+                        title=f"Order Submitted — {short_name}",
+                        message=(
+                            f"{side.name} {quantity} x {execution_short_name}. "
+                            "Waiting for broker fill confirmation."
+                        ),
+                        severity="success",
+                        metadata={
+                            "symbol": execution_symbol,
+                            "underlying_symbol": underlying_symbol,
+                            "side": side.name,
+                            "quantity": quantity,
+                            "stop_loss": sl_price,
+                            "target": target_price,
+                            "order_id": order_id,
+                            "strategy": strat_name,
+                            "status": executed_order.status.value,
+                        },
+                    ))
+                    if int(executed_order.fill_quantity or 0) > 0:
+                        await self._finalize_live_entry_fill(
+                            context=self._pending_live_entries[order_id],
+                            order=executed_order,
+                            fill_quantity=int(executed_order.fill_quantity),
+                            fill_price=float(executed_order.fill_price or entry_price),
+                        )
+                        if executed_order.status == OrderStatus.FILLED:
+                            self._pending_live_entries.pop(order_id, None)
+                            self._persist_live_runtime_state()
             else:
                 status = executed_order.status.value if executed_order is not None else "rejected"
                 reason = (
@@ -3626,6 +5489,7 @@ class TradingAgent:
                 time_exit_at=now + timedelta(minutes=minutes),
                 signal_id=signal_id,
             )
+            self._persist_live_runtime_state()
             return
 
         previous_qty = max(int(existing.quantity), 0)
@@ -3647,6 +5511,7 @@ class TradingAgent:
         ) / divisor
         existing.opened_at = min(existing.opened_at, now)
         existing.time_exit_at = max(existing.time_exit_at, now + timedelta(minutes=minutes))
+        self._persist_live_runtime_state()
 
     @contextmanager
     def _temporary_risk_overrides(
@@ -4353,107 +6218,154 @@ class TradingAgent:
                 ))
                 self._readiness_notified[market] = True
 
-    async def _fetch_market_data(self, symbol: str, timeframe: Optional[str] = None) -> Optional[pd.DataFrame]:
+    async def _fetch_market_data_from_memory(
+        self,
+        symbol: str,
+        timeframe: str,
+    ) -> Optional[pd.DataFrame]:
+        from src.data.ohlc_cache import get_ohlc_cache
+
+        tf = str(timeframe or self.config.timeframe).strip().upper()
+        now = datetime.now(tz=IST)
+        require_live_bars = self._requires_live_bars(self._symbol_market(symbol), tf, now)
+        stale_candidate: Optional[pd.DataFrame] = None
+
+        def remember_stale(frame: Optional[pd.DataFrame]) -> None:
+            nonlocal stale_candidate
+            if frame is None or frame.empty or "timestamp" not in frame.columns:
+                return
+            if stale_candidate is None:
+                stale_candidate = frame.copy(deep=False)
+                return
+            candidate_ts = self._coerce_ist_timestamp(frame["timestamp"].iloc[-1])
+            existing_ts = self._coerce_ist_timestamp(stale_candidate["timestamp"].iloc[-1])
+            if candidate_ts is not None and (existing_ts is None or candidate_ts > existing_ts):
+                stale_candidate = frame.copy(deep=False)
+
+        cache = get_ohlc_cache()
+        cached = cache.as_dataframe(symbol, tf, limit=500)
+        if not cached.empty:
+            df_cached = cached.reset_index()
+            if "timestamp" not in df_cached.columns and "index" in df_cached.columns:
+                df_cached = df_cached.rename(columns={"index": "timestamp"})
+            df_cached["symbol"] = symbol
+            fresh, _ = self._data_freshness(df_cached, tf)
+            if fresh:
+                self._market_data_cache[(symbol, tf)] = (now, df_cached)
+                return df_cached
+            if not require_live_bars:
+                remember_stale(df_cached)
+
+        cache_key = (symbol, tf)
+        local_cached = self._market_data_cache.get(cache_key)
+        if local_cached is not None:
+            _, cached_df = local_cached
+            fresh, _ = self._data_freshness(cached_df, tf)
+            if fresh:
+                return cached_df.copy(deep=False)
+            if not require_live_bars:
+                remember_stale(cached_df)
+
+        return stale_candidate.copy(deep=False) if stale_candidate is not None else None
+
+    async def _fetch_market_data(
+        self,
+        symbol: str,
+        timeframe: Optional[str] = None,
+        *,
+        live_only: bool = False,
+    ) -> Optional[pd.DataFrame]:
         """Fetch recent OHLC candles for NSE/US/Crypto symbols."""
         tf = str(timeframe or self.config.timeframe).strip().upper()
-        try:
-            from src.data.ohlc_cache import get_ohlc_cache
-
-            market = self._symbol_market(symbol)
-            now = datetime.now(tz=IST)
-            require_live_bars = self._requires_live_bars(market, tf, now)
-            stale_candidate: Optional[pd.DataFrame] = None
-
-            def remember_stale(frame: Optional[pd.DataFrame]) -> None:
-                nonlocal stale_candidate
-                if frame is None or frame.empty or "timestamp" not in frame.columns:
-                    return
-                if stale_candidate is None:
-                    stale_candidate = frame.copy(deep=False)
-                    return
-                candidate_ts = self._coerce_ist_timestamp(frame["timestamp"].iloc[-1])
-                existing_ts = self._coerce_ist_timestamp(stale_candidate["timestamp"].iloc[-1])
-                if candidate_ts is not None and (existing_ts is None or candidate_ts > existing_ts):
-                    stale_candidate = frame.copy(deep=False)
-
-            # 1) Fast path: in-memory cache.
-            cache = get_ohlc_cache()
-            cached = cache.as_dataframe(symbol, tf, limit=500)
-            if not cached.empty:
-                df_cached = cached.reset_index()
-                if "timestamp" not in df_cached.columns and "index" in df_cached.columns:
-                    df_cached = df_cached.rename(columns={"index": "timestamp"})
-                df_cached["symbol"] = symbol
-                fresh, _ = self._data_freshness(df_cached, tf)
-                if fresh:
-                    return df_cached
-                if not require_live_bars:
-                    remember_stale(df_cached)
-
-            # 2) In-process cache to avoid repeated external API fetches
-            # within a single scan cycle across strategies/timeframes.
-            cache_key = (symbol, tf)
-            local_cached = self._market_data_cache.get(cache_key)
-            if local_cached is not None:
-                cached_at, cached_df = local_cached
-                if now - cached_at <= self._market_data_cache_ttl:
-                    fresh, _ = self._data_freshness(cached_df, tf)
+        market = self._symbol_market(symbol)
+        with self._latency_tracker.track(
+            "market_data_fetch_ms",
+            symbol=symbol,
+            market=market,
+            timeframe=tf,
+        ):
+            try:
+                memory_frame = await self._fetch_market_data_from_memory(symbol, tf)
+                if memory_frame is not None and not memory_frame.empty:
+                    fresh, _ = self._data_freshness(memory_frame, tf)
                     if fresh:
-                        return cached_df.copy(deep=False)
+                        return memory_frame
+                if live_only and self._event_driven_hot_path_timeframe_supported(tf):
+                    return memory_frame
+
+                now = datetime.now(tz=IST)
+                require_live_bars = self._requires_live_bars(market, tf, now)
+                stale_candidate = memory_frame.copy(deep=False) if memory_frame is not None else None
+
+                # In-process cache to avoid repeated external API fetches
+                # within a single scan cycle across strategies/timeframes.
+                cache_key = (symbol, tf)
+                local_cached = self._market_data_cache.get(cache_key)
+                if local_cached is not None:
+                    cached_at, cached_df = local_cached
+                    if now - cached_at <= self._market_data_cache_ttl:
+                        fresh, _ = self._data_freshness(cached_df, tf)
+                        if fresh:
+                            return cached_df.copy(deep=False)
+                        if not require_live_bars and stale_candidate is None:
+                            stale_candidate = cached_df.copy(deep=False)
+
+                # TimescaleDB fallback before external broker calls. This reduces
+                # FYERS rate pressure during live NSE sessions if the background
+                # collectors already persisted the latest bars.
+                db_df = await self._fetch_database_market_data(symbol, tf)
+                if db_df is not None and not db_df.empty:
+                    fresh, _ = self._data_freshness(db_df, tf)
+                    if fresh:
+                        self._market_data_cache[cache_key] = (now, db_df)
+                        return db_df
                     if not require_live_bars:
-                        remember_stale(cached_df)
+                        if stale_candidate is None:
+                            stale_candidate = db_df.copy(deep=False)
+                        else:
+                            candidate_ts = self._coerce_ist_timestamp(db_df["timestamp"].iloc[-1])
+                            existing_ts = self._coerce_ist_timestamp(stale_candidate["timestamp"].iloc[-1])
+                            if candidate_ts is not None and (existing_ts is None or candidate_ts > existing_ts):
+                                stale_candidate = db_df.copy(deep=False)
 
-            # 3) TimescaleDB fallback before external broker calls. This reduces
-            # FYERS rate pressure during live NSE sessions if the background
-            # collectors already persisted the latest bars.
-            db_df = await self._fetch_database_market_data(symbol, tf)
-            if db_df is not None and not db_df.empty:
-                fresh, _ = self._data_freshness(db_df, tf)
-                if fresh:
-                    self._market_data_cache[cache_key] = (now, db_df)
-                    return db_df
-                if not require_live_bars:
-                    remember_stale(db_df)
+                # Market-specific primary source.
+                if market == "US":
+                    us_df = await self._fetch_us_market_data(symbol, tf)
+                    if us_df is not None and not us_df.empty:
+                        self._market_data_cache[cache_key] = (now, us_df)
+                        return us_df
+                elif market == "CRYPTO":
+                    crypto_df = await self._fetch_crypto_market_data(symbol, tf)
+                    if crypto_df is not None and not crypto_df.empty:
+                        self._market_data_cache[cache_key] = (now, crypto_df)
+                        return crypto_df
 
-            # 4) Market-specific primary source.
-            if market == "US":
-                us_df = await self._fetch_us_market_data(symbol, tf)
-                if us_df is not None and not us_df.empty:
-                    self._market_data_cache[cache_key] = (now, us_df)
-                    return us_df
-            elif market == "CRYPTO":
-                crypto_df = await self._fetch_crypto_market_data(symbol, tf)
-                if crypto_df is not None and not crypto_df.empty:
-                    self._market_data_cache[cache_key] = (now, crypto_df)
-                    return crypto_df
+                # Broker fallback (NSE + any symbol supported by broker).
+                fyers_df = await self._fetch_fyers_market_data(symbol, tf)
+                if fyers_df is not None and not fyers_df.empty:
+                    self._market_data_cache[cache_key] = (now, fyers_df)
+                    return fyers_df
 
-            # 5) Broker fallback (NSE + any symbol supported by broker).
-            fyers_df = await self._fetch_fyers_market_data(symbol, tf)
-            if fyers_df is not None and not fyers_df.empty:
-                self._market_data_cache[cache_key] = (now, fyers_df)
-                return fyers_df
-
-            # 6) Last fallback for US/crypto in case primary source failed transiently.
-            if market == "US":
-                us_df = await self._fetch_us_market_data(symbol, tf)
-                if us_df is not None and not us_df.empty:
-                    self._market_data_cache[cache_key] = (now, us_df)
-                    return us_df
-                return stale_candidate.copy(deep=False) if stale_candidate is not None else None
-            if market == "CRYPTO":
-                crypto_df = await self._fetch_crypto_market_data(symbol, tf)
-                if crypto_df is not None and not crypto_df.empty:
-                    self._market_data_cache[cache_key] = (now, crypto_df)
-                    return crypto_df
-                return stale_candidate.copy(deep=False) if stale_candidate is not None else None
-            if stale_candidate is not None:
-                self._market_data_cache[cache_key] = (now, stale_candidate)
-                return stale_candidate.copy(deep=False)
-            return None
-
-        except Exception as e:
-            logger.warning("fetch_market_data_error", symbol=symbol, timeframe=tf, error=str(e))
-            return None
+                # Last fallback for US/crypto in case primary source failed transiently.
+                if market == "US":
+                    us_df = await self._fetch_us_market_data(symbol, tf)
+                    if us_df is not None and not us_df.empty:
+                        self._market_data_cache[cache_key] = (now, us_df)
+                        return us_df
+                    return stale_candidate.copy(deep=False) if stale_candidate is not None else None
+                if market == "CRYPTO":
+                    crypto_df = await self._fetch_crypto_market_data(symbol, tf)
+                    if crypto_df is not None and not crypto_df.empty:
+                        self._market_data_cache[cache_key] = (now, crypto_df)
+                        return crypto_df
+                    return stale_candidate.copy(deep=False) if stale_candidate is not None else None
+                if stale_candidate is not None:
+                    self._market_data_cache[cache_key] = (now, stale_candidate)
+                    return stale_candidate.copy(deep=False)
+                return None
+            except Exception as e:
+                logger.warning("fetch_market_data_error", symbol=symbol, timeframe=tf, error=str(e))
+                return None
 
     def _requires_live_bars(self, market: str, timeframe: str, now: Optional[datetime] = None) -> bool:
         token = str(timeframe or "").strip().upper()
@@ -5146,10 +7058,21 @@ class TradingAgent:
         if not symbols:
             return {}
 
+        prices: Dict[str, float] = {}
+        unresolved: List[str] = []
+        for symbol in symbols:
+            broker_price = self._latest_stream_price(symbol)
+            if broker_price is not None:
+                prices[symbol] = broker_price
+            else:
+                unresolved.append(symbol)
+        if not unresolved:
+            return prices
+
         nse_symbols: List[str] = []
         us_symbols: List[str] = []
         crypto_symbols: List[str] = []
-        for symbol in symbols:
+        for symbol in unresolved:
             market = self._symbol_market(symbol)
             if market == "US":
                 us_symbols.append(symbol)
@@ -5157,8 +7080,6 @@ class TradingAgent:
                 crypto_symbols.append(symbol)
             else:
                 nse_symbols.append(symbol)
-
-        prices: Dict[str, float] = {}
 
         if nse_symbols:
             if not self.fyers_client.is_authenticated:
@@ -5193,6 +7114,30 @@ class TradingAgent:
             prices.update(await self._fetch_crypto_live_prices(crypto_symbols))
 
         return prices
+
+    def _latest_stream_price(self, symbol: str) -> float | None:
+        if self._tick_broker is None:
+            return None
+        payload = self._tick_broker.latest(symbol)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            price = float(payload.get("ltp") or payload.get("close") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0 else None
+
+    def _apply_stream_mark_price(self, symbol: str, price: float) -> None:
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            return
+        if px <= 0:
+            return
+        position = self.position_manager.update_price(symbol, px)
+        if position is None:
+            return
+        self.risk_manager.sync_position_value(symbol, float(position.quantity or 0) * px)
 
     async def _fetch_us_live_prices(self, symbols: List[str]) -> Dict[str, float]:
         ticker_to_symbol = {
@@ -5503,6 +7448,15 @@ class TradingAgent:
         qty = max(min(qty, eligible_qty), 1)
         avg_price = float(plan.entry_price) if plan is not None else float(pos_obj.avg_price)
         entry_value = max(avg_price * qty, 1e-6)
+        if not self.config.paper_mode and self._symbol_has_pending_live_order(symbol):
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Exit Deferred — {short_name}",
+                message="A live broker order for this symbol is still pending. Waiting before sending another exit.",
+                severity="warning",
+                metadata={"symbol": symbol, "reason": reason, "pending_live_order": True},
+            ))
+            return
         close_side = OrderSide.SELL if pos_obj.side == PositionSide.LONG else OrderSide.BUY
         order = Order(
             symbol=symbol,
@@ -5527,7 +7481,21 @@ class TradingAgent:
             },
         ))
 
-        placed = self.order_manager.place_order(order)
+        if self.config.paper_mode:
+            placed = self.order_manager.place_order(order)
+        else:
+            await self._queue_live_exit_submission(
+                order=order,
+                symbol=symbol,
+                short_name=short_name,
+                quantity=qty,
+                reason=reason,
+                avg_price=avg_price,
+                entry_value=entry_value,
+                current_price=current_price,
+                plan=plan,
+            )
+            return
         executed = placed.order
         if not placed.success or executed is None or executed.status not in (
             OrderStatus.FILLED,
@@ -5549,82 +7517,61 @@ class TradingAgent:
             ))
             return
 
-        fill_price = float(executed.fill_price or current_price)
-        try:
-            realized = self.position_manager.close_position(
-                symbol,
-                fill_price,
-                quantity=qty,
-                strategy_tag=(plan.strategy if plan is not None else None),
+        if self.config.paper_mode:
+            await self._finalize_live_exit_fill(
+                context=PendingLiveExitOrder(
+                    order_id=str(executed.order_id or ""),
+                    symbol=symbol,
+                    short_name=short_name,
+                    quantity=qty,
+                    reason=reason,
+                    avg_price=avg_price,
+                    entry_value=entry_value,
+                    exit_price_hint=current_price,
+                    plan=plan,
+                ),
+                order=executed,
+                fill_quantity=self._resolved_fill_quantity(executed.fill_quantity, qty),
+                fill_price=float(executed.fill_price or current_price),
             )
-        except ValueError as exc:
-            logger.warning(
-                "position_close_mismatch",
+        else:
+            order_id = str(executed.order_id or "")
+            self._pending_live_exits[order_id] = PendingLiveExitOrder(
+                order_id=order_id,
                 symbol=symbol,
-                strategy=(plan.strategy if plan is not None else None),
+                short_name=short_name,
                 quantity=qty,
-                error=str(exc),
+                reason=reason,
+                avg_price=avg_price,
+                entry_value=entry_value,
+                exit_price_hint=current_price,
+                plan=plan,
             )
-            self._remove_exit_plan(symbol, plan.strategy if plan is not None else None)
+            self._persist_live_runtime_state()
             await self.event_bus.emit(AgentEvent(
-                event_type=AgentEventType.AGENT_ERROR,
-                title=f"Exit State Mismatch — {short_name}",
-                message=str(exc),
-                severity="warning",
+                event_type=AgentEventType.ORDER_PLACED,
+                title=f"Exit Submitted — {short_name}",
+                message=f"{close_side.name} {qty} units submitted. Waiting for broker fill confirmation.",
+                severity="success",
                 metadata={
                     "symbol": symbol,
-                    "strategy": (plan.strategy if plan is not None else None),
+                    "underlying_symbol": (plan.underlying_symbol if plan is not None else symbol),
                     "reason": reason,
                     "quantity": qty,
+                    "order_id": order_id,
+                    "status": executed.status.value,
                 },
             ))
-            return
-        self.risk_manager.record_trade_result(realized)
-        remaining_pos = self.position_manager.get_position(symbol)
-        if remaining_pos is None:
-            self.risk_manager.sync_position_value(symbol, 0.0)
-        else:
-            self.risk_manager.sync_position_value(
-                symbol,
-                remaining_pos.quantity * max(remaining_pos.current_price or fill_price, fill_price),
-            )
-        self._remove_exit_plan(symbol, plan.strategy if plan is not None else None)
-
-        pnl_pct = (realized / entry_value) * 100.0
-        if plan is not None:
-            reinforcement_market = self._symbol_market(plan.underlying_symbol if plan.underlying_symbol else symbol)
-            self._record_reinforcement(plan.strategy, pnl_pct, market=reinforcement_market)
-            engine = self._online_learning_engine
-            if engine is not None and plan.signal_id:
-                asyncio.ensure_future(
-                    engine.label_outcome(
-                        signal_id=plan.signal_id,
-                        pnl_pct=pnl_pct,
-                        exit_timestamp=datetime.now(tz=IST),
-                    )
+            if int(executed.fill_quantity or 0) > 0:
+                await self._finalize_live_exit_fill(
+                    context=self._pending_live_exits[order_id],
+                    order=executed,
+                    fill_quantity=int(executed.fill_quantity),
+                    fill_price=float(executed.fill_price or current_price),
                 )
-
-        await self.event_bus.emit(AgentEvent(
-            event_type=AgentEventType.POSITION_CLOSED,
-            title=f"Position Closed — {short_name}",
-            message=(
-                f"Exit: {reason}. Qty: {qty}. "
-                f"Entry: {avg_price:,.2f} | Exit: {fill_price:,.2f} | "
-                f"PnL: {realized:+,.2f} ({pnl_pct:+.2f}%)."
-            ),
-            severity="success" if realized >= 0 else "warning",
-            metadata={
-                "symbol": symbol,
-                "underlying_symbol": (plan.underlying_symbol if plan is not None else symbol),
-                "reason": reason,
-                "quantity": qty,
-                "entry_price": avg_price,
-                "exit_price": fill_price,
-                "pnl": realized,
-                "pnl_pct": pnl_pct,
-                "strategy": (plan.strategy if plan else ""),
-            },
-        ))
+                if executed.status == OrderStatus.FILLED:
+                    self._pending_live_exits.pop(order_id, None)
+                    self._persist_live_runtime_state()
 
     # ------------------------------------------------------------------
     # Exit Condition Checks
@@ -5651,7 +7598,27 @@ class TradingAgent:
         eod_buffer_minutes = max(int(self.risk_manager.config.time_based_exit_minutes), 1)
 
         for pos_obj in self.position_manager.get_all_positions():
-            symbol = pos_obj.symbol
+            await self._check_position_exit(
+                pos_obj.symbol,
+                now=now,
+                eod_buffer_minutes=eod_buffer_minutes,
+                emit_position_update=True,
+            )
+
+    async def _check_position_exit(
+        self,
+        symbol: str,
+        *,
+        now: datetime,
+        eod_buffer_minutes: int,
+        emit_position_update: bool,
+    ) -> bool:
+        async with self._scan_lock(symbol):
+            pos_obj = self.position_manager.get_position(symbol)
+            if pos_obj is None or int(pos_obj.quantity or 0) <= 0:
+                self._remove_exit_plan(symbol)
+                return False
+
             short_name = symbol.split(":")[-1].split("-")[0]
             quantity = int(pos_obj.quantity)
             avg_price = float(pos_obj.avg_price)
@@ -5660,7 +7627,6 @@ class TradingAgent:
             unrealized_pnl_pct = float(pos_obj.unrealized_pnl_pct)
             side = str(pos_obj.side.value).upper()
 
-            # Time-based exit near market close
             if self._should_force_eod_exit(symbol, now, eod_buffer_minutes):
                 symbol_plans = self._symbol_exit_plans(symbol)
                 if symbol_plans:
@@ -5680,12 +7646,10 @@ class TradingAgent:
                         reason="eod_exit",
                         plan=None,
                     )
-                continue
+                return True
 
             symbol_plans = self._symbol_exit_plans(symbol)
             if not symbol_plans and not self._is_index_symbol(symbol):
-                # Recover exit control for carry-forward option positions that
-                # may exist after process restarts.
                 for view in self.position_manager.get_position_views(symbol=symbol):
                     self._upsert_option_exit_plan(
                         symbol=symbol,
@@ -5724,16 +7688,17 @@ class TradingAgent:
                             plan=plan,
                         )
                         triggered = True
-                if triggered:
-                    continue
+                if triggered or not emit_position_update:
+                    return triggered
+
+            if not emit_position_update:
+                return False
 
             plan = self._display_exit_plan(symbol)
-
             time_left_sec = 0
             if plan is not None:
                 time_left_sec = max(int((plan.time_exit_at - now).total_seconds()), 0)
 
-            # Emit position update
             await self.event_bus.emit(AgentEvent(
                 event_type=AgentEventType.POSITION_UPDATE,
                 title=f"Position: {short_name}",
@@ -5770,6 +7735,7 @@ class TradingAgent:
                     ),
                 },
             ))
+            return False
 
     async def refresh_position_marks(self, symbols: Optional[List[str]] = None) -> Dict[str, float]:
         """Refresh current marks for open positions using live multi-market quotes."""
@@ -5786,7 +7752,7 @@ class TradingAgent:
             except (TypeError, ValueError):
                 continue
             if px > 0:
-                self.position_manager.update_price(symbol, px)
+                self._apply_stream_mark_price(symbol, px)
         return prices
 
     def _should_force_eod_exit(self, symbol: str, now_ist: datetime, buffer_minutes: int) -> bool:

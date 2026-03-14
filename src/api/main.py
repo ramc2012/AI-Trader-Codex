@@ -10,11 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
 
 from src.api.dependencies import (
+    get_execution_event_publisher,
     get_fractal_scan_notifier,
     get_fyers_client,
     get_runtime_manager,
     get_telegram_notifier,
     get_tick_aggregator,
+    get_transport_analytics_consumer,
+    get_transport_mirror,
     get_trading_agent,
 )
 from src.api.routes.backtest import router as backtest_router
@@ -170,6 +173,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application startup/shutdown lifecycle."""
     setup_logging()
     logger.info("app_starting")
+    settings = get_settings()
     # Eagerly create the DB engine so connection issues surface early
     get_engine()
     await apply_runtime_migrations()
@@ -180,6 +184,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     asyncio.create_task(start_auto_collection())
     runtime_manager = get_runtime_manager()
     asyncio.create_task(runtime_manager.start())
+    asyncio.create_task(get_execution_event_publisher().start())
+    if settings.analytics_consumer_enabled and settings.analytics_consumer_embedded_enabled:
+        asyncio.create_task(get_transport_analytics_consumer().start())
+    if settings.transport_mirror_enabled and settings.transport_mirror_embedded_enabled:
+        asyncio.create_task(get_transport_mirror().start())
     asyncio.create_task(warm_global_watchlist_cache())
     # Start real-time tick aggregator (footprint/orderflow)
     aggregator = get_tick_aggregator()
@@ -190,7 +199,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     fractal_scan_notifier = get_fractal_scan_notifier()
     asyncio.create_task(fractal_scan_notifier.start())
 
-    settings = get_settings()
     if settings.agent_auto_start:
         async def _auto_start_agent() -> None:
             # Small delay so runtime/cache tasks begin first.
@@ -212,6 +220,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         asyncio.create_task(_auto_start_agent())
 
     yield
+
+    try:
+        await get_execution_event_publisher().stop()
+    except Exception:
+        pass
+
+    if settings.analytics_consumer_enabled and settings.analytics_consumer_embedded_enabled:
+        try:
+            await get_transport_analytics_consumer().stop()
+        except Exception:
+            pass
 
     try:
         agent = get_trading_agent()

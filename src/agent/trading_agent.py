@@ -52,6 +52,7 @@ from src.execution.order_manager import (
     OrderType,
     ProductType,
 )
+from src.execution.order_submitter import OrderSubmitter
 from src.execution.position_manager import PositionManager, PositionSide
 from src.execution.strategy_executor import StrategyExecutor
 from src.integrations.fyers_client import FyersClient
@@ -217,10 +218,46 @@ class PendingLiveEntryOrder:
 
 
 @dataclass
+class PendingLiveEntrySubmission:
+    """Queued live entry awaiting broker acknowledgement."""
+
+    submission_id: str
+    symbol: str
+    underlying_symbol: str
+    short_name: str
+    execution_short_name: str
+    quantity: int
+    side: OrderSide
+    strategy: str
+    market: str
+    execution_timeframe: str
+    entry_price_hint: float
+    stop_loss: float
+    target: float
+    signal_id: str
+    option_contract: Optional[OptionContract] = None
+
+
+@dataclass
 class PendingLiveExitOrder:
     """Locally tracked live exit order awaiting broker fills."""
 
     order_id: str
+    symbol: str
+    short_name: str
+    quantity: int
+    reason: str
+    avg_price: float
+    entry_value: float
+    exit_price_hint: float
+    plan: Optional[OptionExitPlan] = None
+
+
+@dataclass
+class PendingLiveExitSubmission:
+    """Queued live exit awaiting broker acknowledgement."""
+
+    submission_id: str
     symbol: str
     short_name: str
     quantity: int
@@ -250,6 +287,7 @@ class TradingAgent:
         fyers_client: FyersClient,
         candle_broker: Any | None = None,
         order_event_broker: Any | None = None,
+        order_submitter: OrderSubmitter | None = None,
     ) -> None:
         self.config = config
         self.executor = strategy_executor
@@ -260,6 +298,7 @@ class TradingAgent:
         self.fyers_client = fyers_client
         self._candle_broker = candle_broker
         self._order_event_broker = order_event_broker
+        self._order_submitter = order_submitter or OrderSubmitter(order_manager)
         runtime_settings = get_settings()
         self._runtime_state_path: Path | None = (
             None
@@ -296,9 +335,12 @@ class TradingAgent:
         )
         self._event_driven_task: Optional[asyncio.Task[None]] = None
         self._order_event_task: Optional[asyncio.Task[None]] = None
+        self._order_submit_task: Optional[asyncio.Task[None]] = None
         self._symbol_scan_locks: Dict[str, asyncio.Lock] = {}
         self._pending_live_entries: Dict[str, PendingLiveEntryOrder] = {}
         self._pending_live_exits: Dict[str, PendingLiveExitOrder] = {}
+        self._pending_live_entry_submissions: Dict[str, PendingLiveEntrySubmission] = {}
+        self._pending_live_exit_submissions: Dict[str, PendingLiveExitSubmission] = {}
 
         self.state = AgentState.IDLE
         self._task: Optional[asyncio.Task[None]] = None
@@ -353,6 +395,8 @@ class TradingAgent:
         self._market_trade_counts.clear()
         self._pending_live_entries.clear()
         self._pending_live_exits.clear()
+        self._pending_live_entry_submissions.clear()
+        self._pending_live_exit_submissions.clear()
 
         self.order_manager.paper_mode = self.config.paper_mode
         self.executor.paper_mode = self.config.paper_mode
@@ -396,11 +440,14 @@ class TradingAgent:
             await self._init_online_learning()
             if not self.config.paper_mode:
                 await self._recover_live_broker_state()
+                await self._order_submitter.start()
             self._task = asyncio.create_task(self._main_loop())
             if self._candle_broker is not None and self.config.event_driven_execution_enabled:
                 self._event_driven_task = asyncio.create_task(self._event_driven_loop())
             if self._order_event_broker is not None and not self.config.paper_mode:
                 self._order_event_task = asyncio.create_task(self._order_event_loop())
+            if not self.config.paper_mode:
+                self._order_submit_task = asyncio.create_task(self._order_submit_result_loop())
             logger.info("trading_agent_started", config=self.config.__dict__)
         except Exception as exc:
             self.state = AgentState.ERROR
@@ -442,6 +489,15 @@ class TradingAgent:
             except asyncio.CancelledError:
                 pass
         self._order_event_task = None
+        if self._order_submit_task and not self._order_submit_task.done():
+            self._order_submit_task.cancel()
+            try:
+                await self._order_submit_task
+            except asyncio.CancelledError:
+                pass
+        self._order_submit_task = None
+        if self._order_submitter is not None:
+            await self._order_submitter.stop()
 
         self.executor.stop()
         self._strategy_perf_tracker._persist_state()
@@ -545,6 +601,10 @@ class TradingAgent:
             return False
         return any(context.symbol == token for context in self._pending_live_entries.values()) or any(
             context.symbol == token for context in self._pending_live_exits.values()
+        ) or any(
+            context.symbol == token for context in self._pending_live_entry_submissions.values()
+        ) or any(
+            context.symbol == token for context in self._pending_live_exit_submissions.values()
         )
 
     @staticmethod
@@ -591,6 +651,352 @@ class TradingAgent:
             raise
         finally:
             self._order_event_broker.unsubscribe("*", queue)
+
+    async def _order_submit_result_loop(self) -> None:
+        broker = self._order_submitter.result_broker
+        queue = broker.subscribe("*")
+        try:
+            while self.state == AgentState.RUNNING:
+                payload = await queue.get()
+                await self._handle_order_submit_result(payload)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            broker.unsubscribe("*", queue)
+
+    async def _handle_order_submit_result(self, payload: Dict[str, Any]) -> None:
+        if str(payload.get("type") or "").strip() != "order_submission_result":
+            return
+        submission_id = str(payload.get("submission_id") or "").strip()
+        if not submission_id:
+            return
+        if submission_id in self._pending_live_entry_submissions:
+            await self._handle_entry_submit_result(submission_id, payload)
+            return
+        if submission_id in self._pending_live_exit_submissions:
+            await self._handle_exit_submit_result(submission_id, payload)
+
+    @staticmethod
+    def _order_from_submission_payload(payload: Dict[str, Any]) -> Optional[Order]:
+        snapshot = payload.get("order_snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        try:
+            order = Order(
+                symbol=str(snapshot.get("symbol") or ""),
+                quantity=int(snapshot.get("quantity") or 0),
+                side=OrderSide[str(snapshot.get("side") or "BUY")],
+                order_type=OrderType[str(snapshot.get("order_type") or "MARKET")],
+                product_type=ProductType(str(snapshot.get("product_type") or ProductType.INTRADAY.value)),
+                limit_price=(
+                    float(snapshot["limit_price"])
+                    if snapshot.get("limit_price") not in (None, "")
+                    else None
+                ),
+                stop_price=(
+                    float(snapshot["stop_price"])
+                    if snapshot.get("stop_price") not in (None, "")
+                    else None
+                ),
+                market_price_hint=(
+                    float(snapshot["market_price_hint"])
+                    if snapshot.get("market_price_hint") not in (None, "")
+                    else None
+                ),
+                tag=str(snapshot.get("tag") or ""),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        order.order_id = str(snapshot.get("order_id") or "") or None
+        status_token = str(snapshot.get("status") or "").strip().lower()
+        if status_token:
+            try:
+                order.status = OrderStatus(status_token)
+            except ValueError:
+                pass
+        order.fill_price = TradingAgent._safe_float(snapshot.get("fill_price"))
+        order.fill_quantity = int(snapshot.get("fill_quantity") or 0)
+        order.rejection_reason = str(snapshot.get("rejection_reason") or "") or None
+        placed_at = snapshot.get("placed_at")
+        if placed_at:
+            order.placed_at = datetime.fromisoformat(str(placed_at))
+        filled_at = snapshot.get("filled_at")
+        if filled_at:
+            order.filled_at = datetime.fromisoformat(str(filled_at))
+        return order
+
+    async def _handle_entry_submit_result(self, submission_id: str, payload: Dict[str, Any]) -> None:
+        context = self._pending_live_entry_submissions.pop(submission_id, None)
+        if context is None:
+            return
+        order_id = str(payload.get("order_id") or "").strip()
+        order = self.order_manager.get_order(order_id) if order_id else None
+        if order is None:
+            order = self._order_from_submission_payload(payload)
+        if order is None:
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Order Failed — {context.short_name}",
+                message=str(payload.get("message") or "Order submission failed."),
+                severity="error",
+                metadata={"symbol": context.symbol, "underlying_symbol": context.underlying_symbol},
+            ))
+            return
+
+        if bool(payload.get("success")) and order.status in (
+            OrderStatus.FILLED,
+            OrderStatus.PLACED,
+            OrderStatus.PARTIALLY_FILLED,
+        ):
+            resolved_order_id = str(order.order_id or submission_id)
+            self._pending_live_entries[resolved_order_id] = PendingLiveEntryOrder(
+                order_id=resolved_order_id,
+                symbol=context.symbol,
+                underlying_symbol=context.underlying_symbol,
+                short_name=context.short_name,
+                execution_short_name=context.execution_short_name,
+                quantity=context.quantity,
+                side=context.side,
+                strategy=context.strategy,
+                market=context.market,
+                execution_timeframe=context.execution_timeframe,
+                entry_price_hint=context.entry_price_hint,
+                stop_loss=context.stop_loss,
+                target=context.target,
+                signal_id=context.signal_id,
+                option_contract=context.option_contract,
+            )
+            self._persist_live_runtime_state()
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_PLACED,
+                title=f"Order Submitted — {context.short_name}",
+                message=(
+                    f"{context.side.name} {context.quantity} x {context.execution_short_name}. "
+                    "Waiting for broker fill confirmation."
+                ),
+                severity="success",
+                metadata={
+                    "symbol": context.symbol,
+                    "underlying_symbol": context.underlying_symbol,
+                    "side": context.side.name,
+                    "quantity": context.quantity,
+                    "stop_loss": context.stop_loss,
+                    "target": context.target,
+                    "order_id": resolved_order_id,
+                    "strategy": context.strategy,
+                    "status": order.status.value,
+                    "submission_id": submission_id,
+                },
+            ))
+            if int(order.fill_quantity or 0) > 0:
+                await self._finalize_live_entry_fill(
+                    context=self._pending_live_entries[resolved_order_id],
+                    order=order,
+                    fill_quantity=int(order.fill_quantity),
+                    fill_price=float(order.fill_price or context.entry_price_hint),
+                )
+                if order.status == OrderStatus.FILLED:
+                    self._pending_live_entries.pop(resolved_order_id, None)
+                    self._persist_live_runtime_state()
+            return
+
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_REJECTED,
+            title=f"Order Rejected — {context.short_name}",
+            message=(
+                f"Order was {order.status.value}. Reason: "
+                f"{order.rejection_reason or payload.get('message') or 'unknown'}."
+            ),
+            severity="error",
+            metadata={
+                "symbol": context.symbol,
+                "underlying_symbol": context.underlying_symbol,
+                "status": order.status.value,
+                "reason": order.rejection_reason or payload.get("message") or "unknown",
+                "submission_id": submission_id,
+            },
+        ))
+
+    async def _handle_exit_submit_result(self, submission_id: str, payload: Dict[str, Any]) -> None:
+        context = self._pending_live_exit_submissions.pop(submission_id, None)
+        if context is None:
+            return
+        order_id = str(payload.get("order_id") or "").strip()
+        order = self.order_manager.get_order(order_id) if order_id else None
+        if order is None:
+            order = self._order_from_submission_payload(payload)
+        if order is None:
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Exit Failed — {context.short_name}",
+                message=str(payload.get("message") or "Exit submission failed."),
+                severity="error",
+                metadata={"symbol": context.symbol, "reason": context.reason},
+            ))
+            return
+
+        if bool(payload.get("success")) and order.status in (
+            OrderStatus.FILLED,
+            OrderStatus.PLACED,
+            OrderStatus.PARTIALLY_FILLED,
+        ):
+            resolved_order_id = str(order.order_id or submission_id)
+            self._pending_live_exits[resolved_order_id] = PendingLiveExitOrder(
+                order_id=resolved_order_id,
+                symbol=context.symbol,
+                short_name=context.short_name,
+                quantity=context.quantity,
+                reason=context.reason,
+                avg_price=context.avg_price,
+                entry_value=context.entry_value,
+                exit_price_hint=context.exit_price_hint,
+                plan=context.plan,
+            )
+            self._persist_live_runtime_state()
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_PLACED,
+                title=f"Exit Submitted — {context.short_name}",
+                message=f"{order.side.name} {context.quantity} units submitted. Waiting for broker fill confirmation.",
+                severity="success",
+                metadata={
+                    "symbol": context.symbol,
+                    "underlying_symbol": (context.plan.underlying_symbol if context.plan is not None else context.symbol),
+                    "reason": context.reason,
+                    "quantity": context.quantity,
+                    "order_id": resolved_order_id,
+                    "status": order.status.value,
+                    "submission_id": submission_id,
+                },
+            ))
+            if int(order.fill_quantity or 0) > 0:
+                await self._finalize_live_exit_fill(
+                    context=self._pending_live_exits[resolved_order_id],
+                    order=order,
+                    fill_quantity=int(order.fill_quantity),
+                    fill_price=float(order.fill_price or context.exit_price_hint),
+                )
+                if order.status == OrderStatus.FILLED:
+                    self._pending_live_exits.pop(resolved_order_id, None)
+                    self._persist_live_runtime_state()
+            return
+
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_REJECTED,
+            title=f"Exit Rejected — {context.short_name}",
+            message=(
+                f"Exit {order.status.value}. Reason: "
+                f"{order.rejection_reason or payload.get('message') or 'unknown'}."
+            ),
+            severity="error",
+            metadata={
+                "symbol": context.symbol,
+                "reason": context.reason,
+                "status": order.status.value,
+                "reject_reason": order.rejection_reason or payload.get("message") or "unknown",
+                "submission_id": submission_id,
+            },
+        ))
+
+    async def _queue_live_entry_submission(
+        self,
+        *,
+        order: Order,
+        short_name: str,
+        execution_short_name: str,
+        execution_symbol: str,
+        underlying_symbol: str,
+        quantity: int,
+        side: OrderSide,
+        strat_name: str,
+        execution_market: str,
+        execution_timeframe: str,
+        entry_price: float,
+        sl_price: float,
+        target_price: float,
+        signal_id: str,
+        option_contract: OptionContract | None,
+    ) -> bool:
+        submission_id = f"entry-{uuid.uuid4().hex[:12]}"
+        self._pending_live_entry_submissions[submission_id] = PendingLiveEntrySubmission(
+            submission_id=submission_id,
+            symbol=execution_symbol,
+            underlying_symbol=underlying_symbol,
+            short_name=short_name,
+            execution_short_name=execution_short_name,
+            quantity=quantity,
+            side=side,
+            strategy=strat_name,
+            market=execution_market,
+            execution_timeframe=execution_timeframe,
+            entry_price_hint=entry_price,
+            stop_loss=sl_price,
+            target=target_price,
+            signal_id=signal_id,
+            option_contract=option_contract,
+        )
+        accepted = await self._order_submitter.submit(
+            submission_id=submission_id,
+            order=order,
+            metadata={"kind": "entry", "strategy": strat_name},
+        )
+        if accepted:
+            return True
+        self._pending_live_entry_submissions.pop(submission_id, None)
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_REJECTED,
+            title=f"Order Rejected — {short_name}",
+            message="Live submit queue is full. Order was not sent to broker.",
+            severity="error",
+            metadata={
+                "symbol": execution_symbol,
+                "underlying_symbol": underlying_symbol,
+                "strategy": strat_name,
+                "reason": "submit_queue_full",
+            },
+        ))
+        return False
+
+    async def _queue_live_exit_submission(
+        self,
+        *,
+        order: Order,
+        symbol: str,
+        short_name: str,
+        quantity: int,
+        reason: str,
+        avg_price: float,
+        entry_value: float,
+        current_price: float,
+        plan: OptionExitPlan | None,
+    ) -> bool:
+        submission_id = f"exit-{uuid.uuid4().hex[:12]}"
+        self._pending_live_exit_submissions[submission_id] = PendingLiveExitSubmission(
+            submission_id=submission_id,
+            symbol=symbol,
+            short_name=short_name,
+            quantity=quantity,
+            reason=reason,
+            avg_price=avg_price,
+            entry_value=entry_value,
+            exit_price_hint=current_price,
+            plan=plan,
+        )
+        accepted = await self._order_submitter.submit(
+            submission_id=submission_id,
+            order=order,
+            metadata={"kind": "exit", "reason": reason},
+        )
+        if accepted:
+            return True
+        self._pending_live_exit_submissions.pop(submission_id, None)
+        await self.event_bus.emit(AgentEvent(
+            event_type=AgentEventType.ORDER_REJECTED,
+            title=f"Exit Rejected — {short_name}",
+            message="Live submit queue is full. Exit order was not sent to broker.",
+            severity="error",
+            metadata={"symbol": symbol, "reason": reason, "reject_reason": "submit_queue_full"},
+        ))
+        return False
 
     async def _handle_broker_execution_event(self, payload: Dict[str, Any]) -> None:
         event_kind = str(payload.get("event_kind") or "").strip().lower()
@@ -1363,6 +1769,9 @@ class TradingAgent:
             "event_driven_batch_size": int(self.config.event_driven_batch_size),
             "pending_live_entries": len(self._pending_live_entries),
             "pending_live_exits": len(self._pending_live_exits),
+            "pending_live_entry_submissions": len(self._pending_live_entry_submissions),
+            "pending_live_exit_submissions": len(self._pending_live_exit_submissions),
+            "order_submitter": self._order_submitter.snapshot() if self._order_submitter is not None else None,
             "execution_backend": settings.execution_core_backend,
             "execution_transport": settings.execution_transport,
             "streaming_backends": {
@@ -3437,7 +3846,24 @@ class TradingAgent:
                 if self.config.paper_mode:
                     placed = self.order_manager.place_order(order)
                 else:
-                    placed = await asyncio.to_thread(self.order_manager.place_order, order)
+                    await self._queue_live_entry_submission(
+                        order=order,
+                        short_name=short_name,
+                        execution_short_name=execution_short_name,
+                        execution_symbol=execution_symbol,
+                        underlying_symbol=underlying_symbol,
+                        quantity=quantity,
+                        side=side,
+                        strat_name=strat_name,
+                        execution_market=execution_market,
+                        execution_timeframe=execution_timeframe or self.config.timeframe,
+                        entry_price=entry_price,
+                        sl_price=sl_price,
+                        target_price=target_price,
+                        signal_id=signal_id,
+                        option_contract=option_contract,
+                    )
+                    return
 
             executed_order = placed.order
             if placed.success and executed_order is not None and executed_order.status in (
@@ -6632,7 +7058,18 @@ class TradingAgent:
         if self.config.paper_mode:
             placed = self.order_manager.place_order(order)
         else:
-            placed = await asyncio.to_thread(self.order_manager.place_order, order)
+            await self._queue_live_exit_submission(
+                order=order,
+                symbol=symbol,
+                short_name=short_name,
+                quantity=qty,
+                reason=reason,
+                avg_price=avg_price,
+                entry_value=entry_value,
+                current_price=current_price,
+                plan=plan,
+            )
+            return
         executed = placed.order
         if not placed.success or executed is None or executed.status not in (
             OrderStatus.FILLED,

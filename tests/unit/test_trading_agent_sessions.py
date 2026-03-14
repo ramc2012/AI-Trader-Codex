@@ -8,10 +8,18 @@ from unittest.mock import AsyncMock, MagicMock
 import pandas as pd
 import pytest
 
-from src.agent.trading_agent import AgentConfig, OptionContract, OptionExitPlan, PendingLiveEntryOrder, TradingAgent
+from src.agent.trading_agent import (
+    AgentConfig,
+    OptionContract,
+    OptionExitPlan,
+    PendingLiveEntryOrder,
+    PendingLiveEntrySubmission,
+    TradingAgent,
+)
 from src.agent.trading_agent import AgentState
 from src.config.market_hours import IST
 from src.execution.order_manager import BrokerOrderUpdateResult, Order, OrderManager, OrderSide, OrderStatus, OrderType
+from src.execution.order_submitter import OrderSubmitter
 from src.execution.position_manager import PositionManager, PositionSide
 from src.strategies.base import Signal, SignalStrength, SignalType
 
@@ -696,6 +704,129 @@ async def test_close_position_caps_exit_quantity_to_strategy_slice() -> None:
     remaining_views = position_manager.get_position_views(symbol="CRYPTO:ADAUSDT", strategy_tag="RSI_Reversal")
     assert len(remaining_views) == 1
     assert remaining_views[0].quantity == 10
+
+
+@pytest.mark.asyncio
+async def test_close_position_queues_live_exit_submission_without_direct_place_call() -> None:
+    position_manager = PositionManager()
+    position_manager.open_position(
+        symbol="CRYPTO:ADAUSDT",
+        quantity=10,
+        side=PositionSide.LONG,
+        price=1.0,
+        strategy_tag="EMA_Crossover",
+    )
+
+    order_manager = MagicMock()
+    submitter = MagicMock(spec=OrderSubmitter)
+    submitter.submit = AsyncMock(return_value=True)
+    submitter.snapshot.return_value = {}
+
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+
+    agent = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=order_manager,
+        position_manager=position_manager,
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+        order_submitter=submitter,
+    )
+
+    await agent._close_position(
+        symbol="CRYPTO:ADAUSDT",
+        short_name="ADAUSDT",
+        current_price=1.2,
+        reason="target",
+        plan=None,
+    )
+
+    order_manager.place_order.assert_not_called()
+    submitter.submit.assert_awaited_once()
+    assert len(agent._pending_live_exit_submissions) == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_entry_submit_result_promotes_submission_to_pending_live_entry() -> None:
+    event_bus = MagicMock()
+    event_bus.emit = AsyncMock()
+    risk_manager = MagicMock()
+    order_manager = OrderManager(paper_mode=False)
+
+    order = Order(
+        symbol="NSE:NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        tag="EMA_Crossover",
+    )
+    order.order_id = "LIVE-ACK-1"
+    order.status = OrderStatus.PLACED
+    order_manager._orders[order.order_id] = order
+
+    agent = TradingAgent(
+        config=AgentConfig(paper_mode=False),
+        strategy_executor=MagicMock(),
+        order_manager=order_manager,
+        position_manager=PositionManager(),
+        risk_manager=risk_manager,
+        event_bus=event_bus,
+        fyers_client=MagicMock(),
+    )
+    agent._pending_live_entry_submissions["sub-1"] = PendingLiveEntrySubmission(
+        submission_id="sub-1",
+        symbol="NSE:NIFTY26MAR22500CE",
+        underlying_symbol="NSE:NIFTY50-INDEX",
+        short_name="NIFTY",
+        execution_short_name="NIFTY26MAR22500CE",
+        quantity=10,
+        side=OrderSide.BUY,
+        strategy="EMA_Crossover",
+        market="NSE",
+        execution_timeframe="5",
+        entry_price_hint=100.0,
+        stop_loss=95.0,
+        target=110.0,
+        signal_id="sig-1",
+        option_contract=None,
+    )
+
+    await agent._handle_order_submit_result(
+        {
+            "type": "order_submission_result",
+            "submission_id": "sub-1",
+            "success": True,
+            "message": "ok",
+            "order_id": "LIVE-ACK-1",
+            "status": OrderStatus.PLACED.value,
+            "symbol": "NSE:NIFTY26MAR22500CE",
+            "order_snapshot": {
+                "symbol": "NSE:NIFTY26MAR22500CE",
+                "quantity": 10,
+                "side": "BUY",
+                "order_type": "MARKET",
+                "product_type": "INTRADAY",
+                "tag": "EMA_Crossover",
+                "order_id": "LIVE-ACK-1",
+                "status": OrderStatus.PLACED.value,
+                "fill_price": None,
+                "fill_quantity": 0,
+                "rejection_reason": None,
+                "limit_price": None,
+                "stop_price": None,
+                "market_price_hint": 100.0,
+                "placed_at": None,
+                "filled_at": None,
+            },
+        }
+    )
+
+    assert "sub-1" not in agent._pending_live_entry_submissions
+    assert "LIVE-ACK-1" in agent._pending_live_entries
 
 
 @pytest.mark.asyncio

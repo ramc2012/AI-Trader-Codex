@@ -221,7 +221,11 @@ export function ConnectedStep({
       {tokenStatus?.has_saved_pin && (
         <div className="flex items-center gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2">
           <CheckCircle className="h-3.5 w-3.5 text-emerald-400" />
-          <p className="text-xs text-emerald-400">PIN saved — sessions refresh automatically</p>
+          <p className="text-xs text-emerald-400">
+            {tokenStatus.has_refresh_token
+              ? 'PIN saved — sessions refresh automatically'
+              : 'PIN saved, but this session has no refresh token yet — re-authenticate once to enable automatic refresh'}
+          </p>
         </div>
       )}
 

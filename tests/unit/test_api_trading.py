@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from src.api.dependencies import get_order_manager, get_position_manager, get_trading_agent, reset_managers
 from src.api.main import create_app
+from src.api.routes import trading as trading_routes
 from src.api.routes.trading import _build_trade_pairs
 from src.execution.order_manager import Order, OrderManager, OrderSide, OrderType
 from src.execution.position_manager import PositionManager, PositionSide
@@ -32,13 +33,20 @@ def app() -> Tuple[FastAPI, OrderManager, PositionManager]:
         Tuple of (application, order_manager, position_manager).
     """
     reset_managers()
+    trading_routes._LAST_LIVE_MARK_REFRESH_AT = None
     application = create_app()
     om = OrderManager(paper_mode=True)
     pm = PositionManager()
 
     class DummyAgent:
+        def __init__(self) -> None:
+            self.refresh_prices: dict[str, float] = {}
+
         async def refresh_position_marks(self, symbols: list[str]) -> None:
-            return None
+            for symbol in symbols:
+                price = self.refresh_prices.get(symbol)
+                if price is not None:
+                    pm.update_price(symbol, price)
 
         def _display_exit_plan(self, symbol: str):
             return None
@@ -86,10 +94,13 @@ def app() -> Tuple[FastAPI, OrderManager, PositionManager]:
         def total_allocated_capital_inr(self) -> float:
             return 41750000.0
 
+    agent = DummyAgent()
+    application.state.test_agent = agent
     application.dependency_overrides[get_order_manager] = lambda: om
     application.dependency_overrides[get_position_manager] = lambda: pm
-    application.dependency_overrides[get_trading_agent] = lambda: DummyAgent()
+    application.dependency_overrides[get_trading_agent] = lambda: agent
     yield application, om, pm
+    trading_routes._LAST_LIVE_MARK_REFRESH_AT = None
     reset_managers()
 
 
@@ -363,6 +374,30 @@ class TestPortfolio:
         # nifty: (22100 - 22000)*50 = 5000
         # bank:  (48000 - 47900)*25 = 2500
         assert data["total_unrealized_pnl"] == pytest.approx(7500.0)
+
+    def test_portfolio_refreshes_live_marks_before_aggregating(
+        self,
+        client: TestClient,
+        app: Tuple[FastAPI, OrderManager, PositionManager],
+        pm: PositionManager,
+    ) -> None:
+        """Portfolio summary uses refreshed marks instead of stale cached prices."""
+        application, _, _ = app
+        agent = application.state.test_agent
+
+        pm.open_position(
+            symbol="CRYPTO:BTCUSDT",
+            quantity=2,
+            side=PositionSide.LONG,
+            price=100.0,
+        )
+        pm.update_price("CRYPTO:BTCUSDT", 100.0)
+        agent.refresh_prices["CRYPTO:BTCUSDT"] = 110.0
+
+        data = client.get("/api/v1/portfolio").json()
+
+        assert data["positions"]["CRYPTO:BTCUSDT"]["current_price"] == pytest.approx(110.0)
+        assert data["total_unrealized_pnl"] == pytest.approx(20.0)
 
 
 # =========================================================================

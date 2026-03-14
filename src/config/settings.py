@@ -25,6 +25,8 @@ from src.config.agent_universe import (
     DEFAULT_AGENT_CRYPTO_SYMBOLS,
     DEFAULT_AGENT_NSE_SYMBOLS,
     DEFAULT_AGENT_US_SYMBOLS,
+    normalize_nse_agent_symbols,
+    parse_symbol_values,
     to_csv,
 )
 
@@ -140,6 +142,14 @@ class Settings(BaseSettings):
     agent_trade_us_when_open: bool = True
     agent_trade_us_options: bool = True
     agent_trade_crypto_24x7: bool = True
+    agent_india_capital: float = Field(default=250000.0, ge=10000.0)
+    agent_us_capital: float = Field(default=250000.0, ge=1000.0)
+    agent_crypto_capital: float = Field(default=250000.0, ge=1000.0)
+    agent_india_max_instrument_pct: float = Field(default=25.0, ge=1.0, le=100.0)
+    agent_us_max_instrument_pct: float = Field(default=20.0, ge=1.0, le=100.0)
+    agent_crypto_max_instrument_pct: float = Field(default=20.0, ge=1.0, le=100.0)
+    agent_strategy_capital_bucket_enabled: bool = False
+    agent_strategy_max_concurrent_positions: int = Field(default=4, ge=1, le=20)
     agent_liberal_bootstrap_enabled: bool = True
     agent_bootstrap_cycles: int = Field(default=300, ge=1, le=5000)
     agent_bootstrap_size_multiplier: float = Field(default=2.0, ge=1.0, le=5.0)
@@ -218,46 +228,48 @@ class Settings(BaseSettings):
         This validator restores the persisted values only when the resolved field is blank.
         """
         persistent_path = self.credentials_env_path
-        if not persistent_path.exists():
-            return self
+        if persistent_path.exists():
+            try:
+                persisted: dict[str, str] = {}
+                for raw_line in persistent_path.read_text(encoding="utf-8").splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    persisted[key] = value
 
-        try:
-            persisted: dict[str, str] = {}
-            for raw_line in persistent_path.read_text(encoding="utf-8").splitlines():
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                persisted[key] = value
-        except Exception:
-            return self
+                fallback_map = {
+                    "FYERS_APP_ID": "fyers_app_id",
+                    "FYERS_SECRET_KEY": "fyers_secret_key",
+                    "FYERS_REDIRECT_URI": "fyers_redirect_uri",
+                    "FINNHUB_API_KEY": "finnhub_api_key",
+                    "ALPHAVANTAGE_API_KEY": "alphavantage_api_key",
+                    "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
+                    "TELEGRAM_CHAT_ID": "telegram_chat_id",
+                }
 
-        fallback_map = {
-            "FYERS_APP_ID": "fyers_app_id",
-            "FYERS_SECRET_KEY": "fyers_secret_key",
-            "FYERS_REDIRECT_URI": "fyers_redirect_uri",
-            "FINNHUB_API_KEY": "finnhub_api_key",
-            "ALPHAVANTAGE_API_KEY": "alphavantage_api_key",
-            "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
-            "TELEGRAM_CHAT_ID": "telegram_chat_id",
-        }
+                for env_key, field_name in fallback_map.items():
+                    current = getattr(self, field_name, "")
+                    if str(current or "").strip():
+                        continue
+                    persisted_value = str(persisted.get(env_key, "") or "").strip()
+                    if persisted_value:
+                        setattr(self, field_name, persisted_value)
 
-        for env_key, field_name in fallback_map.items():
-            current = getattr(self, field_name, "")
-            if str(current or "").strip():
-                continue
-            persisted_value = str(persisted.get(env_key, "") or "").strip()
-            if persisted_value:
-                setattr(self, field_name, persisted_value)
+                if "TELEGRAM_ENABLED" not in os.environ:
+                    persisted_enabled = str(persisted.get("TELEGRAM_ENABLED", "") or "").strip().lower()
+                    if persisted_enabled in {"1", "true", "yes", "on"}:
+                        self.telegram_enabled = True
+                    elif persisted_enabled in {"0", "false", "no", "off"}:
+                        self.telegram_enabled = False
+            except Exception:
+                pass
 
-        if "TELEGRAM_ENABLED" not in os.environ:
-            persisted_enabled = str(persisted.get("TELEGRAM_ENABLED", "") or "").strip().lower()
-            if persisted_enabled in {"1", "true", "yes", "on"}:
-                self.telegram_enabled = True
-            elif persisted_enabled in {"0", "false", "no", "off"}:
-                self.telegram_enabled = False
+        self.agent_default_symbols = to_csv(normalize_nse_agent_symbols(self.agent_default_symbols))
+        self.agent_us_symbols = to_csv(parse_symbol_values(self.agent_us_symbols))
+        self.agent_crypto_symbols = to_csv(parse_symbol_values(self.agent_crypto_symbols))
 
         return self
 

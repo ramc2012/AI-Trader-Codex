@@ -108,6 +108,7 @@ export function AuthWizard() {
       {currentStep === 2 && (
         <ConnectStep
           loginUrl={loginUrl}
+          tokenStatus={tokenStatus}
           onComplete={() => {
             setForceStep(null);
             setPinPromptDismissed(false);

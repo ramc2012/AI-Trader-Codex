@@ -718,6 +718,25 @@ class FyersClient:
             logger.warning("token_auto_refresh_failed", error=str(exc))
             return False
 
+    def ensure_authenticated_with_saved_pin(self) -> bool:
+        """Ensure the broker session is usable, forcing refresh if needed.
+
+        This handles the case where our locally tracked expiry still looks valid
+        but FYERS has already invalidated the session server-side.
+
+        Returns:
+            True if a refresh happened successfully; otherwise False.
+        """
+        refreshed = self.try_auto_refresh_with_saved_pin(False)
+        if self.is_authenticated:
+            return refreshed
+
+        if not self._is_refresh_token_valid():
+            return refreshed
+
+        logger.info("forcing_saved_pin_refresh_after_auth_failure")
+        return self.try_auto_refresh_with_saved_pin(True)
+
     def auto_refresh_if_needed(self, pin: str | None = None) -> bool:
         """Automatically refresh token if expired or expiring soon.
 

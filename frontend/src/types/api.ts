@@ -368,6 +368,9 @@ export interface TokenStatus {
   refresh_token_expires_in_days: number | null;
   needs_full_reauth: boolean;
   has_saved_pin: boolean;
+  has_access_token: boolean;
+  has_refresh_token: boolean;
+  status_message?: string | null;
 }
 
 export interface ManualAuthResponse {
@@ -407,11 +410,16 @@ export interface FyersCredentials {
   app_id: string;
   redirect_uri: string;
   configured: boolean;
+  secret_configured: boolean;
+  credentials_path?: string | null;
 }
 
 export interface MarketDataProviders {
   finnhub_configured: boolean;
   alphavantage_configured: boolean;
+  finnhub_key_preview?: string | null;
+  alphavantage_key_preview?: string | null;
+  credentials_path?: string | null;
 }
 
 export interface TelegramConfig {
@@ -530,6 +538,8 @@ export interface AgentStatus {
   execution_timeframes?: string[];
   reference_timeframes?: string[];
   telegram_status_interval_minutes?: number;
+  strategy_capital_bucket_enabled?: boolean;
+  strategy_max_concurrent_positions?: number;
   capital_allocations?: Record<string, MarketCapitalAllocation>;
   total_allocated_capital_inr?: number;
   positions_count: number;
@@ -573,6 +583,8 @@ export interface AgentConfig {
   execution_timeframes?: string[];
   reference_timeframes?: string[];
   telegram_status_interval_minutes?: number;
+  strategy_capital_bucket_enabled?: boolean;
+  strategy_max_concurrent_positions?: number;
 }
 
 export interface AgentInspectorBar {

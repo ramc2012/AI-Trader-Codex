@@ -142,7 +142,7 @@ class AgentConfig:
     reinforcement_enabled: bool = True
     reinforcement_alpha: float = 0.2
     reinforcement_size_boost_pct: float = 60.0
-    strategy_capital_bucket_enabled: bool = True
+    strategy_capital_bucket_enabled: bool = False
     strategy_max_concurrent_positions: int = 4
     telegram_status_interval_minutes: int = 30
 
@@ -645,6 +645,8 @@ class TradingAgent:
             "execution_timeframes": self.get_execution_timeframes(),
             "reference_timeframes": self.get_reference_timeframes(),
             "telegram_status_interval_minutes": max(int(self.config.telegram_status_interval_minutes), 0),
+            "strategy_capital_bucket_enabled": bool(self.config.strategy_capital_bucket_enabled),
+            "strategy_max_concurrent_positions": int(self.config.strategy_max_concurrent_positions),
             "capital_allocations": capital_allocations,
             "total_allocated_capital_inr": self.total_allocated_capital_inr(),
             "positions_count": portfolio.get("position_count", 0),
@@ -955,6 +957,19 @@ class TradingAgent:
                 elif pnl_inr < 0:
                     bucket["losses"] += 1
 
+        for position in self.position_manager.get_all_positions():
+            market = self._symbol_market(position.symbol)
+            _, _, fx_to_inr = parse_currency_context(position.symbol, usd_inr_rate=usd_inr_rate)
+            market_value_inr = float(position.market_value) * float(fx_to_inr)
+            unrealized_pnl_inr = float(position.unrealized_pnl) * float(fx_to_inr)
+            bucket = market_bucket(market)
+            bucket["open_positions"] += 1
+            bucket["entries"] = max(int(bucket["entries"]), int(bucket["closed_trades"]) + int(bucket["open_positions"]))
+            bucket["capital_used"] += self._bucket_native_value(bucket, market_value_inr)
+            bucket["capital_used_inr"] += market_value_inr
+            bucket["unrealized_pnl"] += self._bucket_native_value(bucket, unrealized_pnl_inr)
+            bucket["unrealized_pnl_inr"] += unrealized_pnl_inr
+
         for position in self.position_manager.get_position_views():
             market = self._symbol_market(position.symbol)
             strategy = self._normalize_strategy_tag(position.strategy_tag)
@@ -962,7 +977,6 @@ class TradingAgent:
             market_value_inr = float(position.market_value) * float(fx_to_inr)
             unrealized_pnl_inr = float(position.unrealized_pnl) * float(fx_to_inr)
             buckets = (
-                market_bucket(market),
                 strategy_bucket(strategy),
                 strategy_market_bucket(strategy, market),
                 strategy_instrument_bucket(strategy, position.symbol),
@@ -2495,6 +2509,22 @@ class TradingAgent:
         return lots * lot_size
 
     @staticmethod
+    def _normalize_liquidity_units(
+        raw_size: int,
+        *,
+        execution_market: str,
+        lot_size: int,
+    ) -> int:
+        size = max(int(raw_size), 0)
+        if size <= 0:
+            return 0
+        # US option feeds report volume/OI in contracts while the order
+        # manager uses share-equivalent OCC size (100 per contract).
+        if str(execution_market or "").upper() == "US" and int(lot_size) > 1:
+            return size * int(lot_size)
+        return size
+
+    @staticmethod
     def _safe_positive_int(value: Any) -> int:
         try:
             parsed = int(float(value or 0))
@@ -2640,12 +2670,24 @@ class TradingAgent:
                     contract_snapshot = candidate
 
         if contract_snapshot:
-            volume = self._safe_positive_int(contract_snapshot.get("volume"))
-            oi = self._safe_positive_int(contract_snapshot.get("oi"))
+            volume_raw = self._safe_positive_int(contract_snapshot.get("volume"))
+            oi_raw = self._safe_positive_int(contract_snapshot.get("oi"))
+            volume = self._normalize_liquidity_units(
+                volume_raw,
+                execution_market=execution_market,
+                lot_size=lot_size,
+            )
+            oi = self._normalize_liquidity_units(
+                oi_raw,
+                execution_market=execution_market,
+                lot_size=lot_size,
+            )
             details["contract_liquidity"] = {
                 "symbol": contract_snapshot.get("symbol"),
                 "volume": volume,
                 "oi": oi,
+                "raw_volume": volume_raw,
+                "raw_oi": oi_raw,
                 "bid": round(float(contract_snapshot.get("bid") or 0.0), 4),
                 "ask": round(float(contract_snapshot.get("ask") or 0.0), 4),
             }
@@ -2685,13 +2727,19 @@ class TradingAgent:
             if frame is not None and not frame.empty and "volume" in frame.columns:
                 recent_volume = pd.to_numeric(frame["volume"], errors="coerce").dropna().tail(12)
                 if not recent_volume.empty:
-                    median_bar_volume = self._safe_positive_int(recent_volume.median())
+                    median_bar_volume_raw = self._safe_positive_int(recent_volume.median())
+                    median_bar_volume = self._normalize_liquidity_units(
+                        median_bar_volume_raw,
+                        execution_market=execution_market,
+                        lot_size=lot_size,
+                    )
                     if median_bar_volume > 0:
                         bar_cap = int(median_bar_volume * 0.10)
                         if lot_size > 1 and median_bar_volume >= lot_size:
                             bar_cap = max(bar_cap, lot_size)
                         if bar_cap > 0:
                             raw_caps.append(bar_cap)
+                            details["median_bar_volume_raw"] = median_bar_volume_raw
                             details["median_bar_volume"] = median_bar_volume
                             details["recent_volume_cap"] = bar_cap
 
@@ -4205,10 +4253,10 @@ class TradingAgent:
         nse_auth = bool(getattr(self.fyers_client, "is_authenticated", False))
         auto_refreshed = False
         if nse_enabled and nse_open and not nse_auth:
-            refresh_fn = getattr(self.fyers_client, "try_auto_refresh_with_saved_pin", None)
+            refresh_fn = getattr(self.fyers_client, "ensure_authenticated_with_saved_pin", None)
             if callable(refresh_fn):
                 try:
-                    auto_refreshed = bool(await asyncio.to_thread(refresh_fn, False))
+                    auto_refreshed = bool(await asyncio.to_thread(refresh_fn))
                     nse_auth = bool(getattr(self.fyers_client, "is_authenticated", False))
                 except Exception as exc:
                     logger.warning("nse_readiness_refresh_error", error=str(exc))
@@ -4486,10 +4534,10 @@ class TradingAgent:
 
     async def _fetch_fyers_market_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
         if not self.fyers_client.is_authenticated:
-            refresh_fn = getattr(self.fyers_client, "try_auto_refresh_with_saved_pin", None)
+            refresh_fn = getattr(self.fyers_client, "ensure_authenticated_with_saved_pin", None)
             if callable(refresh_fn):
                 try:
-                    await asyncio.to_thread(refresh_fn, False)
+                    await asyncio.to_thread(refresh_fn)
                 except Exception as exc:
                     logger.warning("fyers_market_data_refresh_error", symbol=symbol, error=str(exc))
         if not self.fyers_client.is_authenticated:
@@ -5114,10 +5162,10 @@ class TradingAgent:
 
         if nse_symbols:
             if not self.fyers_client.is_authenticated:
-                refresh_fn = getattr(self.fyers_client, "try_auto_refresh_with_saved_pin", None)
+                refresh_fn = getattr(self.fyers_client, "ensure_authenticated_with_saved_pin", None)
                 if callable(refresh_fn):
                     try:
-                        await asyncio.to_thread(refresh_fn, False)
+                        await asyncio.to_thread(refresh_fn)
                     except Exception as exc:
                         logger.warning("fetch_live_prices_refresh_error", market="nse", error=str(exc))
             if self.fyers_client.is_authenticated:
@@ -5915,10 +5963,10 @@ class TradingAgent:
             if not nse_symbols:
                 return
             if not self.fyers_client.is_authenticated:
-                refresh_fn = getattr(self.fyers_client, "try_auto_refresh_with_saved_pin", None)
+                refresh_fn = getattr(self.fyers_client, "ensure_authenticated_with_saved_pin", None)
                 if callable(refresh_fn):
                     try:
-                        await asyncio.to_thread(refresh_fn, False)
+                        await asyncio.to_thread(refresh_fn)
                     except Exception as exc:
                         logger.warning("data_intelligence_refresh_error", error=str(exc))
             if not self.fyers_client.is_authenticated:

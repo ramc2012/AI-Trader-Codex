@@ -3,7 +3,7 @@
 import json
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 from fyers_apiv3.fyersModel import FyersModel
@@ -99,6 +99,33 @@ class TestAuthentication:
 
             with pytest.raises(AuthenticationError, match="Token generation failed"):
                 client.authenticate("bad_code")
+
+    def test_ensure_authenticated_forces_refresh_when_session_is_invalid(
+        self, client: FyersClient
+    ) -> None:
+        with (
+            patch.object(client, "try_auto_refresh_with_saved_pin", side_effect=[False, True]) as refresh,
+            patch.object(client, "_is_refresh_token_valid", return_value=True),
+            patch.object(FyersClient, "is_authenticated", new_callable=PropertyMock, return_value=False),
+        ):
+            refreshed = client.ensure_authenticated_with_saved_pin()
+
+        assert refreshed is True
+        assert refresh.call_args_list[0].args == (False,)
+        assert refresh.call_args_list[1].args == (True,)
+
+    def test_ensure_authenticated_skips_forced_refresh_without_refresh_token(
+        self, client: FyersClient
+    ) -> None:
+        with (
+            patch.object(client, "try_auto_refresh_with_saved_pin", return_value=False) as refresh,
+            patch.object(client, "_is_refresh_token_valid", return_value=False),
+            patch.object(FyersClient, "is_authenticated", new_callable=PropertyMock, return_value=False),
+        ):
+            refreshed = client.ensure_authenticated_with_saved_pin()
+
+        assert refreshed is False
+        refresh.assert_called_once_with(False)
 
     def test_set_access_token(self, client: FyersClient) -> None:
         client.set_access_token("TEST_APP_ID:manual_token")

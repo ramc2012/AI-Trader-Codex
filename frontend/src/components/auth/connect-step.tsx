@@ -2,40 +2,37 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { ExternalLink, Loader2, CheckCircle, Edit3, ArrowRight } from 'lucide-react';
-import { useSearchParams } from 'next/navigation';
 import { useLoginUrl, useSubmitAuthCode } from '@/hooks/use-auth';
+import type { TokenStatus } from '@/types/api';
 
 interface ConnectStepProps {
   loginUrl: string | null;
+  tokenStatus: TokenStatus | null;
   onComplete: () => void;
   onEditCredentials: () => void;
 }
 
 function extractAuthCode(input: string): string {
   const trimmed = input.trim();
-
-  // If it looks like a URL or contains auth_code param, extract the token
-  if (trimmed.includes('auth_code=') || trimmed.includes('://')) {
-    try {
-      if (trimmed.includes('://')) {
-        const url = new URL(trimmed);
-        const code = url.searchParams.get('auth_code');
-        if (code) return code;
-      }
-      const match = trimmed.match(/auth_code=([^&\s]+)/);
-      if (match?.[1]) return match[1];
-    } catch {
-      // Fall through to return as-is
-    }
+  if (!trimmed) {
+    return '';
   }
 
-  return trimmed;
+  // Preserve literal "+" characters from the redirect URL. URLSearchParams
+  // would decode them as spaces, which breaks FYERS token exchange.
+  const match = trimmed.match(/(?:^|[?&])auth_code=([^&#\s]+)/);
+  const rawCode = match?.[1] ?? trimmed;
+
+  try {
+    return decodeURIComponent(rawCode.replace(/\+/g, '%2B')).trim().replace(/ /g, '+');
+  } catch {
+    return rawCode.trim().replace(/ /g, '+');
+  }
 }
 
-export function ConnectStep({ loginUrl, onComplete, onEditCredentials }: ConnectStepProps) {
+export function ConnectStep({ loginUrl, tokenStatus, onComplete, onEditCredentials }: ConnectStepProps) {
   const { refetch: fetchLoginUrl, isFetching: fetchingUrl } = useLoginUrl();
   const submitAuthCode = useSubmitAuthCode();
-  const searchParams = useSearchParams();
   const autoHandledRef = useRef(false);
 
   const [authCode, setAuthCode] = useState('');
@@ -55,7 +52,7 @@ export function ConnectStep({ loginUrl, onComplete, onEditCredentials }: Connect
 
   const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
     const pastedText = e.clipboardData.getData('text');
-    if (pastedText.includes('auth_code=')) {
+    if (pastedText.includes('auth_code=') || pastedText.includes('://')) {
       e.preventDefault();
       const extracted = extractAuthCode(pastedText);
       setAuthCode(extracted);
@@ -87,13 +84,17 @@ export function ConnectStep({ loginUrl, onComplete, onEditCredentials }: Connect
   };
 
   useEffect(() => {
-    const rawCode = searchParams.get('auth_code');
-    if (!rawCode || autoHandledRef.current || submitAuthCode.isPending || success) {
+    if (autoHandledRef.current || submitAuthCode.isPending || success || typeof window === 'undefined') {
+      return;
+    }
+
+    const href = window.location.href;
+    if (!href.includes('auth_code=')) {
       return;
     }
 
     autoHandledRef.current = true;
-    const code = extractAuthCode(rawCode);
+    const code = extractAuthCode(href);
     if (!code) {
       return;
     }
@@ -111,7 +112,7 @@ export function ConnectStep({ loginUrl, onComplete, onEditCredentials }: Connect
         setError(err instanceof Error ? err.message : 'Authentication failed');
       },
     });
-  }, [searchParams, submitAuthCode, success, onComplete]);
+  }, [submitAuthCode, success, onComplete]);
 
   if (success) {
     return (
@@ -127,6 +128,18 @@ export function ConnectStep({ loginUrl, onComplete, onEditCredentials }: Connect
       <p className="text-sm text-slate-400">
         Log in to Fyers and paste the authorization code to connect your account.
       </p>
+
+      {tokenStatus?.status_message && (
+        <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-3 text-xs text-slate-300">
+          <p className="font-medium text-slate-200">Broker session status</p>
+          <p className="mt-1">{tokenStatus.status_message}</p>
+          {tokenStatus.has_access_token && !tokenStatus.has_refresh_token && (
+            <p className="mt-1 text-slate-400">
+              The saved session has no refresh token, so a full FYERS re-login is required.
+            </p>
+          )}
+        </div>
+      )}
 
       {/* Step 1: Open Fyers Login */}
       <div>

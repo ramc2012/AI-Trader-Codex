@@ -49,7 +49,7 @@ async def _get_client() -> Optional[FyersClient]:
 
     if not client.is_authenticated:
         try:
-            refreshed = await asyncio.to_thread(client.try_auto_refresh_with_saved_pin, False)
+            refreshed = await asyncio.to_thread(client.ensure_authenticated_with_saved_pin)
             if refreshed:
                 logger.info("auto_collector_token_refreshed")
         except Exception:

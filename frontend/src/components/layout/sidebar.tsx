@@ -10,6 +10,7 @@ import {
   Activity,
   FlaskConical,
   List,
+  Radar,
   Settings,
   TrendingUp,
   BarChart2,
@@ -23,6 +24,7 @@ import { APP_INSTANCE_LABEL, APP_NAME_BASE } from '@/lib/app-brand';
 const navItems = [
   { href: '/',              label: 'Dashboard',  icon: LayoutDashboard },
   { href: '/watchlist',     label: 'Watchlist',   icon: List },
+  { href: '/fno-radar',     label: 'FnO Radar',    icon: Radar },
   { href: '/analytics?tab=charts',  label: 'Charts',  icon: CandlestickChart, matchPrefix: '/analytics' },
   { href: '/analytics?tab=profile', label: 'Profile', icon: BarChart3, matchPrefix: '/analytics' },
   { href: '/indices/nifty/options', matchPrefix: '/indices', label: 'Options', icon: TrendingUp },

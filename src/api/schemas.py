@@ -9,8 +9,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
-from src.config.agent_universe import DEFAULT_AGENT_CRYPTO_SYMBOLS, DEFAULT_AGENT_US_SYMBOLS
+from pydantic import BaseModel, Field, model_validator
+from src.config.agent_universe import (
+    DEFAULT_AGENT_CRYPTO_SYMBOLS,
+    DEFAULT_AGENT_US_SYMBOLS,
+    normalize_nse_agent_symbols,
+    parse_symbol_values,
+)
 from src.config.constants import DEFAULT_AGENT_NSE_SYMBOLS
 
 
@@ -448,6 +453,8 @@ class FyersCredentialsResponse(BaseModel):
     app_id: str
     redirect_uri: str
     configured: bool = True
+    secret_configured: bool = False
+    credentials_path: Optional[str] = None
 
 
 class MarketDataProvidersRequest(BaseModel):
@@ -462,6 +469,9 @@ class MarketDataProvidersResponse(BaseModel):
 
     finnhub_configured: bool = False
     alphavantage_configured: bool = False
+    finnhub_key_preview: Optional[str] = None
+    alphavantage_key_preview: Optional[str] = None
+    credentials_path: Optional[str] = None
 
 
 class TelegramConfigRequest(BaseModel):
@@ -547,6 +557,9 @@ class TokenStatusResponse(BaseModel):
     refresh_token_expires_in_days: Optional[float] = None
     needs_full_reauth: bool
     has_saved_pin: bool = False
+    has_access_token: bool = False
+    has_refresh_token: bool = False
+    status_message: Optional[str] = None
 
 
 # =========================================================================
@@ -685,7 +698,7 @@ class AgentConfigRequest(BaseModel):
     reinforcement_enabled: bool = Field(default=True)
     reinforcement_alpha: float = Field(default=0.2, ge=0.01, le=1.0)
     reinforcement_size_boost_pct: float = Field(default=60.0, ge=0.0, le=300.0)
-    strategy_capital_bucket_enabled: bool = Field(default=True)
+    strategy_capital_bucket_enabled: bool = Field(default=False)
     strategy_max_concurrent_positions: int = Field(default=4, ge=1, le=20)
     telegram_status_interval_minutes: int = Field(
         default=30,
@@ -693,6 +706,13 @@ class AgentConfigRequest(BaseModel):
         le=1440,
         description="Periodic Telegram status update interval (0 disables periodic updates)",
     )
+
+    @model_validator(mode="after")
+    def _normalize_symbol_universe(self) -> "AgentConfigRequest":
+        self.symbols = normalize_nse_agent_symbols(self.symbols)
+        self.us_symbols = parse_symbol_values(self.us_symbols)
+        self.crypto_symbols = parse_symbol_values(self.crypto_symbols)
+        return self
 
 
 class AgentStatusResponse(BaseModel):
@@ -716,6 +736,8 @@ class AgentStatusResponse(BaseModel):
     execution_timeframes: List[str] = Field(default_factory=list)
     reference_timeframes: List[str] = Field(default_factory=list)
     telegram_status_interval_minutes: int = 30
+    strategy_capital_bucket_enabled: bool = False
+    strategy_max_concurrent_positions: int = 4
     capital_allocations: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     total_allocated_capital_inr: float = 0.0
     positions_count: int = 0

@@ -7,7 +7,9 @@ broker integration.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Dict
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -45,6 +47,7 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 router = APIRouter(tags=["Auth"])
+_AUTH_CODE_PATTERN = re.compile(r"(?:^|[?&])auth_code=([^&#\s]+)")
 
 
 def _get_env_manager() -> EnvManager:
@@ -54,6 +57,57 @@ def _get_env_manager() -> EnvManager:
     current DATA_DIR setting even after get_settings.cache_clear().
     """
     return EnvManager(env_path=get_settings().credentials_env_path)
+
+
+def _mask_secret(value: str) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if len(raw) <= 4:
+        return "*" * len(raw)
+    if len(raw) <= 8:
+        return f"{raw[:2]}{'*' * (len(raw) - 4)}{raw[-2:]}"
+    return f"{raw[:3]}{'*' * (len(raw) - 7)}{raw[-4:]}"
+
+
+def _build_provider_response() -> MarketDataProvidersResponse:
+    settings = get_settings()
+    finnhub = str(settings.finnhub_api_key or "").strip()
+    alphavantage = str(settings.alphavantage_api_key or "").strip()
+    return MarketDataProvidersResponse(
+        finnhub_configured=bool(finnhub),
+        alphavantage_configured=bool(alphavantage),
+        finnhub_key_preview=_mask_secret(finnhub),
+        alphavantage_key_preview=_mask_secret(alphavantage),
+        credentials_path=str(settings.credentials_env_path),
+    )
+
+
+def _normalize_auth_code(raw_value: str) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return ""
+
+    try:
+        decoded = unquote(value.replace("+", "%2B"))
+    except Exception:
+        decoded = value
+
+    # FYERS auth codes should not contain spaces. Treat any that appear as a
+    # query-decoding artifact from a literal "+" in the original URL.
+    return decoded.strip().replace(" ", "+")
+
+
+def _extract_auth_code(raw_input: str) -> str:
+    text = str(raw_input or "").strip()
+    if not text:
+        return ""
+
+    match = _AUTH_CODE_PATTERN.search(text)
+    if match:
+        return _normalize_auth_code(match.group(1))
+
+    return _normalize_auth_code(text)
 
 
 def _build_telegram_config_response() -> TelegramConfigResponse:
@@ -90,7 +144,7 @@ async def auth_status(
         )
 
     try:
-        refreshed = await asyncio.to_thread(client.try_auto_refresh_with_saved_pin, False)
+        refreshed = await asyncio.to_thread(client.ensure_authenticated_with_saved_pin)
         profile = None
         authenticated = False
         try:
@@ -220,6 +274,8 @@ async def get_credentials() -> FyersCredentialsResponse:
         app_id=settings.fyers_app_id if settings.fyers_app_id else "",
         redirect_uri=settings.fyers_redirect_uri,
         configured=bool(settings.fyers_app_id and settings.fyers_secret_key),
+        secret_configured=bool(str(settings.fyers_secret_key or "").strip()),
+        credentials_path=str(settings.credentials_env_path),
     )
 
 
@@ -269,6 +325,8 @@ async def save_credentials(
             app_id=credentials.app_id,
             redirect_uri=credentials.redirect_uri,
             configured=True,
+            secret_configured=True,
+            credentials_path=str(get_settings().credentials_env_path),
         )
 
     except HTTPException:
@@ -284,11 +342,7 @@ async def save_credentials(
 @router.get("/auth/market-data-providers", response_model=MarketDataProvidersResponse)
 async def get_market_data_providers() -> MarketDataProvidersResponse:
     """Return availability state for external US market-data providers."""
-    settings = get_settings()
-    return MarketDataProvidersResponse(
-        finnhub_configured=bool(str(settings.finnhub_api_key or "").strip()),
-        alphavantage_configured=bool(str(settings.alphavantage_api_key or "").strip()),
-    )
+    return _build_provider_response()
 
 
 @router.post("/auth/market-data-providers", response_model=MarketDataProvidersResponse)
@@ -307,11 +361,7 @@ async def save_market_data_providers(
             detail="Failed to update market-data provider keys. Check server logs.",
         )
     get_settings.cache_clear()
-    settings = get_settings()
-    return MarketDataProvidersResponse(
-        finnhub_configured=bool(str(settings.finnhub_api_key or "").strip()),
-        alphavantage_configured=bool(str(settings.alphavantage_api_key or "").strip()),
-    )
+    return _build_provider_response()
 
 
 @router.get("/auth/telegram", response_model=TelegramConfigResponse)
@@ -487,8 +537,7 @@ async def submit_manual_auth_code(
     and submit it here.
     """
     try:
-        # Clean the auth code - trim whitespace, newlines, etc.
-        auth_code = request.auth_code.strip()
+        auth_code = _extract_auth_code(request.auth_code)
 
         # Basic validation
         if not auth_code:
@@ -497,31 +546,6 @@ async def submit_manual_auth_code(
                 message="Authorization code cannot be empty",
                 authenticated=False,
             )
-
-        # If user pasted a full URL instead of just the token, extract the token
-        if "auth_code=" in auth_code or "https://" in auth_code or "http://" in auth_code:
-            logger.info("extracting_token_from_url", original_length=len(auth_code))
-            try:
-                from urllib.parse import urlparse, parse_qs
-                # Parse URL if it looks like a URL
-                if "://" in auth_code:
-                    parsed = urlparse(auth_code)
-                    params = parse_qs(parsed.query)
-                    if "auth_code" in params and params["auth_code"]:
-                        auth_code = params["auth_code"][0]
-                        logger.info("extracted_token_from_url", new_length=len(auth_code))
-                # Or extract if it's just the query string
-                elif "auth_code=" in auth_code:
-                    params = parse_qs(auth_code)
-                    if "auth_code" in params and params["auth_code"]:
-                        auth_code = params["auth_code"][0]
-                        logger.info("extracted_token_from_query", new_length=len(auth_code))
-            except Exception as parse_exc:
-                logger.warning("token_extraction_failed", error=str(parse_exc))
-                # Continue with original auth_code if extraction fails
-
-        # Final trim after potential extraction
-        auth_code = auth_code.strip()
 
         # Log the code length for debugging (not the actual code for security)
         logger.info("manual_auth_attempt", code_length=len(auth_code), starts_with=auth_code[:3] if len(auth_code) > 3 else "")
@@ -733,10 +757,23 @@ async def get_token_status(
             and not status.get("access_token_valid", False)
             and status.get("refresh_token_valid", False)
         ):
-            refreshed = await asyncio.to_thread(client.try_auto_refresh_with_saved_pin, False)
+            refreshed = await asyncio.to_thread(client.ensure_authenticated_with_saved_pin)
             if refreshed:
                 asyncio.create_task(get_runtime_manager().restart_if_authenticated())
                 status = client.get_token_status()
+
+        has_access_token = bool(client.access_token)
+        has_refresh_token = bool(getattr(client, "_refresh_token", None))
+        if status.get("access_token_valid", False):
+            status_message = "Active broker session."
+        elif has_access_token and status.get("refresh_token_valid", False) and has_pin:
+            status_message = "Access token expired; automatic refresh is available with the saved PIN."
+        elif has_access_token and status.get("refresh_token_valid", False):
+            status_message = "Access token expired; enter the FYERS PIN to refresh the session."
+        elif has_access_token:
+            status_message = "Stored access token expired and no refresh token is available. Re-authenticate via OAuth."
+        else:
+            status_message = "No saved broker session found. Complete the FYERS login flow."
 
         return TokenStatusResponse(
             access_token_valid=status.get("access_token_valid", False),
@@ -745,6 +782,9 @@ async def get_token_status(
             refresh_token_expires_in_days=status.get("refresh_token_expires_in_days"),
             needs_full_reauth=status.get("needs_full_reauth", True),
             has_saved_pin=has_pin,
+            has_access_token=has_access_token,
+            has_refresh_token=has_refresh_token,
+            status_message=status_message,
         )
         
     except Exception as exc:
@@ -755,4 +795,7 @@ async def get_token_status(
             refresh_token_valid=False,
             needs_full_reauth=True,
             has_saved_pin=False,
+            has_access_token=False,
+            has_refresh_token=False,
+            status_message="Unable to read broker token state.",
         )

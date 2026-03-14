@@ -46,6 +46,39 @@ NIFTY50_WATCHLIST_SYMBOLS: list[str] = [
     "NSE:ADANIENT-EQ", "NSE:ASIANPAINT-EQ", "NSE:TITAN-EQ",
 ]
 
+LEGACY_AGENT_NSE_INDEX_ONLY_SYMBOLS: list[str] = [
+    NIFTY_SYMBOL,
+    BANKNIFTY_SYMBOL,
+    FINNIFTY_SYMBOL,
+    MIDCPNIFTY_SYMBOL,
+    SENSEX_SYMBOL,
+]
+
+# Previous bundled default universe before the March 2026 Nifty 50 refresh.
+# When this exact legacy default is supplied via env/UI, treat it as an
+# outdated implicit default and upgrade it to the current universe.
+LEGACY_AGENT_NSE_SYMBOLS_PRE_MARCH_2026: list[str] = [
+    NIFTY_SYMBOL,
+    BANKNIFTY_SYMBOL,
+    FINNIFTY_SYMBOL,
+    MIDCPNIFTY_SYMBOL,
+    SENSEX_SYMBOL,
+    "NSE:RELIANCE-EQ", "NSE:TCS-EQ", "NSE:INFY-EQ", "NSE:HDFCBANK-EQ",
+    "NSE:ICICIBANK-EQ", "NSE:HINDUNILVR-EQ", "NSE:SBIN-EQ", "NSE:BHARTIARTL-EQ",
+    "NSE:ITC-EQ", "NSE:KOTAKBANK-EQ", "NSE:LT-EQ", "NSE:AXISBANK-EQ",
+    "NSE:ASIANPAINT-EQ", "NSE:MARUTI-EQ", "NSE:BAJFINANCE-EQ", "NSE:HCLTECH-EQ",
+    "NSE:WIPRO-EQ", "NSE:TITAN-EQ", "NSE:SUNPHARMA-EQ", "NSE:ULTRACEMCO-EQ",
+    "NSE:ONGC-EQ", "NSE:NTPC-EQ", "NSE:POWERGRID-EQ", "NSE:NESTLEIND-EQ",
+    "NSE:TECHM-EQ", "NSE:CIPLA-EQ", "NSE:DIVISLAB-EQ", "NSE:GRASIM-EQ",
+    "NSE:ADANIPORTS-EQ", "NSE:BAJAJ-AUTO-EQ", "NSE:HEROMOTOCO-EQ",
+    "NSE:EICHERMOT-EQ", "NSE:APOLLOHOSP-EQ", "NSE:TATAMOTORS-EQ",
+    "NSE:TATASTEEL-EQ", "NSE:JSWSTEEL-EQ", "NSE:INDUSINDBK-EQ",
+    "NSE:HINDALCO-EQ", "NSE:COALINDIA-EQ", "NSE:DRREDDY-EQ", "NSE:BPCL-EQ",
+    "NSE:TATACONSUM-EQ", "NSE:BRITANNIA-EQ", "NSE:BAJAJFINSV-EQ",
+    "NSE:SHREECEM-EQ", "NSE:SBILIFE-EQ", "NSE:HDFCLIFE-EQ", "NSE:ADANIENT-EQ",
+    "NSE:LTIM-EQ", "NSE:MM-EQ",
+]
+
 DEFAULT_AGENT_NSE_SYMBOLS: list[str] = [
     NIFTY_SYMBOL,
     BANKNIFTY_SYMBOL,
@@ -92,6 +125,25 @@ def unique_symbols(values: Iterable[str]) -> list[str]:
         seen.add(symbol)
         items.append(symbol)
     return items
+
+
+def parse_symbol_values(values: str | Iterable[str] | None) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        return unique_symbols(values.split(","))
+    return unique_symbols(values)
+
+
+def normalize_nse_agent_symbols(values: str | Iterable[str] | None) -> list[str]:
+    parsed = parse_symbol_values(values)
+    if not parsed:
+        return list(DEFAULT_AGENT_NSE_SYMBOLS)
+    if parsed == LEGACY_AGENT_NSE_INDEX_ONLY_SYMBOLS:
+        return list(DEFAULT_AGENT_NSE_SYMBOLS)
+    if parsed == LEGACY_AGENT_NSE_SYMBOLS_PRE_MARCH_2026:
+        return list(DEFAULT_AGENT_NSE_SYMBOLS)
+    return parsed
 
 
 def to_csv(values: Iterable[str]) -> str:

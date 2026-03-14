@@ -66,6 +66,86 @@ _tick_aggregator: Optional[RealTimeAggregator] = None
 _fractal_scan_notifier: Optional[FractalScanNotifier] = None
 
 
+def _agent_total_capital_inr(config: AgentConfig) -> float:
+    usd_inr_rate = float(get_settings().usd_inr_reference_rate)
+    return round(
+        float(config.india_capital) + (float(config.us_capital) + float(config.crypto_capital)) * usd_inr_rate,
+        2,
+    )
+
+
+def _sync_risk_manager_for_agent_config(config: AgentConfig) -> None:
+    risk_manager = get_risk_manager()
+    usd_inr_rate = float(get_settings().usd_inr_reference_rate)
+    total_capital_inr = _agent_total_capital_inr(config)
+    india_cap_inr = float(config.india_capital)
+    us_cap_inr = float(config.us_capital) * usd_inr_rate
+    crypto_cap_inr = float(config.crypto_capital) * usd_inr_rate
+    max_position_size_inr = max(
+        india_cap_inr * (float(config.india_max_instrument_pct) / 100.0),
+        us_cap_inr * (float(config.us_max_instrument_pct) / 100.0),
+        crypto_cap_inr * (float(config.crypto_max_instrument_pct) / 100.0),
+        1.0,
+    )
+    risk_manager.config.capital = total_capital_inr
+    risk_manager.config.max_daily_loss_pct = max(float(config.max_daily_loss_pct), 0.0) / 100.0
+    risk_manager.config.max_daily_loss = total_capital_inr * risk_manager.config.max_daily_loss_pct
+    risk_manager.config.max_position_size = max_position_size_inr
+    risk_manager.config.max_concentration_pct = max_position_size_inr / max(total_capital_inr, 1.0)
+
+
+def _agent_config_from_settings() -> AgentConfig:
+    settings = get_settings()
+    config = AgentConfig(
+        symbols=[symbol.strip() for symbol in settings.agent_default_symbols.split(",") if symbol.strip()],
+        us_symbols=[symbol.strip() for symbol in settings.agent_us_symbols.split(",") if symbol.strip()],
+        crypto_symbols=[symbol.strip() for symbol in settings.agent_crypto_symbols.split(",") if symbol.strip()],
+        trade_nse_when_open=settings.agent_trade_nse_when_open,
+        trade_us_when_open=settings.agent_trade_us_when_open,
+        trade_us_options=settings.agent_trade_us_options,
+        trade_crypto_24x7=settings.agent_trade_crypto_24x7,
+        capital=_agent_total_capital_inr(
+            AgentConfig(
+                india_capital=settings.agent_india_capital,
+                us_capital=settings.agent_us_capital,
+                crypto_capital=settings.agent_crypto_capital,
+            )
+        ),
+        india_capital=settings.agent_india_capital,
+        us_capital=settings.agent_us_capital,
+        crypto_capital=settings.agent_crypto_capital,
+        india_max_instrument_pct=settings.agent_india_max_instrument_pct,
+        us_max_instrument_pct=settings.agent_us_max_instrument_pct,
+        crypto_max_instrument_pct=settings.agent_crypto_max_instrument_pct,
+        max_daily_loss_pct=settings.max_daily_loss_pct,
+        scan_interval_seconds=settings.agent_scan_interval,
+        timeframe=settings.agent_default_timeframe,
+        execution_timeframes=[
+            tf.strip() for tf in settings.agent_execution_timeframes.split(",") if tf.strip()
+        ],
+        reference_timeframes=[
+            tf.strip() for tf in settings.agent_reference_timeframes.split(",") if tf.strip()
+        ],
+        liberal_bootstrap_enabled=settings.agent_liberal_bootstrap_enabled,
+        bootstrap_cycles=settings.agent_bootstrap_cycles,
+        bootstrap_size_multiplier=settings.agent_bootstrap_size_multiplier,
+        bootstrap_max_concentration_pct=settings.agent_bootstrap_max_concentration_pct,
+        bootstrap_max_open_positions=settings.agent_bootstrap_max_open_positions,
+        bootstrap_risk_per_trade_pct=settings.agent_bootstrap_risk_per_trade_pct,
+        option_time_exit_minutes=settings.agent_option_time_exit_minutes,
+        option_default_stop_loss_pct=settings.agent_option_default_stop_loss_pct,
+        option_default_target_pct=settings.agent_option_default_target_pct,
+        reinforcement_enabled=settings.agent_reinforcement_enabled,
+        reinforcement_alpha=settings.agent_reinforcement_alpha,
+        reinforcement_size_boost_pct=settings.agent_reinforcement_size_boost_pct,
+        strategy_capital_bucket_enabled=settings.agent_strategy_capital_bucket_enabled,
+        strategy_max_concurrent_positions=settings.agent_strategy_max_concurrent_positions,
+        telegram_status_interval_minutes=settings.telegram_status_interval_minutes,
+    )
+    config.capital = _agent_total_capital_inr(config)
+    return config
+
+
 def get_order_manager() -> OrderManager:
     """Get or create the singleton OrderManager (paper mode)."""
     global _order_manager
@@ -238,39 +318,10 @@ def get_trading_agent(config: Optional[AgentConfig] = None) -> TradingAgent:
     global _trading_agent
     if _trading_agent is None:
         if config is None:
-            settings = get_settings()
-            config = AgentConfig(
-                symbols=[symbol.strip() for symbol in settings.agent_default_symbols.split(",") if symbol.strip()],
-                us_symbols=[symbol.strip() for symbol in settings.agent_us_symbols.split(",") if symbol.strip()],
-                crypto_symbols=[
-                    symbol.strip() for symbol in settings.agent_crypto_symbols.split(",") if symbol.strip()
-                ],
-                trade_nse_when_open=settings.agent_trade_nse_when_open,
-                trade_us_when_open=settings.agent_trade_us_when_open,
-                trade_us_options=settings.agent_trade_us_options,
-                trade_crypto_24x7=settings.agent_trade_crypto_24x7,
-                scan_interval_seconds=settings.agent_scan_interval,
-                timeframe=settings.agent_default_timeframe,
-                execution_timeframes=[
-                    tf.strip() for tf in settings.agent_execution_timeframes.split(",") if tf.strip()
-                ],
-                reference_timeframes=[
-                    tf.strip() for tf in settings.agent_reference_timeframes.split(",") if tf.strip()
-                ],
-                liberal_bootstrap_enabled=settings.agent_liberal_bootstrap_enabled,
-                bootstrap_cycles=settings.agent_bootstrap_cycles,
-                bootstrap_size_multiplier=settings.agent_bootstrap_size_multiplier,
-                bootstrap_max_concentration_pct=settings.agent_bootstrap_max_concentration_pct,
-                bootstrap_max_open_positions=settings.agent_bootstrap_max_open_positions,
-                bootstrap_risk_per_trade_pct=settings.agent_bootstrap_risk_per_trade_pct,
-                option_time_exit_minutes=settings.agent_option_time_exit_minutes,
-                option_default_stop_loss_pct=settings.agent_option_default_stop_loss_pct,
-                option_default_target_pct=settings.agent_option_default_target_pct,
-                reinforcement_enabled=settings.agent_reinforcement_enabled,
-                reinforcement_alpha=settings.agent_reinforcement_alpha,
-                reinforcement_size_boost_pct=settings.agent_reinforcement_size_boost_pct,
-                telegram_status_interval_minutes=settings.telegram_status_interval_minutes,
-            )
+            config = _agent_config_from_settings()
+        else:
+            config.capital = _agent_total_capital_inr(config)
+        _sync_risk_manager_for_agent_config(config)
         _trading_agent = TradingAgent(
             config=config,
             strategy_executor=get_strategy_executor(),

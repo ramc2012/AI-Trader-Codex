@@ -113,7 +113,7 @@ const DEFAULT_STRATEGIES = [
 const DEFAULT_EXECUTION_TIMEFRAMES = ['3', '5', '15'];
 const DEFAULT_REFERENCE_TIMEFRAMES = ['60', 'D'];
 const DEFAULT_NSE_SYMBOLS =
-  'NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX,NSE:NIFTYMIDCAP50-INDEX,BSE:SENSEX-INDEX';
+  'NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX,NSE:NIFTYMIDCAP50-INDEX,BSE:SENSEX-INDEX,NSE:HDFCBANK-EQ,NSE:ICICIBANK-EQ,NSE:KOTAKBANK-EQ,NSE:AXISBANK-EQ,NSE:SBIN-EQ,NSE:INDUSINDBK-EQ,NSE:BAJFINANCE-EQ,NSE:BAJAJFINSV-EQ,NSE:SHRIRAMFIN-EQ,NSE:HDFCLIFE-EQ,NSE:SBILIFE-EQ,NSE:TCS-EQ,NSE:INFY-EQ,NSE:HCLTECH-EQ,NSE:WIPRO-EQ,NSE:TECHM-EQ,NSE:LTIM-EQ,NSE:RELIANCE-EQ,NSE:ONGC-EQ,NSE:BPCL-EQ,NSE:NTPC-EQ,NSE:POWERGRID-EQ,NSE:COALINDIA-EQ,NSE:HINDUNILVR-EQ,NSE:ITC-EQ,NSE:NESTLEIND-EQ,NSE:BRITANNIA-EQ,NSE:TATACONSUM-EQ,NSE:MARUTI-EQ,NSE:BAJAJ-AUTO-EQ,NSE:HEROMOTOCO-EQ,NSE:EICHERMOT-EQ,NSE:TATAMOTORS-EQ,NSE:MM-EQ,NSE:LT-EQ,NSE:ADANIPORTS-EQ,NSE:BEL-EQ,NSE:TATASTEEL-EQ,NSE:JSWSTEEL-EQ,NSE:HINDALCO-EQ,NSE:GRASIM-EQ,NSE:ULTRACEMCO-EQ,NSE:SUNPHARMA-EQ,NSE:DRREDDY-EQ,NSE:CIPLA-EQ,NSE:DIVISLAB-EQ,NSE:APOLLOHOSP-EQ,NSE:BHARTIARTL-EQ,NSE:ADANIENT-EQ,NSE:ASIANPAINT-EQ,NSE:TITAN-EQ';
 const DEFAULT_US_SYMBOLS =
   'US:SPY,US:QQQ,US:DIA,US:IWM,US:AAPL,US:AMZN,US:JPM,US:XOM,US:UNH,US:CAT';
 
@@ -214,6 +214,8 @@ export default function AIAgentPage() {
   const [indiaMaxInstrumentPct, setIndiaMaxInstrumentPct] = useState(25);
   const [usMaxInstrumentPct, setUsMaxInstrumentPct] = useState(20);
   const [cryptoMaxInstrumentPct, setCryptoMaxInstrumentPct] = useState(20);
+  const [strategyCapitalBucketEnabled, setStrategyCapitalBucketEnabled] = useState(false);
+  const [strategyMaxConcurrentPositions, setStrategyMaxConcurrentPositions] = useState(4);
   const [timeframe, setTimeframe] = useState('5');
   const configHydratedRef = useRef(false);
 
@@ -248,6 +250,8 @@ export default function AIAgentPage() {
       setIndiaMaxInstrumentPct(status.capital_allocations?.NSE?.max_instrument_pct ?? 25);
       setUsMaxInstrumentPct(status.capital_allocations?.US?.max_instrument_pct ?? 20);
       setCryptoMaxInstrumentPct(status.capital_allocations?.CRYPTO?.max_instrument_pct ?? 20);
+      setStrategyCapitalBucketEnabled(status.strategy_capital_bucket_enabled ?? false);
+      setStrategyMaxConcurrentPositions(status.strategy_max_concurrent_positions ?? 4);
       configHydratedRef.current = true;
     });
     return () => {
@@ -308,6 +312,8 @@ export default function AIAgentPage() {
       india_max_instrument_pct: indiaMaxInstrumentPct,
       us_max_instrument_pct: usMaxInstrumentPct,
       crypto_max_instrument_pct: cryptoMaxInstrumentPct,
+      strategy_capital_bucket_enabled: strategyCapitalBucketEnabled,
+      strategy_max_concurrent_positions: strategyMaxConcurrentPositions,
       max_daily_loss_pct: 2.0,
       timeframe,
       execution_timeframes: DEFAULT_EXECUTION_TIMEFRAMES,
@@ -333,6 +339,8 @@ export default function AIAgentPage() {
     indiaMaxInstrumentPct,
     usMaxInstrumentPct,
     cryptoMaxInstrumentPct,
+    strategyCapitalBucketEnabled,
+    strategyMaxConcurrentPositions,
     timeframe,
     telegramStatusInterval,
     startMutation,
@@ -369,6 +377,12 @@ export default function AIAgentPage() {
     marketStatRows.map(([market, row]) => [market, Number(row?.net_pnl_inr ?? 0)])
   );
   const totalAllocatedCapitalInr = status?.total_allocated_capital_inr ?? 0;
+  const estimatedIndiaPerTradeBudget = strategyCapitalBucketEnabled
+    ? Math.min(
+        indiaCapital / Math.max(strategies.length, 1) / Math.max(strategyMaxConcurrentPositions, 1),
+        indiaCapital * (indiaMaxInstrumentPct / 100)
+      )
+    : indiaCapital * (indiaMaxInstrumentPct / 100);
 
   // ── Historical simulation state ─────────────────────────
   const [activeTab, setActiveTab] = useState<'live' | 'simulate'>('live');
@@ -693,6 +707,58 @@ export default function AIAgentPage() {
               <div className="text-xs text-slate-400">Total Allocated Capital (INR equiv)</div>
               <div className="mt-2 text-sm font-medium text-slate-200">
                 ₹{Math.round(totalAllocatedCapitalInr || (indiaCapital + (usCapital + cryptoCapital) * 83)).toLocaleString('en-IN')}
+              </div>
+            </div>
+
+            <div className="sm:col-span-2 lg:col-span-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                  <div className="text-xs font-medium uppercase tracking-[0.18em] text-slate-400">
+                    Strategy Capital Bucket
+                  </div>
+                  <p className="mt-1 text-sm text-slate-300">
+                    Optional extra throttle that splits each market bucket across enabled strategies and strategy slots before an order can be placed.
+                  </p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Estimated India per-trade cap: ₹{Math.round(estimatedIndiaPerTradeBudget).toLocaleString('en-IN')}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setStrategyCapitalBucketEnabled((value) => !value)}
+                  disabled={isRunning || isPaused}
+                  className={`rounded-full px-3 py-1 text-xs font-medium border transition-colors ${
+                    strategyCapitalBucketEnabled
+                      ? 'border-emerald-600 bg-emerald-600/20 text-emerald-400'
+                      : 'border-cyan-600 bg-cyan-600/20 text-cyan-300'
+                  } disabled:opacity-50`}
+                >
+                  {strategyCapitalBucketEnabled ? 'Bucket Enabled' : 'Bucket Disabled'}
+                </button>
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="text-xs text-slate-400 mb-1 block">
+                    Max Open Positions / Strategy / Market
+                  </label>
+                  <input
+                    type="number"
+                    value={strategyMaxConcurrentPositions}
+                    onChange={(e) => setStrategyMaxConcurrentPositions(Number(e.target.value))}
+                    min={1}
+                    max={20}
+                    disabled={isRunning || isPaused || !strategyCapitalBucketEnabled}
+                    className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 disabled:opacity-50"
+                  />
+                </div>
+                <div className="rounded-lg border border-slate-800 bg-slate-900/70 px-3 py-2">
+                  <div className="text-xs text-slate-400">India cap formula</div>
+                  <div className="mt-1 text-sm text-slate-200">
+                    {strategyCapitalBucketEnabled
+                      ? `min(India cap / ${Math.max(strategies.length, 1)} strategies / ${Math.max(strategyMaxConcurrentPositions, 1)} slots, max instrument cap)`
+                      : 'Default mode. Uses the full India max-instrument cap without per-strategy splitting.'}
+                  </div>
+                </div>
               </div>
             </div>
 

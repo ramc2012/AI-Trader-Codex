@@ -130,6 +130,8 @@ def test_agent_status_exposes_market_and_strategy_stats() -> None:
     assert "market_stats" in status
     assert "strategy_stats" in status
     assert "capital_allocations" in status
+    assert "strategy_capital_bucket_enabled" in status
+    assert "strategy_max_concurrent_positions" in status
     assert "strategy_market_stats" in status
     assert "strategy_instrument_stats" in status
     assert "online_learning_active" in status
@@ -269,6 +271,7 @@ def test_strategy_budget_limits_split_capital_evenly() -> None:
     config = AgentConfig(
         capital=250000.0,
         strategies=["EMA_Crossover", "RSI_Reversal", "Supertrend_Breakout", "MP_OrderFlow_Breakout"],
+        strategy_capital_bucket_enabled=True,
         strategy_max_concurrent_positions=4,
     )
     agent = _build_agent(config)
@@ -471,6 +474,35 @@ async def test_resolve_liquidity_quantity_cap_uses_option_volume_and_oi() -> Non
     assert result["volume_cap"] == 60
     assert result["oi_cap"] == 100
     assert result["max_quantity"] == 60
+
+
+@pytest.mark.asyncio
+async def test_resolve_liquidity_quantity_cap_scales_us_option_contract_counts() -> None:
+    agent = _build_agent(AgentConfig())
+
+    result = await agent._resolve_liquidity_quantity_cap(
+        execution_symbol="US:SPY260313C00600000",
+        underlying_symbol="US:SPY",
+        execution_market="US",
+        execution_timeframe="15",
+        side=OrderSide.BUY,
+        lot_size=100,
+        options_analytics={
+            "selected_contract": {
+                "symbol": "US:SPY260313C00600000",
+                "volume": 1200,
+                "oi": 5000,
+                "bid": 4.8,
+                "ask": 5.0,
+            }
+        },
+    )
+
+    assert result["contract_liquidity"]["raw_volume"] == 1200
+    assert result["contract_liquidity"]["raw_oi"] == 5000
+    assert result["volume_cap"] == 6000
+    assert result["oi_cap"] == 10000
+    assert result["max_quantity"] == 6000
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ history from the in-memory managers.
 
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
@@ -37,9 +38,14 @@ from src.execution.order_manager import (
 )
 from src.execution.position_manager import PositionManager, PositionSide
 from src.risk.risk_manager import RiskManager
+from src.utils.logger import get_logger
 from src.utils.market_symbols import classify_market, parse_currency_context
 
 router = APIRouter(tags=["Trading"])
+logger = get_logger(__name__)
+_LIVE_MARK_REFRESH_LOCK = asyncio.Lock()
+_LAST_LIVE_MARK_REFRESH_AT: datetime | None = None
+_LIVE_MARK_REFRESH_MAX_AGE_SECONDS = 1.0
 
 
 # =========================================================================
@@ -172,14 +178,8 @@ async def list_positions(
     settings = get_settings()
     usd_inr_rate = float(settings.usd_inr_reference_rate)
     now = datetime.now(tz=IST)
+    await _refresh_open_position_marks(pm, trading_agent)
     positions = pm.get_all_positions()
-    if positions:
-        # Keep marks fresh for UI polling instead of waiting for the next agent cycle.
-        try:
-            await trading_agent.refresh_position_marks([p.symbol for p in positions])
-            positions = pm.get_all_positions()
-        except Exception:
-            pass
 
     out: List[PositionResponse] = []
     for position in positions:
@@ -224,12 +224,13 @@ async def list_positions(
 
 
 @router.get("/portfolio", response_model=PortfolioSummaryResponse)
-def portfolio_summary(
+async def portfolio_summary(
     pm: PositionManager = Depends(get_position_manager),
     trading_agent: TradingAgent = Depends(get_trading_agent),
 ) -> PortfolioSummaryResponse:
     """Get aggregated portfolio summary with total P&L."""
     settings = get_settings()
+    await _refresh_open_position_marks(pm, trading_agent)
     summary = _build_currency_aware_portfolio(
         pm=pm,
         usd_inr_rate=float(settings.usd_inr_reference_rate),
@@ -239,18 +240,20 @@ def portfolio_summary(
 
 
 @router.get("/portfolio/instruments", response_model=PortfolioInstrumentSummaryResponse)
-def portfolio_by_instrument(
+async def portfolio_by_instrument(
     period: str = Query(
         default="daily",
         description="One of: daily, week, month, year",
     ),
     om: OrderManager = Depends(get_order_manager),
     pm: PositionManager = Depends(get_position_manager),
+    trading_agent: TradingAgent = Depends(get_trading_agent),
 ) -> PortfolioInstrumentSummaryResponse:
     """Return period-filtered performance summary grouped by instrument."""
     settings = get_settings()
     usd_inr_rate = float(settings.usd_inr_reference_rate)
     from_time, to_time, normalized_period = _period_bounds(period)
+    await _refresh_open_position_marks(pm, trading_agent)
 
     rows: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {
@@ -442,13 +445,14 @@ def list_closed_trades(
 
 
 @router.get("/portfolio/equity-curve")
-def get_equity_curve(
+async def get_equity_curve(
     pm: PositionManager = Depends(get_position_manager),
     trading_agent: TradingAgent = Depends(get_trading_agent),
     period: str = Query(default="daily", description="One of: daily, week, month, year"),
 ) -> List[Dict[str, Any]]:
     """Get a realized-plus-live equity curve filtered to the selected period."""
     settings = get_settings()
+    await _refresh_open_position_marks(pm, trading_agent)
     return _build_equity_curve(
         pm=pm,
         usd_inr_rate=float(settings.usd_inr_reference_rate),
@@ -460,6 +464,34 @@ def get_equity_curve(
 # =========================================================================
 # Helpers
 # =========================================================================
+
+
+async def _refresh_open_position_marks(
+    pm: PositionManager,
+    trading_agent: TradingAgent,
+) -> None:
+    """Refresh live marks before computing aggregate portfolio views."""
+    positions = pm.get_all_positions()
+    if not positions:
+        return
+    global _LAST_LIVE_MARK_REFRESH_AT
+    now = datetime.now(tz=IST)
+    if _LAST_LIVE_MARK_REFRESH_AT is not None:
+        age_seconds = (now - _LAST_LIVE_MARK_REFRESH_AT).total_seconds()
+        if age_seconds <= _LIVE_MARK_REFRESH_MAX_AGE_SECONDS:
+            return
+    async with _LIVE_MARK_REFRESH_LOCK:
+        now = datetime.now(tz=IST)
+        if _LAST_LIVE_MARK_REFRESH_AT is not None:
+            age_seconds = (now - _LAST_LIVE_MARK_REFRESH_AT).total_seconds()
+            if age_seconds <= _LIVE_MARK_REFRESH_MAX_AGE_SECONDS:
+                return
+        try:
+            await trading_agent.refresh_position_marks([p.symbol for p in positions])
+            _LAST_LIVE_MARK_REFRESH_AT = datetime.now(tz=IST)
+        except Exception:
+            # Summary routes should degrade to the last cached marks, not fail hard.
+            logger.warning("portfolio_mark_refresh_failed", exc_info=True)
 
 
 def _order_to_response(order: object) -> OrderResponse:

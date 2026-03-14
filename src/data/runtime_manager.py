@@ -54,7 +54,7 @@ class RuntimeManager:
         if self._running:
             return
         if not self._client.is_authenticated:
-            refreshed = await asyncio.to_thread(self._client.try_auto_refresh_with_saved_pin, False)
+            refreshed = await asyncio.to_thread(self._client.ensure_authenticated_with_saved_pin)
             if refreshed:
                 logger.info("runtime_token_auto_refreshed")
             if not self._client.is_authenticated:

@@ -36,6 +36,7 @@ from src.api.dependencies import (
     get_trading_agent,
     reset_trading_agent,
 )
+from src.api.routes.trading import _build_currency_aware_portfolio, _refresh_open_position_marks
 from src.api.schemas import AgentConfigRequest, AgentEventResponse, AgentStatusResponse
 from src.config.settings import get_settings
 from src.database.operations import get_ohlc_candles
@@ -1060,6 +1061,7 @@ async def resume_agent() -> Dict[str, Any]:
 async def get_agent_status() -> Dict[str, Any]:
     """Get current agent status and metrics."""
     agent = get_trading_agent()
+    await _refresh_open_position_marks(get_position_manager(), agent)
     return agent.get_status()
 
 
@@ -1754,9 +1756,15 @@ async def notify_status_telegram() -> Dict[str, Any]:
         }
 
     agent = get_trading_agent()
-    status = agent.get_status()
     pm = get_position_manager()
-    portfolio = pm.get_portfolio_summary()
+    await _refresh_open_position_marks(pm, agent)
+    status = agent.get_status()
+    settings = get_settings()
+    portfolio = _build_currency_aware_portfolio(
+        pm=pm,
+        usd_inr_rate=float(settings.usd_inr_reference_rate),
+        capital_allocations=agent.get_capital_allocations(),
+    )
 
     last_scan = status.get("last_scan_time")
     last_scan_ist = "—"

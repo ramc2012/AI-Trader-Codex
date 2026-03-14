@@ -78,6 +78,16 @@ export function CredentialsStep({ onComplete }: CredentialsStepProps) {
           <ExternalLink className="h-3 w-3" />
         </a>
       </p>
+      {existing?.credentials_path && (
+        <div className="rounded-lg border border-slate-700 bg-slate-800/50 px-3 py-2 text-xs text-slate-400">
+          <p>
+            Persisted broker settings file: <span className="font-mono text-slate-300">{existing.credentials_path}</span>
+          </p>
+          {existing.secret_configured && (
+            <p className="mt-1 text-slate-500">A secret key is already stored on the backend. Enter a new one only to replace it.</p>
+          )}
+        </div>
+      )}
 
       <div>
         <label className="block text-sm font-medium text-slate-300 mb-1.5">

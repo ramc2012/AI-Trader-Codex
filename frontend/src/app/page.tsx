@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 import {
   TrendingUp,
   TrendingDown,
@@ -10,6 +11,8 @@ import {
   Trophy,
   Wifi,
   WifiOff,
+  Radar,
+  ArrowRight,
 } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, Tooltip } from 'recharts';
 import { useQuery } from '@tanstack/react-query';
@@ -227,6 +230,28 @@ export default function DashboardPage() {
           isLoading={riskLoading}
         />
       </div>
+
+      <Link
+        href="/fno-radar"
+        className="group flex items-center justify-between rounded-2xl border border-cyan-500/20 bg-[linear-gradient(135deg,rgba(8,47,73,0.65),rgba(15,23,42,0.92))] p-5 transition-colors hover:border-cyan-400/40"
+      >
+        <div className="flex items-start gap-4">
+          <div className="rounded-2xl bg-cyan-500/10 p-3 text-cyan-300">
+            <Radar className="h-6 w-6" />
+          </div>
+          <div>
+            <p className="text-xs font-medium uppercase tracking-[0.22em] text-cyan-200/80">New Workspace</p>
+            <h3 className="mt-2 text-xl font-semibold text-slate-100">FnO Radar</h3>
+            <p className="mt-1 text-sm text-slate-300">
+              Composite swing-trade board for ATM index options using volatility, breadth, profile, and OI.
+            </p>
+          </div>
+        </div>
+        <span className="flex items-center gap-2 text-sm font-medium text-cyan-200 transition-transform group-hover:translate-x-1">
+          Open
+          <ArrowRight className="h-4 w-4" />
+        </span>
+      </Link>
 
       {/* Equity curve */}
       <div className="rounded-xl border border-slate-800 bg-slate-900 p-5">

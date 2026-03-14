@@ -528,7 +528,7 @@ class TradingAgent:
                 last_flush = time.monotonic()
                 for symbol in symbols:
                     started = time.perf_counter()
-                    await self._scan_symbol(symbol)
+                    await self._scan_symbol(symbol, live_only=True)
                     self._latency_tracker.record(
                         "event_driven_symbol_scan_ms",
                         (time.perf_counter() - started) * 1000.0,
@@ -2107,8 +2107,10 @@ class TradingAgent:
                     await self._ensure_data_available(symbols_to_warm)
                     self._warmed_symbols.update(symbols_to_warm)
 
+                periodic_scan_symbols = self._periodic_scan_symbols(active_symbols)
+
                 # Scan each symbol
-                for symbol in active_symbols:
+                for symbol in periodic_scan_symbols:
                     await self._scan_symbol(symbol)
 
                 # Check existing positions for exit conditions
@@ -2152,8 +2154,8 @@ class TradingAgent:
                     event_type=AgentEventType.THINKING,
                     title=f"Cycle {self._cycle_count} Complete",
                     message=(
-                        f"Scanned {len(active_symbols)} symbols "
-                        f"({', '.join(short_name(s) for s in active_symbols)}). "
+                        f"Periodic scanned {len(periodic_scan_symbols)} of {len(active_symbols)} active symbols "
+                        f"({', '.join(short_name(s) for s in periodic_scan_symbols) or 'event-driven only'}). "
                         f"Open positions: {portfolio.get('position_count', 0)}. "
                         f"Daily P&L: {self._daily_pnl:+,.0f}. "
                         f"Next scan in {self.config.scan_interval_seconds}s."
@@ -2163,6 +2165,7 @@ class TradingAgent:
                         "cycle": self._cycle_count,
                         "pnl": self._daily_pnl,
                         "active_symbols": active_symbols,
+                        "periodic_scan_symbols": periodic_scan_symbols,
                         "sessions": sessions,
                     },
                 ))
@@ -2173,6 +2176,7 @@ class TradingAgent:
                     (time.perf_counter() - cycle_started) * 1000.0,
                     cycle=self._cycle_count,
                     active_symbols=len(active_symbols),
+                    periodic_scans=len(periodic_scan_symbols),
                     sessions=",".join(self._active_sessions),
                     circuit_breaker=False,
                 )
@@ -2196,15 +2200,29 @@ class TradingAgent:
     # Symbol Scan
     # ------------------------------------------------------------------
 
-    async def _scan_symbol(self, symbol: str) -> None:
-        async with self._scan_lock(symbol):
-            await self._scan_symbol_unlocked(symbol)
+    def _event_driven_hot_path_timeframe_supported(self, timeframe: str) -> bool:
+        token = str(timeframe or "").strip().upper()
+        return token in {"1", "3", "5", "15", "60", "D"}
 
-    async def _scan_symbol_unlocked(self, symbol: str) -> None:
+    def _should_use_event_driven_lane(self, symbol: str) -> bool:
+        return self._candle_broker is not None and self._is_event_driven_symbol_eligible(symbol)
+
+    def _periodic_scan_symbols(self, active_symbols: List[str]) -> List[str]:
+        return [symbol for symbol in active_symbols if not self._should_use_event_driven_lane(symbol)]
+
+    async def _scan_symbol(self, symbol: str, *, live_only: bool = False) -> None:
+        async with self._scan_lock(symbol):
+            await self._scan_symbol_unlocked(symbol, live_only=live_only)
+
+    async def _scan_symbol_unlocked(self, symbol: str, *, live_only: bool = False) -> None:
         """Run all strategies on a single symbol across execution timeframes."""
         scan_started = time.perf_counter()
         short_name = symbol.split(":")[-1].split("-")[0]
-        execution_timeframes = await self._rank_execution_timeframes(symbol, self.get_execution_timeframes())
+        execution_timeframes = await self._rank_execution_timeframes(
+            symbol,
+            self.get_execution_timeframes(),
+            live_only=live_only,
+        )
         trades_before_symbol = self._total_trades
         symbol_market = self._symbol_market(symbol)
         timeframe_frames: Dict[str, pd.DataFrame] = {}
@@ -2224,7 +2242,7 @@ class TradingAgent:
         had_data = False
         for timeframe in execution_timeframes:
             # Fetch market data for execution timeframe
-            df = await self._fetch_market_data(symbol, timeframe=timeframe)
+            df = await self._fetch_market_data(symbol, timeframe=timeframe, live_only=live_only)
             if df is None or df.empty:
                 continue
 
@@ -2322,6 +2340,7 @@ class TradingAgent:
                         confirmed, reference_meta = await self._confirm_reference_timeframes(
                             symbol=symbol,
                             signal_type=signal.signal_type,
+                            live_only=live_only,
                         )
                     if not confirmed:
                         await self.event_bus.emit(AgentEvent(
@@ -2448,6 +2467,7 @@ class TradingAgent:
                 short_name=short_name,
                 timeframe_frames=timeframe_frames,
                 execution_timeframes=execution_timeframes,
+                live_only=live_only,
             )
 
         if not had_data:
@@ -2482,6 +2502,8 @@ class TradingAgent:
         self,
         symbol: str,
         signal_type: SignalType,
+        *,
+        live_only: bool = False,
     ) -> Tuple[bool, Dict[str, Any]]:
         """Confirm short-term signals using higher-timeframe spot trend bias."""
         with self._latency_tracker.track(
@@ -2495,7 +2517,7 @@ class TradingAgent:
             references: Dict[str, Any] = {}
 
             for timeframe in reference_timeframes:
-                df = await self._fetch_market_data(symbol, timeframe=timeframe)
+                df = await self._fetch_market_data(symbol, timeframe=timeframe, live_only=live_only)
                 if df is None or df.empty:
                     references[timeframe] = {"trend": "missing"}
                     continue
@@ -2562,6 +2584,8 @@ class TradingAgent:
         short_name: str,
         timeframe_frames: Dict[str, pd.DataFrame],
         execution_timeframes: List[str],
+        *,
+        live_only: bool = False,
     ) -> None:
         """Enter one exploratory bootstrap trade when no normal trade fired."""
         # Keep one active option position per underlying in bootstrap.
@@ -2587,6 +2611,7 @@ class TradingAgent:
         confirmed, reference_meta = await self._confirm_reference_timeframes(
             symbol=symbol,
             signal_type=exploratory_signal.signal_type,
+            live_only=live_only,
         )
         if not confirmed:
             # If higher-timeframe data is missing, allow exploratory trade
@@ -2775,6 +2800,8 @@ class TradingAgent:
         self,
         symbol: str,
         execution_timeframes: List[str],
+        *,
+        live_only: bool = False,
     ) -> List[str]:
         ordered: List[str] = []
         seen: set[str] = set()
@@ -2788,7 +2815,7 @@ class TradingAgent:
             return ordered
 
         baseline = "15" if "15" in ordered else ordered[min(len(ordered) - 1, 1)]
-        frame = await self._fetch_market_data(symbol, timeframe=baseline)
+        frame = await self._fetch_market_data(symbol, timeframe=baseline, live_only=live_only)
         if frame is None or frame.empty or "close" not in frame.columns:
             return ordered
 
@@ -5363,7 +5390,63 @@ class TradingAgent:
                 ))
                 self._readiness_notified[market] = True
 
-    async def _fetch_market_data(self, symbol: str, timeframe: Optional[str] = None) -> Optional[pd.DataFrame]:
+    async def _fetch_market_data_from_memory(
+        self,
+        symbol: str,
+        timeframe: str,
+    ) -> Optional[pd.DataFrame]:
+        from src.data.ohlc_cache import get_ohlc_cache
+
+        tf = str(timeframe or self.config.timeframe).strip().upper()
+        now = datetime.now(tz=IST)
+        require_live_bars = self._requires_live_bars(self._symbol_market(symbol), tf, now)
+        stale_candidate: Optional[pd.DataFrame] = None
+
+        def remember_stale(frame: Optional[pd.DataFrame]) -> None:
+            nonlocal stale_candidate
+            if frame is None or frame.empty or "timestamp" not in frame.columns:
+                return
+            if stale_candidate is None:
+                stale_candidate = frame.copy(deep=False)
+                return
+            candidate_ts = self._coerce_ist_timestamp(frame["timestamp"].iloc[-1])
+            existing_ts = self._coerce_ist_timestamp(stale_candidate["timestamp"].iloc[-1])
+            if candidate_ts is not None and (existing_ts is None or candidate_ts > existing_ts):
+                stale_candidate = frame.copy(deep=False)
+
+        cache = get_ohlc_cache()
+        cached = cache.as_dataframe(symbol, tf, limit=500)
+        if not cached.empty:
+            df_cached = cached.reset_index()
+            if "timestamp" not in df_cached.columns and "index" in df_cached.columns:
+                df_cached = df_cached.rename(columns={"index": "timestamp"})
+            df_cached["symbol"] = symbol
+            fresh, _ = self._data_freshness(df_cached, tf)
+            if fresh:
+                self._market_data_cache[(symbol, tf)] = (now, df_cached)
+                return df_cached
+            if not require_live_bars:
+                remember_stale(df_cached)
+
+        cache_key = (symbol, tf)
+        local_cached = self._market_data_cache.get(cache_key)
+        if local_cached is not None:
+            _, cached_df = local_cached
+            fresh, _ = self._data_freshness(cached_df, tf)
+            if fresh:
+                return cached_df.copy(deep=False)
+            if not require_live_bars:
+                remember_stale(cached_df)
+
+        return stale_candidate.copy(deep=False) if stale_candidate is not None else None
+
+    async def _fetch_market_data(
+        self,
+        symbol: str,
+        timeframe: Optional[str] = None,
+        *,
+        live_only: bool = False,
+    ) -> Optional[pd.DataFrame]:
         """Fetch recent OHLC candles for NSE/US/Crypto symbols."""
         tf = str(timeframe or self.config.timeframe).strip().upper()
         market = self._symbol_market(symbol)
@@ -5374,39 +5457,19 @@ class TradingAgent:
             timeframe=tf,
         ):
             try:
-                from src.data.ohlc_cache import get_ohlc_cache
+                memory_frame = await self._fetch_market_data_from_memory(symbol, tf)
+                if memory_frame is not None and not memory_frame.empty:
+                    fresh, _ = self._data_freshness(memory_frame, tf)
+                    if fresh:
+                        return memory_frame
+                if live_only and self._event_driven_hot_path_timeframe_supported(tf):
+                    return memory_frame
 
                 now = datetime.now(tz=IST)
                 require_live_bars = self._requires_live_bars(market, tf, now)
-                stale_candidate: Optional[pd.DataFrame] = None
+                stale_candidate = memory_frame.copy(deep=False) if memory_frame is not None else None
 
-                def remember_stale(frame: Optional[pd.DataFrame]) -> None:
-                    nonlocal stale_candidate
-                    if frame is None or frame.empty or "timestamp" not in frame.columns:
-                        return
-                    if stale_candidate is None:
-                        stale_candidate = frame.copy(deep=False)
-                        return
-                    candidate_ts = self._coerce_ist_timestamp(frame["timestamp"].iloc[-1])
-                    existing_ts = self._coerce_ist_timestamp(stale_candidate["timestamp"].iloc[-1])
-                    if candidate_ts is not None and (existing_ts is None or candidate_ts > existing_ts):
-                        stale_candidate = frame.copy(deep=False)
-
-                # 1) Fast path: in-memory cache.
-                cache = get_ohlc_cache()
-                cached = cache.as_dataframe(symbol, tf, limit=500)
-                if not cached.empty:
-                    df_cached = cached.reset_index()
-                    if "timestamp" not in df_cached.columns and "index" in df_cached.columns:
-                        df_cached = df_cached.rename(columns={"index": "timestamp"})
-                    df_cached["symbol"] = symbol
-                    fresh, _ = self._data_freshness(df_cached, tf)
-                    if fresh:
-                        return df_cached
-                    if not require_live_bars:
-                        remember_stale(df_cached)
-
-                # 2) In-process cache to avoid repeated external API fetches
+                # In-process cache to avoid repeated external API fetches
                 # within a single scan cycle across strategies/timeframes.
                 cache_key = (symbol, tf)
                 local_cached = self._market_data_cache.get(cache_key)
@@ -5416,10 +5479,10 @@ class TradingAgent:
                         fresh, _ = self._data_freshness(cached_df, tf)
                         if fresh:
                             return cached_df.copy(deep=False)
-                        if not require_live_bars:
-                            remember_stale(cached_df)
+                        if not require_live_bars and stale_candidate is None:
+                            stale_candidate = cached_df.copy(deep=False)
 
-                # 3) TimescaleDB fallback before external broker calls. This reduces
+                # TimescaleDB fallback before external broker calls. This reduces
                 # FYERS rate pressure during live NSE sessions if the background
                 # collectors already persisted the latest bars.
                 db_df = await self._fetch_database_market_data(symbol, tf)
@@ -5429,9 +5492,15 @@ class TradingAgent:
                         self._market_data_cache[cache_key] = (now, db_df)
                         return db_df
                     if not require_live_bars:
-                        remember_stale(db_df)
+                        if stale_candidate is None:
+                            stale_candidate = db_df.copy(deep=False)
+                        else:
+                            candidate_ts = self._coerce_ist_timestamp(db_df["timestamp"].iloc[-1])
+                            existing_ts = self._coerce_ist_timestamp(stale_candidate["timestamp"].iloc[-1])
+                            if candidate_ts is not None and (existing_ts is None or candidate_ts > existing_ts):
+                                stale_candidate = db_df.copy(deep=False)
 
-                # 4) Market-specific primary source.
+                # Market-specific primary source.
                 if market == "US":
                     us_df = await self._fetch_us_market_data(symbol, tf)
                     if us_df is not None and not us_df.empty:
@@ -5443,13 +5512,13 @@ class TradingAgent:
                         self._market_data_cache[cache_key] = (now, crypto_df)
                         return crypto_df
 
-                # 5) Broker fallback (NSE + any symbol supported by broker).
+                # Broker fallback (NSE + any symbol supported by broker).
                 fyers_df = await self._fetch_fyers_market_data(symbol, tf)
                 if fyers_df is not None and not fyers_df.empty:
                     self._market_data_cache[cache_key] = (now, fyers_df)
                     return fyers_df
 
-                # 6) Last fallback for US/crypto in case primary source failed transiently.
+                # Last fallback for US/crypto in case primary source failed transiently.
                 if market == "US":
                     us_df = await self._fetch_us_market_data(symbol, tf)
                     if us_df is not None and not us_df.empty:

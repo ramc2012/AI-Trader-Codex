@@ -361,6 +361,39 @@ async def test_fetch_market_data_prefers_newer_stale_db_frame_when_market_closed
     assert pd.to_datetime(frame["timestamp"].iloc[-1]) == pd.to_datetime(newer_db_frame["timestamp"].iloc[-1])
 
 
+@pytest.mark.asyncio
+async def test_fetch_market_data_live_only_skips_db_and_rest_fallbacks(monkeypatch) -> None:
+    agent = _build_agent(AgentConfig())
+    stale_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(days=2))
+
+    class _Cache:
+        def as_dataframe(self, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+            return stale_frame.set_index("timestamp")
+
+    monkeypatch.setattr("src.data.ohlc_cache.get_ohlc_cache", lambda: _Cache())
+    agent._requires_live_bars = MagicMock(return_value=True)
+    agent._fetch_database_market_data = AsyncMock(return_value=_frame_with_end(datetime.now(tz=IST)))
+    agent._fetch_fyers_market_data = AsyncMock(return_value=_frame_with_end(datetime.now(tz=IST)))
+
+    frame = await agent._fetch_market_data("NSE:NIFTY50-INDEX", timeframe="3", live_only=True)
+
+    assert frame is None
+    agent._fetch_database_market_data.assert_not_called()
+    agent._fetch_fyers_market_data.assert_not_called()
+
+
+def test_periodic_scan_symbols_skip_event_driven_symbols() -> None:
+    agent = _build_agent(AgentConfig(event_driven_execution_enabled=True))
+    agent._candle_broker = MagicMock()
+    agent._is_event_driven_symbol_eligible = MagicMock(
+        side_effect=lambda symbol: symbol == "NSE:NIFTY50-INDEX"
+    )
+
+    filtered = agent._periodic_scan_symbols(["NSE:NIFTY50-INDEX", "CRYPTO:BTCUSDT"])
+
+    assert filtered == ["CRYPTO:BTCUSDT"]
+
+
 def test_signal_priority_score_penalizes_small_timeframe_in_trend() -> None:
     agent = _build_agent(AgentConfig())
     signal = Signal(

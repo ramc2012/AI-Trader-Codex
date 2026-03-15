@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from typing import Any, Dict, Optional
 
@@ -141,24 +141,26 @@ class EventAnalyticsSink:
         if self._http_client is None:
             return
         stream = str(envelope.get("stream") or "execution")
+        event_time = self._clickhouse_timestamp(str(envelope["event_time"]))
+        event_date = event_time[:10]
         if stream == "market_ticks":
             row = {
-                "event_time": envelope["event_time"],
-                "event_date": envelope["event_time"][:10],
+                "event_time": event_time,
+                "event_date": event_date,
                 "symbol": envelope.get("symbol", ""),
                 "market": envelope.get("market", ""),
                 "ltp": float(envelope.get("ltp") or 0.0),
-                "bid": envelope.get("bid"),
-                "ask": envelope.get("ask"),
+                "bid": self._clickhouse_float(envelope.get("bid")),
+                "ask": self._clickhouse_float(envelope.get("ask")),
                 "volume": int(envelope.get("volume") or 0),
-                "cumulative_volume": envelope.get("cumulative_volume"),
+                "cumulative_volume": self._clickhouse_int(envelope.get("cumulative_volume")),
                 "payload": self._dumps_text(envelope.get("payload", {})),
             }
             table = "market_ticks"
         elif stream == "market_bars":
             row = {
-                "event_time": envelope["event_time"],
-                "event_date": envelope["event_time"][:10],
+                "event_time": event_time,
+                "event_date": event_date,
                 "symbol": envelope.get("symbol", ""),
                 "market": envelope.get("market", ""),
                 "timeframe": envelope.get("timeframe", ""),
@@ -173,8 +175,8 @@ class EventAnalyticsSink:
         else:
             table = "execution_events"
             row = {
-                "event_time": envelope["event_time"],
-                "event_date": envelope["event_time"][:10],
+                "event_time": event_time,
+                "event_date": event_date,
                 "event_id": envelope["event_id"],
                 "source": envelope["source"],
                 "event_type": envelope["event_type"],
@@ -194,9 +196,6 @@ class EventAnalyticsSink:
         response.raise_for_status()
 
     async def _write_questdb(self, envelope: Dict[str, Any]) -> None:
-        writer = await self._get_questdb_writer()
-        if writer is None:
-            return
         stream = str(envelope.get("stream") or "execution")
         payload_json = self._dumps_text(envelope.get("payload", {})).replace('"', '\\"')
         if stream == "market_ticks":
@@ -240,8 +239,20 @@ class EventAnalyticsSink:
                 f'payload="{self._escape_field(payload_json)}" '
                 f"{self._to_ns(envelope['event_time'])}\n"
             )
-        writer.write(line.encode("utf-8"))
-        await writer.drain()
+        payload = line.encode("utf-8")
+        writer = await self._get_questdb_writer()
+        if writer is None:
+            return
+        try:
+            writer.write(payload)
+            await writer.drain()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            await self._reset_questdb_writer()
+            writer = await self._get_questdb_writer()
+            if writer is None:
+                raise
+            writer.write(payload)
+            await writer.drain()
 
     async def _get_questdb_writer(self) -> asyncio.StreamWriter | None:
         async with self._questdb_lock:
@@ -257,6 +268,17 @@ class EventAnalyticsSink:
                 return None
             self._questdb_writer = writer
             return self._questdb_writer
+
+    async def _reset_questdb_writer(self) -> None:
+        async with self._questdb_lock:
+            if self._questdb_writer is None:
+                return
+            try:
+                self._questdb_writer.close()
+                await self._questdb_writer.wait_closed()
+            except Exception:
+                pass
+            self._questdb_writer = None
 
     @staticmethod
     def _escape_tag(value: str) -> str:
@@ -282,6 +304,23 @@ class EventAnalyticsSink:
         if value in (None, ""):
             return "null"
         return f"{int(value)}i"
+
+    @staticmethod
+    def _clickhouse_float(value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        return float(value)
+
+    @staticmethod
+    def _clickhouse_int(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        return int(value)
+
+    @staticmethod
+    def _clickhouse_timestamp(timestamp: str) -> str:
+        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
     @staticmethod
     def _dumps_bytes(payload: Dict[str, Any]) -> bytes:

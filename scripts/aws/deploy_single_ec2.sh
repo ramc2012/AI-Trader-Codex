@@ -20,7 +20,9 @@ AWS_REGION="$(env_value AWS_REGION)"
 AWS_ACCOUNT_ID="$(env_value AWS_ACCOUNT_ID)"
 BACKEND_IMAGE="$(env_value BACKEND_IMAGE)"
 FRONTEND_IMAGE="$(env_value FRONTEND_IMAGE)"
+EXECUTION_CORE_IMAGE="$(env_value EXECUTION_CORE_IMAGE)"
 PUBLIC_HOST="$(env_value PUBLIC_HOST)"
+DEPLOY_SUBSECOND_STACK="${DEPLOY_SUBSECOND_STACK:-$(env_value DEPLOY_SUBSECOND_STACK)}"
 
 if [[ -z "${AWS_REGION:-}" || -z "${AWS_ACCOUNT_ID:-}" ]]; then
   echo "Set AWS_REGION and AWS_ACCOUNT_ID in .env.aws.single"
@@ -32,12 +34,22 @@ if [[ -z "${BACKEND_IMAGE:-}" || -z "${FRONTEND_IMAGE:-}" || -z "${PUBLIC_HOST:-
   exit 1
 fi
 
+compose_args=(--env-file .env.aws.single -f docker-compose.aws-single.yml)
+
+if [[ "${DEPLOY_SUBSECOND_STACK:-false}" == "true" ]]; then
+  if [[ -z "${EXECUTION_CORE_IMAGE:-}" ]]; then
+    echo "Set EXECUTION_CORE_IMAGE in .env.aws.single when DEPLOY_SUBSECOND_STACK=true"
+    exit 1
+  fi
+  compose_args+=(-f docker-compose.aws-subsecond.yml)
+fi
+
 echo "Logging into ECR..."
 aws ecr get-login-password --region "${AWS_REGION}" \
   | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
 echo "Pulling latest images..."
-docker compose --env-file .env.aws.single -f docker-compose.aws-single.yml pull
+docker compose "${compose_args[@]}" pull
 
 echo "Fixing persistent data ownership..."
 mkdir -p backend_data
@@ -55,7 +67,7 @@ if ! sudo swapon --show | grep -q '/swapfile'; then
 fi
 
 echo "Starting stack..."
-docker compose --env-file .env.aws.single -f docker-compose.aws-single.yml up -d
+docker compose "${compose_args[@]}" up -d
 
 echo "Deployment completed."
-docker compose --env-file .env.aws.single -f docker-compose.aws-single.yml ps
+docker compose "${compose_args[@]}" ps

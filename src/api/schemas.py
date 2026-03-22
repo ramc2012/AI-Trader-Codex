@@ -726,6 +726,8 @@ class AgentConfigRequest(BaseModel):
                 "RSI_Reversal": 1.0,
                 "Supertrend_Breakout": 1.0,
                 "Crypto_Swing_Radar": 1.15,
+                "Profile_Swing_Radar": 1.2,
+                "Profile_AI_Swing_Radar": 1.25,
             }
         },
         description="Optional market-specific strategy budget weights",

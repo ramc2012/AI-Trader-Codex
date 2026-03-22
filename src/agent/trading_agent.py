@@ -202,6 +202,8 @@ class AgentConfig:
                 "RSI_Reversal": 1.0,
                 "Supertrend_Breakout": 1.0,
                 "Crypto_Swing_Radar": 1.15,
+                "Profile_Swing_Radar": 1.2,
+                "Profile_AI_Swing_Radar": 1.25,
             }
         }
     )
@@ -2342,8 +2344,8 @@ class TradingAgent:
             "FnO_Swing_Radar": {"NSE"},
             "US_Swing_Radar": {"US"},
             "Crypto_Swing_Radar": {"CRYPTO"},
-            "Profile_Swing_Radar": {"NSE", "US"},
-            "Profile_AI_Swing_Radar": {"NSE", "US"},
+            "Profile_Swing_Radar": {"NSE", "US", "CRYPTO"},
+            "Profile_AI_Swing_Radar": {"NSE", "US", "CRYPTO"},
         }.get(strategy_name)
         if allowed_markets is not None and market_key not in allowed_markets:
             return False
@@ -3387,7 +3389,7 @@ class TradingAgent:
             name for name in requested
             if name in {"Profile_Swing_Radar", "Profile_AI_Swing_Radar"}
         }
-        if profile_requested and market in {"NSE", "US"}:
+        if profile_requested and market in {"NSE", "US", "CRYPTO"}:
             hourly_frame = await self._fetch_market_data(symbol, timeframe="60")
             if hourly_frame is not None and not hourly_frame.empty:
                 for strategy_name in sorted(profile_requested):
@@ -3644,17 +3646,50 @@ class TradingAgent:
                         timeframe,
                         regime_meta,
                     )
+                    learning_policy = self._learning_signal_policy(
+                        strat_name,
+                        symbol_market,
+                        timeframe,
+                        signal,
+                    )
+                    signal.metadata.setdefault("learning_profile", learning_policy["learning_profile"])
+                    signal.metadata["learning_priority_delta"] = float(learning_policy["priority_delta"])
+                    signal.metadata["learning_min_strength"] = str(learning_policy["min_strength"])
+                    effective_priority_threshold = priority_threshold + float(learning_policy["priority_delta"])
                     signal.metadata["trade_priority_score"] = round(priority_score, 2)
                     signal.metadata["trade_priority_threshold"] = round(priority_threshold, 2)
+                    signal.metadata["learning_priority_threshold"] = round(effective_priority_threshold, 2)
 
-                    if priority_score < priority_threshold:
+                    if self._signal_strength_rank(signal.strength) < self._signal_strength_rank(
+                        learning_policy["min_strength_enum"]
+                    ):
+                        if emit_verbose_events:
+                            await self.event_bus.emit(AgentEvent(
+                                event_type=AgentEventType.NO_SIGNAL,
+                                title=f"{strat_name}: Learning Filtered",
+                                message=(
+                                    f"{strat_name} on {tf_label} was skipped. "
+                                    f"Live learning requires at least {learning_policy['min_strength'].upper()} "
+                                    f"signals in the current performance state."
+                                ),
+                                severity="info",
+                                metadata={
+                                    "symbol": symbol,
+                                    "strategy": strat_name,
+                                    "timeframe": timeframe,
+                                    "learning": learning_policy,
+                                },
+                            ))
+                        continue
+
+                    if priority_score < effective_priority_threshold:
                         if emit_verbose_events:
                             await self.event_bus.emit(AgentEvent(
                                 event_type=AgentEventType.NO_SIGNAL,
                                 title=f"{strat_name}: Priority Filtered",
                                 message=(
                                     f"{strat_name} setup on {tf_label} was skipped. "
-                                    f"Priority {priority_score:.1f} < threshold {priority_threshold:.1f} "
+                                    f"Priority {priority_score:.1f} < threshold {effective_priority_threshold:.1f} "
                                     f"for {regime_meta.get('regime', 'transition')} regime."
                                 ),
                                 severity="info",
@@ -3664,6 +3699,8 @@ class TradingAgent:
                                     "timeframe": timeframe,
                                     "priority_score": round(priority_score, 2),
                                     "priority_threshold": round(priority_threshold, 2),
+                                    "learning_priority_threshold": round(effective_priority_threshold, 2),
+                                    "learning": learning_policy,
                                     "regime": regime_meta,
                                 },
                             ))
@@ -5597,6 +5634,60 @@ class TradingAgent:
         if market == "CRYPTO":
             threshold += 2.0
         return max(48.0, min(threshold, 78.0))
+
+    @staticmethod
+    def _signal_strength_rank(strength: SignalStrength) -> int:
+        return {
+            SignalStrength.WEAK: 1,
+            SignalStrength.MODERATE: 2,
+            SignalStrength.STRONG: 3,
+        }.get(strength, 0)
+
+    def _learning_signal_policy(
+        self,
+        strategy: str,
+        market: str,
+        execution_timeframe: str,
+        signal: Signal,
+    ) -> Dict[str, Any]:
+        profile = self._strategy_learning_profile(strategy, market)
+        trade_count = max(int(profile.get("trade_count", 0) or 0), 0)
+        reward_ema = float(profile.get("reward_ema", 0.0) or 0.0)
+        rolling_sharpe = float(profile.get("rolling_sharpe", 0.0) or 0.0)
+        win_rate = float(profile.get("win_rate", 0.0) or 0.0)
+        tf_token = str(execution_timeframe or "").strip().upper()
+
+        priority_delta = 0.0
+        min_strength = SignalStrength.WEAK
+        if trade_count >= 8:
+            timeframe_penalty = 2.0 if tf_token in {"3", "5"} else 1.0 if tf_token in {"15", "60"} else 0.0
+            if reward_ema <= -2.0 or rolling_sharpe <= -0.35 or win_rate <= 0.40:
+                priority_delta += 7.0 + timeframe_penalty
+                min_strength = SignalStrength.STRONG if tf_token in {"3", "5", "15", "60"} else SignalStrength.MODERATE
+            elif reward_ema <= -0.75 or rolling_sharpe < 0.0 or win_rate <= 0.46:
+                priority_delta += 4.0 + (1.0 if tf_token in {"3", "5"} else 0.0)
+                min_strength = SignalStrength.MODERATE
+            elif reward_ema >= 2.0 and rolling_sharpe >= 0.55 and win_rate >= 0.56:
+                priority_delta -= 4.0
+            elif reward_ema >= 0.75 and win_rate >= 0.52:
+                priority_delta -= 2.0
+
+        metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
+        try:
+            adaptive_rr = float(metadata.get("adaptive_risk_reward", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            adaptive_rr = 0.0
+        if adaptive_rr >= 2.5:
+            priority_delta -= 1.5
+        elif trade_count >= 8 and adaptive_rr > 0.0 and adaptive_rr <= 1.2:
+            priority_delta += 1.5
+
+        return {
+            "learning_profile": profile,
+            "priority_delta": round(priority_delta, 2),
+            "min_strength": min_strength.value,
+            "min_strength_enum": min_strength,
+        }
 
     @staticmethod
     def _max_candidates_per_symbol(market: str, regime_meta: Dict[str, Any]) -> int:

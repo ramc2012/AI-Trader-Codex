@@ -100,6 +100,42 @@ def test_active_symbols_respect_market_toggles() -> None:
     assert active == []
 
 
+def test_profile_swing_strategies_are_allowed_for_crypto() -> None:
+    agent = _build_agent(AgentConfig())
+
+    assert agent._is_strategy_allowed_for_market("Profile_Swing_Radar", "CRYPTO") is True
+    assert agent._is_strategy_allowed_for_market("Profile_AI_Swing_Radar", "CRYPTO") is True
+
+
+def test_learning_signal_policy_tightens_underperforming_short_term_strategy() -> None:
+    agent = _build_agent(AgentConfig())
+    agent._strategy_perf_tracker = MagicMock()
+    agent._strategy_perf_tracker.get_strategy_snapshot.return_value = {
+        "trade_count": 14,
+        "reward_ema": -1.4,
+        "rolling_sharpe": -0.2,
+        "win_rate": 0.41,
+        "enabled": True,
+    }
+
+    signal = Signal(
+        timestamp=datetime.now(tz=IST),
+        symbol="CRYPTO:BTCUSDT",
+        signal_type=SignalType.BUY,
+        strength=SignalStrength.WEAK,
+        price=100.0,
+        stop_loss=95.0,
+        target=110.0,
+        strategy_name="Profile_Swing_Radar",
+        metadata={},
+    )
+
+    policy = agent._learning_signal_policy("Profile_Swing_Radar", "CRYPTO", "5", signal)
+
+    assert policy["priority_delta"] > 0
+    assert policy["min_strength"] == SignalStrength.MODERATE.value
+
+
 def test_us_positions_force_eod_exit_near_close() -> None:
     agent = _build_agent(AgentConfig())
     # 2026-03-05 02:28 IST == 2026-03-04 15:58 US/Eastern.

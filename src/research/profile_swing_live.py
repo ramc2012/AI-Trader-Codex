@@ -97,6 +97,10 @@ def _asset_type_for_symbol(symbol: str, market: str) -> str:
     return "stock"
 
 
+def _crypto_fallback_markets(asset_type: str) -> tuple[str, ...]:
+    return ("NSE", "US") if asset_type == "stock" else ()
+
+
 def _load_dataset(report_dir: str) -> pd.DataFrame:
     path = Path(report_dir) / "profile_dataset.csv.gz"
     if not path.exists():
@@ -138,6 +142,40 @@ def load_condition_stats(report_dir: str, market: str, asset_type: str, target_n
             error=str(exc),
         )
         return pd.DataFrame()
+
+
+def _merge_condition_stats(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    usable = [frame for frame in frames if frame is not None and not frame.empty]
+    if not usable:
+        return pd.DataFrame()
+    combined = pd.concat(usable, ignore_index=True)
+    if combined.empty:
+        return combined
+
+    rows: list[dict[str, Any]] = []
+    for (condition, row_type), group in combined.groupby(["condition", "type"], dropna=False, sort=False):
+        support = pd.to_numeric(group["support"], errors="coerce").fillna(0.0)
+        total_support = float(support.sum())
+        if total_support <= 0:
+            continue
+        weights = support / total_support
+        rows.append(
+            {
+                "condition": str(condition),
+                "type": str(row_type or ""),
+                "support": int(round(total_support)),
+                "support_pct": float(np.average(pd.to_numeric(group.get("support_pct"), errors="coerce").fillna(0.0), weights=weights)),
+                "hit_rate": float(np.average(pd.to_numeric(group.get("hit_rate"), errors="coerce").fillna(0.0), weights=weights)),
+                "baseline_hit_rate": float(np.average(pd.to_numeric(group.get("baseline_hit_rate"), errors="coerce").fillna(0.0), weights=weights)),
+                "lift": float(np.average(pd.to_numeric(group.get("lift"), errors="coerce").fillna(0.0), weights=weights)),
+                "up_share": float(np.average(pd.to_numeric(group.get("up_share"), errors="coerce").fillna(0.0), weights=weights)),
+                "down_share": float(np.average(pd.to_numeric(group.get("down_share"), errors="coerce").fillna(0.0), weights=weights)),
+                "avg_abs_move_2d": float(np.average(pd.to_numeric(group.get("avg_abs_move_2d"), errors="coerce").fillna(0.0), weights=weights)),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["lift", "support"], ascending=[False, False]).reset_index(drop=True)
 
 
 @lru_cache(maxsize=8)
@@ -328,6 +366,29 @@ def _research_summary_lookup(report_dir: str) -> dict[tuple[str, str, str], dict
     return lookup
 
 
+def _baseline_hit_rate(
+    summary_lookup: dict[tuple[str, str, str], dict[str, Any]],
+    *,
+    market: str,
+    asset_type: str,
+    target_name: str,
+) -> float:
+    direct = summary_lookup.get((market, asset_type, target_name), {})
+    direct_rate = _safe_float(direct.get("hit_rate"))
+    if direct_rate > 0:
+        return direct_rate
+
+    if market == "CRYPTO":
+        fallback_rates = [
+            _safe_float(summary_lookup.get((fallback_market, asset_type, target_name), {}).get("hit_rate"))
+            for fallback_market in _crypto_fallback_markets(asset_type)
+        ]
+        fallback_rates = [rate for rate in fallback_rates if rate > 0]
+        if fallback_rates:
+            return float(sum(fallback_rates) / len(fallback_rates))
+    return 0.0
+
+
 def _active_conditions(row: pd.Series | dict[str, Any]) -> set[str]:
     frame = pd.DataFrame([row]).replace([np.inf, -np.inf], np.nan)
     try:
@@ -350,6 +411,13 @@ def _matched_conditions(
     active_conditions: set[str],
 ) -> list[dict[str, Any]]:
     stats = load_condition_stats(report_dir, market, asset_type, target_name)
+    if stats.empty and market == "CRYPTO":
+        stats = _merge_condition_stats(
+            [
+                load_condition_stats(report_dir, fallback_market, asset_type, target_name)
+                for fallback_market in _crypto_fallback_markets(asset_type)
+            ]
+        )
     if stats.empty:
         return []
 
@@ -398,31 +466,53 @@ def _predict_probabilities(
     target_name: str,
     row: pd.Series | dict[str, Any],
 ) -> dict[str, float]:
-    bundle = load_model_bundle(report_dir, market, asset_type, target_name)
-    model = bundle.get("model")
-    feature_columns = list(bundle.get("feature_columns", []) or [])
-    if model is None or not feature_columns:
-        return {}
-
-    medians = pd.Series(bundle.get("feature_medians", {}), dtype=float)
-    record = _encode_model_record(row, feature_columns, medians)
-    try:
-        probabilities = model.predict_proba(record)[0]
-    except Exception as exc:
-        logger.warning(
-            "profile_swing_live_predict_failed",
-            report_dir=report_dir,
-            market=market,
-            asset_type=asset_type,
-            target=target_name,
-            error=str(exc),
+    bundle_specs = [(market, load_model_bundle(report_dir, market, asset_type, target_name))]
+    if market == "CRYPTO":
+        bundle_specs.extend(
+            (fallback_market, load_model_bundle(report_dir, fallback_market, asset_type, target_name))
+            for fallback_market in _crypto_fallback_markets(asset_type)
         )
+
+    predictions: list[dict[str, float]] = []
+    for model_market, bundle in bundle_specs:
+        model = bundle.get("model")
+        feature_columns = list(bundle.get("feature_columns", []) or [])
+        if model is None or not feature_columns:
+            continue
+
+        medians = pd.Series(bundle.get("feature_medians", {}), dtype=float)
+        record = _encode_model_record(row, feature_columns, medians)
+        try:
+            probabilities = model.predict_proba(record)[0]
+        except Exception as exc:
+            logger.warning(
+                "profile_swing_live_predict_failed",
+                report_dir=report_dir,
+                market=model_market,
+                asset_type=asset_type,
+                target=target_name,
+                error=str(exc),
+            )
+            continue
+
+        classes = [str(value) for value in getattr(model, "classes_", [])]
+        predictions.append(
+            {
+                label: round(_safe_float(probability), 6)
+                for label, probability in zip(classes, probabilities, strict=False)
+            }
+        )
+
+    if not predictions:
         return {}
 
-    classes = [str(value) for value in getattr(model, "classes_", [])]
+    labels = sorted({label for row_probabilities in predictions for label in row_probabilities})
     return {
-        label: round(_safe_float(probability), 6)
-        for label, probability in zip(classes, probabilities, strict=False)
+        label: round(
+            float(sum(_safe_float(row_probabilities.get(label)) for row_probabilities in predictions) / len(predictions)),
+            6,
+        )
+        for label in labels
     }
 
 
@@ -535,6 +625,11 @@ def _assess_target(
     up_probability = _safe_float(probabilities.get("up"))
     down_probability = _safe_float(probabilities.get("down"))
     neutral_probability = _safe_float(probabilities.get("neutral"))
+    total_probability = up_probability + down_probability + neutral_probability
+    if total_probability > 0:
+        up_probability /= total_probability
+        down_probability /= total_probability
+        neutral_probability /= total_probability
 
     ai_adjustment = 0.0
     if variant == "ai":
@@ -723,7 +818,7 @@ class ProfileSwingLiveScorer:
         symbol = str(row.get("symbol") or "").strip()
         market = str(row.get("market") or _symbol_market(symbol)).strip().upper()
         asset_type = str(row.get("asset_type") or _asset_type_for_symbol(symbol, market)).strip().lower()
-        if not symbol or market not in {"NSE", "US"}:
+        if not symbol or market not in {"NSE", "US", "CRYPTO"}:
             return None
 
         active_conditions = _active_conditions(row)
@@ -733,8 +828,12 @@ class ProfileSwingLiveScorer:
         summary_lookup = _research_summary_lookup(self.report_dir)
         assessments: list[TargetAssessment] = []
         for target_name, threshold_pct in _target_config(asset_type):
-            summary_row = summary_lookup.get((market, asset_type, target_name), {})
-            baseline_hit_rate = _safe_float(summary_row.get("hit_rate"))
+            baseline_hit_rate = _baseline_hit_rate(
+                summary_lookup,
+                market=market,
+                asset_type=asset_type,
+                target_name=target_name,
+            )
             matches = _matched_conditions(
                 report_dir=self.report_dir,
                 market=market,

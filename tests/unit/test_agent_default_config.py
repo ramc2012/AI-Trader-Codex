@@ -80,3 +80,5 @@ def test_agent_start_request_defaults_include_crypto_swing_controls() -> None:
     assert request.disabled_strategies_by_market["CRYPTO"] == ["Bootstrap_Explorer", "EMA_Crossover"]
     assert request.strategy_budget_weights_by_market["CRYPTO"]["MP_OrderFlow_Breakout"] == 1.8
     assert request.strategy_budget_weights_by_market["CRYPTO"]["Fractal_Profile_Breakout"] == 1.8
+    assert request.strategy_budget_weights_by_market["CRYPTO"]["Profile_Swing_Radar"] == 1.2
+    assert request.strategy_budget_weights_by_market["CRYPTO"]["Profile_AI_Swing_Radar"] == 1.25

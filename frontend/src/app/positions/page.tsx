@@ -81,6 +81,14 @@ function positionMovePct(position: Position): number {
   return raw * (isLongPosition(position) ? 1 : -1);
 }
 
+function positionPnlCurrency(position: Position): string {
+  return position.currency ?? 'INR';
+}
+
+function positionPnlValue(position: Position): number {
+  return Number(position.unrealized_pnl ?? position.unrealized_pnl_inr ?? 0);
+}
+
 function sortPositions(rows: Position[]): Position[] {
   return [...rows].sort((left, right) => {
     if (left.market_open !== right.market_open) {
@@ -374,7 +382,8 @@ function PositionDetailsDialog({
   position: Position;
   onClose: () => void;
 }) {
-  const pnlInr = position.unrealized_pnl_inr ?? position.unrealized_pnl;
+  const pnlValue = positionPnlValue(position);
+  const pnlCurrency = positionPnlCurrency(position);
   const movePct = positionMovePct(position);
 
   return (
@@ -407,8 +416,8 @@ function PositionDetailsDialog({
             <MiniCard label="Mark" value={formatCurrency(position.current_price, position.currency ?? 'INR')} />
             <MiniCard
               label="P&L"
-              value={formatCurrency(pnlInr, 'INR')}
-              tone={pnlInr >= 0 ? 'positive' : 'negative'}
+              value={formatCurrency(pnlValue, pnlCurrency)}
+              tone={pnlValue >= 0 ? 'positive' : 'negative'}
             />
           </div>
 
@@ -661,12 +670,12 @@ export default function PositionsPage() {
                                     </div>
                                   </div>
                                   <div className="text-right">
-                                    <div className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Unrealised P&amp;L</div>
-                                    <div className={cn(
+                                  <div className="text-[10px] uppercase tracking-[0.16em] text-slate-500">Unrealised P&amp;L</div>
+                                  <div className={cn(
                                       'mt-0.5 font-semibold',
-                                      group.unrealizedPnlInr >= 0 ? 'text-emerald-300' : 'text-rose-300',
+                                      group.unrealizedPnl >= 0 ? 'text-emerald-300' : 'text-rose-300',
                                     )}>
-                                      {formatCurrency(group.unrealizedPnlInr, 'INR')}
+                                      {formatCurrency(group.unrealizedPnl, group.currency)}
                                     </div>
                                   </div>
                                 </div>
@@ -674,7 +683,8 @@ export default function PositionsPage() {
                             </td>
                           </tr>
                           {group.positions.map((position) => {
-                            const pnlInr = position.unrealized_pnl_inr ?? position.unrealized_pnl;
+                            const pnlValue = positionPnlValue(position);
+                            const pnlCurrency = positionPnlCurrency(position);
                             const movePct = positionMovePct(position);
                             const hasPlan =
                               position.stop_loss !== null &&
@@ -728,8 +738,8 @@ export default function PositionsPage() {
                                   </div>
                                 </td>
                                 <td className="py-3 pr-4 text-right">
-                                  <div className={cn('font-medium', pnlInr >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
-                                    {formatCurrency(pnlInr, 'INR')}
+                                  <div className={cn('font-medium', pnlValue >= 0 ? 'text-emerald-300' : 'text-rose-300')}>
+                                    {formatCurrency(pnlValue, pnlCurrency)}
                                   </div>
                                   <div className="mt-1 text-xs text-slate-500">
                                     {formatPercent(position.unrealized_pnl_pct, 2)}
@@ -839,16 +849,11 @@ export default function PositionsPage() {
                                   <div
                                     className={cn(
                                       'mt-1 text-sm font-medium',
-                                      group.unrealizedPnlInr >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                                      group.unrealizedPnl >= 0 ? 'text-emerald-300' : 'text-rose-300'
                                     )}
                                   >
                                     {formatCurrency(group.unrealizedPnl, group.currency)}
                                   </div>
-                                  {group.currency !== 'INR' && (
-                                    <div className="mt-1 text-xs text-slate-500">
-                                      {formatCurrency(group.unrealizedPnlInr, 'INR')}
-                                    </div>
-                                  )}
                                 </div>
                               </div>
                             </td>

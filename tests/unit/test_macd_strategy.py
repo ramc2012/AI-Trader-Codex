@@ -107,10 +107,14 @@ class TestMACDStrategy:
         assert strategy.macd_slow == 26
         assert strategy.macd_signal == 9
         assert strategy.rsi_period == 14
-        assert strategy.rsi_filter == 50.0
+        assert strategy.rsi_filter == 52.0
         assert strategy.atr_period == 14
-        assert strategy.atr_sl_multiplier == 2.0
-        assert strategy.risk_reward_ratio == 2.0
+        assert strategy.atr_sl_multiplier == 1.5
+        assert strategy.risk_reward_ratio == 2.2
+        assert strategy.buy_zero_line_mode == "near_or_aligned"
+        assert strategy.sell_zero_line_mode == "aligned"
+        assert strategy.zero_line_mode == "asymmetric"
+        assert strategy.max_zero_line_distance_atr == 0.25
 
     def test_instantiation_custom_params(self) -> None:
         strategy = MACDStrategy(
@@ -129,9 +133,19 @@ class TestMACDStrategy:
         assert strategy.rsi_filter == 45
         assert strategy.risk_reward_ratio == 3.0
 
+    def test_legacy_zero_line_mode_applies_to_both_sides(self) -> None:
+        strategy = MACDStrategy(zero_line_mode="aligned")
+        assert strategy.buy_zero_line_mode == "aligned"
+        assert strategy.sell_zero_line_mode == "aligned"
+        assert strategy.zero_line_mode == "aligned"
+
     def test_invalid_macd_periods(self) -> None:
         with pytest.raises(ValueError, match="macd_fast"):
             MACDStrategy(macd_fast=26, macd_slow=12)
+
+    def test_invalid_zero_line_mode(self) -> None:
+        with pytest.raises(ValueError, match="zero_line_mode"):
+            MACDStrategy(zero_line_mode="invalid")
 
     def test_name_property(self) -> None:
         strategy = MACDStrategy()
@@ -196,12 +210,57 @@ class TestMACDStrategy:
         assert "histogram" in meta
         assert "rsi" in meta
         assert "atr" in meta
+        assert "zero_line_mode" in meta
+        assert "buy_zero_line_mode" in meta
+        assert "sell_zero_line_mode" in meta
+        assert "active_zero_line_mode" in meta
+        assert "zero_line_aligned" in meta
+        assert "zero_line_distance_atr" in meta
 
     def test_insufficient_data(self) -> None:
         data = _make_base_data(10)
         strategy = MACDStrategy()
         signals = strategy.generate_signals(data)
         assert len(signals) == 0
+
+    def test_aligned_zero_line_mode_rejects_opposite_side_cross(self) -> None:
+        strategy = MACDStrategy(zero_line_mode="aligned")
+        assert strategy._zero_line_allows_entry(-0.5, 1.0, SignalType.BUY) is False
+        assert strategy._zero_line_allows_entry(0.5, 1.0, SignalType.SELL) is False
+        assert strategy._zero_line_allows_entry(0.1, 1.0, SignalType.BUY) is True
+        assert strategy._zero_line_allows_entry(-0.1, 1.0, SignalType.SELL) is True
+
+    def test_near_or_aligned_zero_line_mode_allows_nearby_cross(self) -> None:
+        strategy = MACDStrategy(
+            zero_line_mode="near_or_aligned",
+            max_zero_line_distance_atr=0.25,
+        )
+        assert strategy._zero_line_allows_entry(-0.2, 1.0, SignalType.BUY) is True
+        assert strategy._zero_line_allows_entry(0.2, 1.0, SignalType.SELL) is True
+        assert strategy._zero_line_allows_entry(-0.5, 1.0, SignalType.BUY) is False
+        assert strategy._zero_line_allows_entry(0.5, 1.0, SignalType.SELL) is False
+
+    def test_zero_line_bonus_can_upgrade_strength(self) -> None:
+        base = MACDStrategy(zero_line_mode="off")
+        aligned = MACDStrategy(zero_line_mode="aligned")
+
+        weak_strength = base._assess_strength(
+            crossover_diff=0.08,
+            atr=1.0,
+            rsi=50.0,
+            macd_value=-0.2,
+            side=SignalType.BUY,
+        )
+        stronger_strength = aligned._assess_strength(
+            crossover_diff=0.08,
+            atr=1.0,
+            rsi=50.0,
+            macd_value=0.2,
+            side=SignalType.BUY,
+        )
+
+        assert weak_strength == SignalStrength.WEAK
+        assert stronger_strength == SignalStrength.MODERATE
 
     def test_repr(self) -> None:
         s = MACDStrategy(macd_fast=12, macd_slow=26, macd_signal=9, rsi_filter=50)

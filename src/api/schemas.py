@@ -12,11 +12,11 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, model_validator
 from src.config.agent_universe import (
     DEFAULT_AGENT_CRYPTO_SYMBOLS,
+    DEFAULT_AGENT_NSE_SYMBOLS,
     DEFAULT_AGENT_US_SYMBOLS,
     normalize_nse_agent_symbols,
     parse_symbol_values,
 )
-from src.config.constants import DEFAULT_AGENT_NSE_SYMBOLS
 
 
 # =========================================================================
@@ -645,8 +645,13 @@ class AgentConfigRequest(BaseModel):
             "EMA_Crossover",
             "RSI_Reversal",
             "Supertrend_Breakout",
+            "FnO_Swing_Radar",
+            "US_Swing_Radar",
+            "Profile_Swing_Radar",
+            "Profile_AI_Swing_Radar",
             "MP_OrderFlow_Breakout",
             "Fractal_Profile_Breakout",
+            "Crypto_Swing_Radar",
         ],
         description="Strategy names to activate",
     )
@@ -707,6 +712,24 @@ class AgentConfigRequest(BaseModel):
     reinforcement_size_boost_pct: float = Field(default=60.0, ge=0.0, le=300.0)
     strategy_capital_bucket_enabled: bool = Field(default=False)
     strategy_max_concurrent_positions: int = Field(default=4, ge=1, le=20)
+    disabled_strategies_by_market: Dict[str, List[str]] = Field(
+        default_factory=lambda: {
+            "CRYPTO": ["Bootstrap_Explorer", "EMA_Crossover"],
+        },
+        description="Optional market-specific strategy disable map",
+    )
+    strategy_budget_weights_by_market: Dict[str, Dict[str, float]] = Field(
+        default_factory=lambda: {
+            "CRYPTO": {
+                "MP_OrderFlow_Breakout": 1.8,
+                "Fractal_Profile_Breakout": 1.8,
+                "RSI_Reversal": 1.0,
+                "Supertrend_Breakout": 1.0,
+                "Crypto_Swing_Radar": 1.15,
+            }
+        },
+        description="Optional market-specific strategy budget weights",
+    )
     telegram_status_interval_minutes: int = Field(
         default=30,
         ge=0,
@@ -719,6 +742,24 @@ class AgentConfigRequest(BaseModel):
         self.symbols = normalize_nse_agent_symbols(self.symbols)
         self.us_symbols = parse_symbol_values(self.us_symbols)
         self.crypto_symbols = parse_symbol_values(self.crypto_symbols)
+        self.disabled_strategies_by_market = {
+            str(market).strip().upper(): [
+                str(strategy).strip()
+                for strategy in strategies
+                if str(strategy or "").strip()
+            ]
+            for market, strategies in self.disabled_strategies_by_market.items()
+            if str(market or "").strip()
+        }
+        self.strategy_budget_weights_by_market = {
+            str(market).strip().upper(): {
+                str(strategy).strip(): max(float(weight), 0.1)
+                for strategy, weight in weights.items()
+                if str(strategy or "").strip()
+            }
+            for market, weights in self.strategy_budget_weights_by_market.items()
+            if str(market or "").strip()
+        }
         return self
 
 

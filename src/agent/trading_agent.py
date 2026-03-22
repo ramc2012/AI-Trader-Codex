@@ -28,9 +28,13 @@ import pandas as pd
 
 from src.agent.events import AgentEvent, AgentEventBus, AgentEventType
 from src.config.agent_universe import (
+    CRYPTO_SWING_BENCHMARK_SYMBOL,
     DEFAULT_AGENT_CRYPTO_SYMBOLS,
     DEFAULT_AGENT_NSE_SYMBOLS,
     DEFAULT_AGENT_US_SYMBOLS,
+    NIFTY_SYMBOL,
+    spot_symbol_to_fno_root,
+    us_symbol_to_ticker,
 )
 from src.config.constants import INDEX_INSTRUMENTS
 from src.config.market_hours import (
@@ -43,6 +47,7 @@ from src.config.market_hours import (
 )
 from src.config.fno_constants import get_instrument as get_fno_instrument, get_lot_size
 from src.config.settings import get_settings
+from src.config.us_swing_universe import US_SWING_BENCHMARK_SYMBOL
 from src.execution.order_manager import (
     BrokerOrderUpdateResult,
     Order,
@@ -60,12 +65,19 @@ from src.risk.position_sizer import PositionSizer
 from src.risk.risk_manager import RiskManager
 from src.strategies.base import BaseStrategy, Signal, SignalStrength, SignalType
 from src.strategies.directional.bollinger_strategy import BollingerBandStrategy
+from src.strategies.directional.crypto_swing_radar import CryptoSwingRadarStrategy
 from src.strategies.directional.ema_crossover import EMACrossoverStrategy
+from src.strategies.directional.fno_swing_radar import FnOSwingRadarStrategy
 from src.strategies.directional.fractal_profile_strategy import FractalProfileBreakoutStrategy
 from src.strategies.directional.macd_strategy import MACDStrategy
 from src.strategies.directional.mp_orderflow_strategy import MarketProfileOrderFlowStrategy
 from src.strategies.directional.ml_ensemble import MLEnsembleStrategy
+from src.strategies.directional.profile_swing_radar import (
+    ProfileAISwingRadarStrategy,
+    ProfileSwingRadarStrategy,
+)
 from src.strategies.directional.rsi_reversal import RSIReversalStrategy
+from src.strategies.directional.us_swing_radar import USSwingRadarStrategy
 from src.ml.online.learning_engine import OnlineLearningEngine
 from src.ml.online.strategy_performance_tracker import StrategyPerformanceTracker
 from src.monitoring.latency import ExecutionLatencyTracker
@@ -100,6 +112,11 @@ STRATEGY_REGISTRY: Dict[str, type[BaseStrategy]] = {
     "Bollinger_MeanReversion": BollingerBandStrategy,
     "Supertrend_Breakout": SupertrendStrategy,
     "ML_Ensemble": MLEnsembleStrategy,
+    "FnO_Swing_Radar": FnOSwingRadarStrategy,
+    "US_Swing_Radar": USSwingRadarStrategy,
+    "Crypto_Swing_Radar": CryptoSwingRadarStrategy,
+    "Profile_Swing_Radar": ProfileSwingRadarStrategy,
+    "Profile_AI_Swing_Radar": ProfileAISwingRadarStrategy,
 }
 
 
@@ -127,11 +144,20 @@ class AgentConfig:
             "EMA_Crossover",
             "RSI_Reversal",
             "Supertrend_Breakout",
+            "FnO_Swing_Radar",
+            "US_Swing_Radar",
+            "Profile_Swing_Radar",
+            "Profile_AI_Swing_Radar",
             "MP_OrderFlow_Breakout",
             "Fractal_Profile_Breakout",
+            "Crypto_Swing_Radar",
         ]
     )
     scan_interval_seconds: int = 30
+    periodic_scan_batch_size: int = 96
+    startup_initial_scan_limit: int = 24
+    startup_scan_limit_step: int = 24
+    startup_ramp_cycles: int = 4
     paper_mode: bool = True
     capital: float = 41_750_000.0
     india_capital: float = 250_000.0
@@ -163,6 +189,22 @@ class AgentConfig:
     strategy_capital_bucket_enabled: bool = False
     strategy_max_concurrent_positions: int = 4
     telegram_status_interval_minutes: int = 30
+    disabled_strategies_by_market: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            "CRYPTO": ["Bootstrap_Explorer", "EMA_Crossover"],
+        }
+    )
+    strategy_budget_weights_by_market: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {
+            "CRYPTO": {
+                "MP_OrderFlow_Breakout": 1.8,
+                "Fractal_Profile_Breakout": 1.8,
+                "RSI_Reversal": 1.0,
+                "Supertrend_Breakout": 1.0,
+                "Crypto_Swing_Radar": 1.15,
+            }
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -193,6 +235,8 @@ class OptionExitPlan:
     opened_at: datetime
     time_exit_at: datetime
     signal_id: str = ""
+    planned_holding_days: int = 0
+    allow_overnight: bool = False
 
 
 @dataclass
@@ -213,6 +257,8 @@ class PendingLiveEntryOrder:
     stop_loss: float
     target: float
     signal_id: str
+    planned_holding_days: int = 0
+    allow_overnight: bool = False
     option_contract: Optional[OptionContract] = None
     trade_counted: bool = False
 
@@ -235,6 +281,8 @@ class PendingLiveEntrySubmission:
     stop_loss: float
     target: float
     signal_id: str
+    planned_holding_days: int = 0
+    allow_overnight: bool = False
     option_contract: Optional[OptionContract] = None
 
 
@@ -318,6 +366,8 @@ class TradingAgent:
         self._us_intraday_cache_ttl = timedelta(seconds=45)
         self._us_daily_cache: Dict[str, Tuple[datetime, pd.DataFrame]] = {}
         self._us_daily_cache_ttl = timedelta(minutes=5)
+        self._us_provider_cooldowns: Dict[str, datetime] = {}
+        self._us_provider_failure_counts: Dict[str, int] = {}
         self._option_exit_plans: Dict[str, Dict[str, OptionExitPlan]] = {}
         self._strategy_reward_ema: Dict[str, float] = {}
         self._strategy_market_reward_ema: Dict[str, Dict[str, float]] = {}
@@ -351,6 +401,7 @@ class TradingAgent:
         self._pending_live_exits: Dict[str, PendingLiveExitOrder] = {}
         self._pending_live_entry_submissions: Dict[str, PendingLiveEntrySubmission] = {}
         self._pending_live_exit_submissions: Dict[str, PendingLiveExitSubmission] = {}
+        self._startup_scan_cursor = 0
 
         self.state = AgentState.IDLE
         self._task: Optional[asyncio.Task[None]] = None
@@ -398,8 +449,11 @@ class TradingAgent:
         self._market_data_cache.clear()
         self._us_intraday_cache.clear()
         self._us_daily_cache.clear()
+        self._us_provider_cooldowns.clear()
+        self._us_provider_failure_counts.clear()
         self._stale_data_keys.clear()
         self._circuit_breaker_notified = False
+        self._startup_scan_cursor = 0
         self._reset_execution_core_signal_state()
         self._strategy_signal_counts.clear()
         self._strategy_trade_counts.clear()
@@ -1103,6 +1157,8 @@ class TradingAgent:
                 stop_loss=context.stop_loss,
                 target=context.target,
                 signal_id=context.signal_id,
+                planned_holding_days=context.planned_holding_days,
+                allow_overnight=context.allow_overnight,
                 option_contract=context.option_contract,
             )
             self._persist_live_runtime_state()
@@ -1253,6 +1309,8 @@ class TradingAgent:
         sl_price: float,
         target_price: float,
         signal_id: str,
+        planned_holding_days: int,
+        allow_overnight: bool,
         option_contract: OptionContract | None,
     ) -> bool:
         submission_id = f"entry-{uuid.uuid4().hex[:12]}"
@@ -1271,6 +1329,8 @@ class TradingAgent:
             stop_loss=sl_price,
             target=target_price,
             signal_id=signal_id,
+            planned_holding_days=planned_holding_days,
+            allow_overnight=allow_overnight,
             option_contract=option_contract,
         )
         accepted = await self._order_submitter.submit(
@@ -1505,6 +1565,8 @@ class TradingAgent:
                 stop_loss=context.stop_loss,
                 target=context.target,
                 signal_id=context.signal_id,
+                planned_holding_days=context.planned_holding_days,
+                allow_overnight=context.allow_overnight,
             )
 
         await self.event_bus.emit(AgentEvent(
@@ -1929,6 +1991,18 @@ class TradingAgent:
             severity="success",
         ))
 
+    def _strategy_learning_profile(self, strategy: str, market: str | None = None) -> Dict[str, Any]:
+        market_key = str(market or "").upper()
+        snapshot = self._strategy_perf_tracker.get_strategy_snapshot(
+            strategy,
+            market=market_key,
+            prefer_market=bool(market_key),
+        )
+        if market_key and not self._is_strategy_allowed_for_market(strategy, market_key):
+            snapshot["enabled"] = False
+            snapshot["disabled_reason"] = f"disabled_for_market:{market_key.lower()}"
+        return snapshot
+
     def get_strategy_controls(self) -> List[Dict[str, Any]]:
         """Return toggle state for all known strategies."""
         states = self.executor.get_strategy_states()
@@ -1937,9 +2011,15 @@ class TradingAgent:
         for name in STRATEGY_REGISTRY.keys():
             state = states.get(name)
             enabled = bool(state.enabled) if state is not None else name in enabled_from_config
+            learning_by_market = {
+                market: self._strategy_learning_profile(name, market)
+                for market in ("NSE", "US", "CRYPTO")
+            }
             controls.append({
                 "name": name,
                 "enabled": enabled,
+                "learning": self._strategy_learning_profile(name),
+                "learning_by_market": learning_by_market,
             })
         return controls
 
@@ -2245,6 +2325,112 @@ class TradingAgent:
             if bool(control.get("enabled"))
         ]
 
+    def _enabled_strategy_names_for_market(self, market: str) -> List[str]:
+        market_key = str(market or "").strip().upper()
+        return [
+            strategy
+            for strategy in self._enabled_strategy_names()
+            if self._is_strategy_allowed_for_market(strategy, market_key)
+        ]
+
+    def _is_strategy_allowed_for_market(self, strategy: str, market: str | None) -> bool:
+        market_key = str(market or "").strip().upper()
+        strategy_name = str(strategy or "").strip()
+        if not strategy_name:
+            return False
+        allowed_markets = {
+            "FnO_Swing_Radar": {"NSE"},
+            "US_Swing_Radar": {"US"},
+            "Crypto_Swing_Radar": {"CRYPTO"},
+            "Profile_Swing_Radar": {"NSE", "US"},
+            "Profile_AI_Swing_Radar": {"NSE", "US"},
+        }.get(strategy_name)
+        if allowed_markets is not None and market_key not in allowed_markets:
+            return False
+        disabled = {
+            str(name).strip()
+            for name in self.config.disabled_strategies_by_market.get(market_key, [])
+            if str(name or "").strip()
+        }
+        return strategy_name not in disabled
+
+    def _strategy_budget_weight(self, strategy: str, market: str) -> float:
+        market_key = str(market or "").strip().upper()
+        raw = self.config.strategy_budget_weights_by_market.get(market_key, {}).get(str(strategy or "").strip(), 1.0)
+        try:
+            return max(float(raw), 0.1)
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _execution_timeframes_for_symbol(self, symbol: str) -> List[str]:
+        timeframes = set(self.get_execution_timeframes())
+        market = self._symbol_market(symbol)
+        if self._is_strategy_allowed_for_market("Crypto_Swing_Radar", market) and "Crypto_Swing_Radar" in self.config.strategies:
+            timeframes.add("240")
+        return self._sort_timeframes(timeframes)
+
+    def _validate_strategy_data(
+        self,
+        strategy: str,
+        market: str,
+        timeframe: str,
+        df: pd.DataFrame,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        strategy_name = str(strategy or "").strip()
+        market_key = str(market or "").strip().upper()
+        if market_key != "CRYPTO" or strategy_name not in {"Fractal_Profile_Breakout", "MP_OrderFlow_Breakout"}:
+            return True, {"strategy": strategy_name, "checked": False}
+        if df is None or df.empty or "timestamp" not in df.columns:
+            return False, {"strategy": strategy_name, "reason": "missing_frame"}
+
+        frame = df.copy(deep=False)
+        timestamps = pd.to_datetime(frame["timestamp"], errors="coerce").dropna()
+        if len(timestamps) < 24:
+            return False, {"strategy": strategy_name, "reason": "insufficient_bars"}
+
+        volumes = pd.to_numeric(frame.get("volume"), errors="coerce").fillna(0.0)
+        highs = pd.to_numeric(frame.get("high"), errors="coerce")
+        lows = pd.to_numeric(frame.get("low"), errors="coerce")
+        opens = pd.to_numeric(frame.get("open"), errors="coerce")
+        closes = pd.to_numeric(frame.get("close"), errors="coerce")
+        if any(series is None for series in (highs, lows, opens, closes)):
+            return False, {"strategy": strategy_name, "reason": "missing_ohlc"}
+
+        invalid_ohlc = int(((highs < lows) | (opens > highs) | (opens < lows) | (closes > highs) | (closes < lows)).sum())
+        zero_volume_ratio = float((volumes <= 0).mean()) if len(volumes) > 0 else 1.0
+        flat_bar_ratio = float(((highs - lows).abs() <= closes.abs().clip(lower=1.0) * 0.0002).mean())
+        diffs = timestamps.sort_values().diff().dropna().dt.total_seconds().div(60.0)
+        median_gap = float(diffs.median()) if not diffs.empty else 0.0
+        max_gap = float(diffs.max()) if not diffs.empty else 0.0
+        expected_gap = 3.0 if strategy_name == "Fractal_Profile_Breakout" else max(float(int(timeframe)), 1.0)
+        recent_window = 80 if strategy_name == "Fractal_Profile_Breakout" else 90
+        recent_highs = highs.tail(recent_window)
+        recent_lows = lows.tail(recent_window)
+        recent_closes = closes.tail(recent_window)
+        price_dispersion = float((recent_highs.max() - recent_lows.min()) / max(abs(float(recent_closes.iloc[-1])), 1e-6))
+
+        meta = {
+            "strategy": strategy_name,
+            "median_gap_minutes": round(median_gap, 2),
+            "max_gap_minutes": round(max_gap, 2),
+            "zero_volume_ratio": round(zero_volume_ratio, 4),
+            "flat_bar_ratio": round(flat_bar_ratio, 4),
+            "invalid_ohlc_rows": invalid_ohlc,
+            "price_dispersion": round(price_dispersion, 4),
+            "expected_gap_minutes": round(expected_gap, 2),
+        }
+        if invalid_ohlc > 0:
+            return False, {**meta, "reason": "invalid_ohlc"}
+        if zero_volume_ratio > 0.18:
+            return False, {**meta, "reason": "excess_zero_volume"}
+        if flat_bar_ratio > 0.35:
+            return False, {**meta, "reason": "too_many_flat_bars"}
+        if median_gap > (expected_gap * 1.75) or max_gap > (expected_gap * 4.5):
+            return False, {**meta, "reason": "timestamp_gaps"}
+        if price_dispersion < 0.012:
+            return False, {**meta, "reason": "insufficient_dispersion"}
+        return True, {**meta, "reason": "ok", "checked": True}
+
     def _symbol_exit_plans(self, symbol: str) -> List[OptionExitPlan]:
         strategy_map = self._option_exit_plans.get(symbol) or {}
         return list(strategy_map.values())
@@ -2273,6 +2459,8 @@ class TradingAgent:
             target=weighted_target / divisor,
             opened_at=min(plan.opened_at for plan in plans),
             time_exit_at=min(plan.time_exit_at for plan in plans),
+            planned_holding_days=max(int(plan.planned_holding_days) for plan in plans),
+            allow_overnight=any(plan.allow_overnight for plan in plans),
         )
 
     def _has_exit_plan_for_underlying(self, underlying_symbol: str) -> bool:
@@ -2430,6 +2618,8 @@ class TradingAgent:
             "opened_at": plan.opened_at.isoformat(),
             "time_exit_at": plan.time_exit_at.isoformat(),
             "signal_id": plan.signal_id,
+            "planned_holding_days": int(plan.planned_holding_days),
+            "allow_overnight": bool(plan.allow_overnight),
         }
 
     @staticmethod
@@ -2446,6 +2636,8 @@ class TradingAgent:
             opened_at=datetime.fromisoformat(str(payload.get("opened_at"))),
             time_exit_at=datetime.fromisoformat(str(payload.get("time_exit_at"))),
             signal_id=str(payload.get("signal_id") or ""),
+            planned_holding_days=int(payload.get("planned_holding_days") or 0),
+            allow_overnight=bool(payload.get("allow_overnight")),
         )
 
     def _serialize_pending_live_entry(self, context: PendingLiveEntryOrder) -> dict[str, Any]:
@@ -2464,6 +2656,8 @@ class TradingAgent:
             "stop_loss": float(context.stop_loss),
             "target": float(context.target),
             "signal_id": context.signal_id,
+            "planned_holding_days": int(context.planned_holding_days),
+            "allow_overnight": bool(context.allow_overnight),
             "trade_counted": bool(context.trade_counted),
             "option_contract": (
                 self._serialize_option_contract(context.option_contract)
@@ -2494,6 +2688,8 @@ class TradingAgent:
             stop_loss=float(payload.get("stop_loss") or 0.0),
             target=float(payload.get("target") or 0.0),
             signal_id=str(payload.get("signal_id") or ""),
+            planned_holding_days=int(payload.get("planned_holding_days") or 0),
+            allow_overnight=bool(payload.get("allow_overnight")),
             option_contract=option_contract,
             trade_counted=bool(payload.get("trade_counted")),
         )
@@ -2864,13 +3060,16 @@ class TradingAgent:
                 self._last_scan_time = datetime.now(tz=IST)
                 cycle_started = time.perf_counter()
 
-                # Ensure historical data exists for newly active NSE symbols.
-                symbols_to_warm = [symbol for symbol in active_symbols if symbol not in self._warmed_symbols]
+                periodic_scan_symbols = self._periodic_scan_symbols(active_symbols)
+
+                # Warm only the symbols scheduled for this cycle so large
+                # universes come online progressively instead of blocking.
+                symbols_to_warm = [
+                    symbol for symbol in periodic_scan_symbols if symbol not in self._warmed_symbols
+                ]
                 if symbols_to_warm:
                     await self._ensure_data_available(symbols_to_warm)
                     self._warmed_symbols.update(symbols_to_warm)
-
-                periodic_scan_symbols = self._periodic_scan_symbols(active_symbols)
 
                 # Scan each symbol
                 for symbol in periodic_scan_symbols:
@@ -2971,12 +3170,252 @@ class TradingAgent:
         return self._candle_broker is not None and self._is_event_driven_symbol_eligible(symbol)
 
     def _periodic_scan_symbols(self, active_symbols: List[str]) -> List[str]:
-        return [
+        periodic_scan_symbols = [
             symbol
             for symbol in active_symbols
             if not self._should_use_event_driven_lane(symbol)
             and not self._should_use_execution_core_signal_lane(symbol)
         ]
+        if len(periodic_scan_symbols) <= 1:
+            return periodic_scan_symbols
+
+        budget = self._periodic_scan_budget(len(periodic_scan_symbols))
+        if budget >= len(periodic_scan_symbols):
+            return periodic_scan_symbols
+
+        open_position_symbols = self._open_position_symbols()
+        pinned_symbols = [symbol for symbol in periodic_scan_symbols if symbol in open_position_symbols]
+        rotating_symbols = [symbol for symbol in periodic_scan_symbols if symbol not in open_position_symbols]
+        if not rotating_symbols:
+            return pinned_symbols
+
+        rotating_budget = max(budget - len(pinned_symbols), 0)
+        if rotating_budget <= 0:
+            return pinned_symbols
+
+        cursor = self._startup_scan_cursor % len(rotating_symbols)
+        selected_batch = rotating_symbols[cursor:cursor + rotating_budget]
+        if len(selected_batch) < rotating_budget:
+            selected_batch.extend(rotating_symbols[: rotating_budget - len(selected_batch)])
+        self._startup_scan_cursor = (cursor + rotating_budget) % len(rotating_symbols)
+        return pinned_symbols + selected_batch
+
+    def _periodic_scan_budget(self, symbol_count: int) -> int:
+        if symbol_count <= 0:
+            return 0
+
+        budget = symbol_count
+        configured_cap = max(int(self.config.periodic_scan_batch_size or 0), 0)
+        if configured_cap > 0:
+            budget = min(budget, configured_cap)
+
+        ramp_cycles = max(int(self.config.startup_ramp_cycles or 0), 0)
+        if ramp_cycles > 0 and self._cycle_count <= ramp_cycles:
+            startup_cycle = max(self._cycle_count, 1) - 1
+            initial_limit = max(int(self.config.startup_initial_scan_limit or 1), 1)
+            scan_step = max(int(self.config.startup_scan_limit_step or 1), 1)
+            budget = min(budget, initial_limit + (startup_cycle * scan_step))
+
+        return max(1, min(symbol_count, budget))
+
+    def _open_position_symbols(self) -> set[str]:
+        try:
+            positions = self.position_manager.get_all_positions()
+        except Exception:
+            return set()
+        if not isinstance(positions, list):
+            return set()
+        return {
+            str(getattr(position, "symbol", "") or "").strip()
+            for position in positions
+            if str(getattr(position, "symbol", "") or "").strip()
+        }
+
+    def _us_provider_available(self, provider: str) -> bool:
+        token = str(provider or "").strip().lower()
+        if not token:
+            return False
+        cooldown_until = self._us_provider_cooldowns.get(token)
+        if cooldown_until is None:
+            return True
+        now = datetime.now(tz=IST)
+        if cooldown_until <= now:
+            self._us_provider_cooldowns.pop(token, None)
+            self._us_provider_failure_counts.pop(token, None)
+            return True
+        return False
+
+    def _set_us_provider_cooldown(
+        self,
+        provider: str,
+        cooldown_seconds: int,
+        reason: str,
+        **metadata: Any,
+    ) -> None:
+        token = str(provider or "").strip().lower()
+        seconds = max(int(cooldown_seconds or 0), 0)
+        if not token or seconds <= 0:
+            return
+
+        until = datetime.now(tz=IST) + timedelta(seconds=seconds)
+        current = self._us_provider_cooldowns.get(token)
+        if current is not None and current >= until:
+            return
+
+        self._us_provider_cooldowns[token] = until
+        self._us_provider_failure_counts[token] = 0
+        logger.warning(
+            "us_market_data_provider_cooldown",
+            provider=token,
+            reason=reason,
+            cooldown_seconds=seconds,
+            until=until.isoformat(),
+            **metadata,
+        )
+
+    def _record_us_provider_success(self, provider: str) -> None:
+        token = str(provider or "").strip().lower()
+        if token:
+            self._us_provider_failure_counts.pop(token, None)
+
+    def _record_us_provider_exception(
+        self,
+        provider: str,
+        *,
+        symbol: str,
+        ticker: str,
+        error: str,
+    ) -> None:
+        token = str(provider or "").strip().lower()
+        if not token:
+            return
+        failures = self._us_provider_failure_counts.get(token, 0) + 1
+        self._us_provider_failure_counts[token] = failures
+        if failures >= max(int(self._runtime_settings.us_provider_error_threshold or 1), 1):
+            self._set_us_provider_cooldown(
+                token,
+                int(self._runtime_settings.us_provider_error_cooldown_seconds),
+                "repeated_failures",
+                symbol=symbol,
+                ticker=ticker,
+                failures=failures,
+                error=error,
+            )
+
+    def _record_us_provider_http_error(
+        self,
+        provider: str,
+        *,
+        status_code: int,
+        symbol: str,
+        ticker: str,
+    ) -> None:
+        if status_code == 429:
+            self._set_us_provider_cooldown(
+                provider,
+                int(self._runtime_settings.us_provider_rate_limit_cooldown_seconds),
+                "rate_limited",
+                symbol=symbol,
+                ticker=ticker,
+                status_code=status_code,
+            )
+        elif status_code in {401, 403}:
+            self._set_us_provider_cooldown(
+                provider,
+                int(self._runtime_settings.us_provider_auth_cooldown_seconds),
+                "auth_or_access_denied",
+                symbol=symbol,
+                ticker=ticker,
+                status_code=status_code,
+            )
+        elif status_code in {500, 502, 503, 504}:
+            self._record_us_provider_exception(
+                provider,
+                symbol=symbol,
+                ticker=ticker,
+                error=f"http_{status_code}",
+            )
+
+    async def _build_strategy_inputs(
+        self,
+        symbol: str,
+        timeframe: str,
+        strategy_names: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        inputs: Dict[str, Dict[str, Any]] = {}
+        requested = set(strategy_names)
+        market = self._symbol_market(symbol)
+
+        if "FnO_Swing_Radar" in requested and market == "NSE":
+            instrument = get_fno_instrument(spot_symbol_to_fno_root(symbol))
+            if instrument is not None and instrument.instrument_type == "EQUITY":
+                daily_frame = await self._fetch_market_data(symbol, timeframe="D")
+                benchmark_daily_frame = await self._fetch_market_data(NIFTY_SYMBOL, timeframe="D")
+                if (
+                    daily_frame is not None
+                    and not daily_frame.empty
+                    and benchmark_daily_frame is not None
+                    and not benchmark_daily_frame.empty
+                ):
+                    inputs["FnO_Swing_Radar"] = {
+                        "symbol": symbol,
+                        "execution_timeframe": timeframe,
+                        "daily_frame": daily_frame.copy(deep=False),
+                        "benchmark_daily_frame": benchmark_daily_frame.copy(deep=False),
+                        "learning_profile": self._strategy_learning_profile("FnO_Swing_Radar", "NSE"),
+                    }
+
+        if "US_Swing_Radar" in requested and market == "US":
+            normalized_ticker = us_symbol_to_ticker(symbol)
+            if self._parse_us_option_symbol(normalized_ticker) is None:
+                daily_frame = await self._fetch_market_data(symbol, timeframe="D")
+                benchmark_daily_frame = await self._fetch_market_data(US_SWING_BENCHMARK_SYMBOL, timeframe="D")
+                if (
+                    daily_frame is not None
+                    and not daily_frame.empty
+                    and benchmark_daily_frame is not None
+                    and not benchmark_daily_frame.empty
+                ):
+                    inputs["US_Swing_Radar"] = {
+                        "symbol": symbol,
+                        "execution_timeframe": timeframe,
+                        "daily_frame": daily_frame.copy(deep=False),
+                        "benchmark_daily_frame": benchmark_daily_frame.copy(deep=False),
+                        "learning_profile": self._strategy_learning_profile("US_Swing_Radar", "US"),
+                    }
+        profile_requested = {
+            name for name in requested
+            if name in {"Profile_Swing_Radar", "Profile_AI_Swing_Radar"}
+        }
+        if profile_requested and market in {"NSE", "US"}:
+            hourly_frame = await self._fetch_market_data(symbol, timeframe="60")
+            if hourly_frame is not None and not hourly_frame.empty:
+                for strategy_name in sorted(profile_requested):
+                    inputs[strategy_name] = {
+                        "symbol": symbol,
+                        "market": market,
+                        "execution_timeframe": timeframe,
+                        "hourly_frame": hourly_frame.copy(deep=False),
+                        "learning_profile": self._strategy_learning_profile(strategy_name, market),
+                    }
+        if "Crypto_Swing_Radar" in requested and market == "CRYPTO":
+            daily_frame = await self._fetch_market_data(symbol, timeframe="D")
+            benchmark_symbol = CRYPTO_SWING_BENCHMARK_SYMBOL
+            benchmark_daily_frame = await self._fetch_market_data(benchmark_symbol, timeframe="D")
+            if (
+                daily_frame is not None
+                and not daily_frame.empty
+                and benchmark_daily_frame is not None
+                and not benchmark_daily_frame.empty
+            ):
+                inputs["Crypto_Swing_Radar"] = {
+                    "symbol": symbol,
+                    "execution_timeframe": timeframe,
+                    "daily_frame": daily_frame.copy(deep=False),
+                    "benchmark_daily_frame": benchmark_daily_frame.copy(deep=False),
+                    "learning_profile": self._strategy_learning_profile("Crypto_Swing_Radar", "CRYPTO"),
+                }
+        return inputs
 
     async def _scan_symbol(self, symbol: str, *, live_only: bool = False) -> None:
         async with self._scan_lock(symbol):
@@ -2989,9 +3428,17 @@ class TradingAgent:
         emit_verbose_events = not live_only
         execution_timeframes = await self._rank_execution_timeframes(
             symbol,
-            self.get_execution_timeframes(),
+            self._execution_timeframes_for_symbol(symbol),
             live_only=live_only,
         )
+        if (
+            self._symbol_market(symbol) == "CRYPTO"
+            and "Crypto_Swing_Radar" in self.config.strategies
+            and self._is_strategy_allowed_for_market("Crypto_Swing_Radar", "CRYPTO")
+            and "240" not in execution_timeframes
+        ):
+            execution_timeframes.append("240")
+            execution_timeframes = self._sort_timeframes(set(execution_timeframes))
         trades_before_symbol = self._total_trades
         symbol_market = self._symbol_market(symbol)
         timeframe_frames: Dict[str, pd.DataFrame] = {}
@@ -3048,13 +3495,57 @@ class TradingAgent:
                     metadata={"symbol": symbol, "ltp": ltp, "candles": len(df), "timeframe": timeframe},
                 ))
 
+            active_strategy_names = [
+                strat_name
+                for strat_name in self.config.strategies
+                if strat_name in self.executor._strategies
+                and timeframe in self.STRATEGY_TIMEFRAMES.get(strat_name, [self.config.timeframe])
+                and self._is_strategy_allowed_for_market(strat_name, symbol_market)
+            ]
+            if not active_strategy_names:
+                continue
+
+            validated_strategy_names: List[str] = []
+            for strat_name in active_strategy_names:
+                valid_data, validity_meta = self._validate_strategy_data(strat_name, symbol_market, timeframe, df)
+                if valid_data:
+                    validated_strategy_names.append(strat_name)
+                    continue
+                validity_context = {key: value for key, value in validity_meta.items() if key != "strategy"}
+                logger.info(
+                    "strategy_skipped_invalid_data",
+                    strategy=strat_name,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    **validity_context,
+                )
+                if emit_verbose_events:
+                    await self.event_bus.emit(AgentEvent(
+                        event_type=AgentEventType.NO_SIGNAL,
+                        title=f"{strat_name}: Data Invalid",
+                        message=(
+                            f"{strat_name} skipped {short_name} on {tf_label} because "
+                            f"crypto data validation failed: {validity_meta.get('reason')}."
+                        ),
+                        severity="warning",
+                        metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe, **validity_context},
+                    ))
+            active_strategy_names = validated_strategy_names
+            if not active_strategy_names:
+                continue
+
+            strategy_inputs = await self._build_strategy_inputs(symbol, timeframe, active_strategy_names)
+
             # Run strategies and namespace the symbol key with timeframe so
             # dedupe state doesn't suppress valid signals across resolutions.
-            results = self.executor.process_data(df, f"{symbol}|{timeframe}")
+            results = self.executor.process_data(
+                df,
+                f"{symbol}|{timeframe}",
+                strategy_filter=active_strategy_names,
+                strategy_inputs=strategy_inputs,
+            )
 
-            for strat_name in self.config.strategies:
-                if strat_name not in self.executor._strategies:
-                    continue
+            for strat_name in active_strategy_names:
                 if not self._strategy_perf_tracker.is_enabled(strat_name):
                     logger.debug("strategy_skipped_auto_disabled", strategy=strat_name, symbol=symbol)
                     continue
@@ -3365,6 +3856,8 @@ class TradingAgent:
         live_only: bool = False,
     ) -> None:
         """Enter one exploratory bootstrap trade when no normal trade fired."""
+        if not self._is_strategy_allowed_for_market("Bootstrap_Explorer", self._symbol_market(symbol)):
+            return
         # Keep one active option position per underlying in bootstrap.
         if self._has_exit_plan_for_underlying(symbol):
             return
@@ -3652,6 +4145,9 @@ class TradingAgent:
 
         if not isinstance(signal.metadata, dict):
             signal.metadata = {}
+        signal_meta = signal.metadata
+        planned_holding_days = max(int(signal_meta.get("planned_holding_days", 0) or 0), 0)
+        allow_overnight = bool(signal_meta.get("allow_overnight")) and planned_holding_days > 0
 
         # Assign a UUID to this signal and register features for online learning
         signal_id = str(uuid.uuid4())
@@ -3865,6 +4361,8 @@ class TradingAgent:
                 "stop_loss": sl_price,
                 "target": target_price,
                 "execution_timeframe": execution_timeframe,
+                "planned_holding_days": planned_holding_days,
+                "allow_overnight": allow_overnight,
                 "reference": reference_meta,
                 "option_contract": (
                     {
@@ -4166,12 +4664,13 @@ class TradingAgent:
         # Place order. Index directional signals are converted into long options:
         # BUY -> buy CE, SELL -> buy PE.
         side = execution_side
+        product_type = ProductType.MARGIN if allow_overnight else ProductType.INTRADAY
         order = Order(
             symbol=execution_symbol,
             quantity=quantity,
             side=side,
             order_type=OrderType.MARKET,
-            product_type=ProductType.INTRADAY,
+            product_type=product_type,
             market_price_hint=entry_price,
             tag=strat_name,
         )
@@ -4190,6 +4689,7 @@ class TradingAgent:
                 "side": side.name,
                 "quantity": quantity,
                 "strategy": strat_name,
+                "product_type": product_type.value,
                 "lot_size": lot_size,
                 "liquidity": signal.metadata.get("liquidity_constraints") if isinstance(signal.metadata, dict) else None,
             },
@@ -4220,6 +4720,8 @@ class TradingAgent:
                         sl_price=sl_price,
                         target_price=target_price,
                         signal_id=signal_id,
+                        planned_holding_days=planned_holding_days,
+                        allow_overnight=allow_overnight,
                         option_contract=option_contract,
                     )
                     return
@@ -4249,6 +4751,8 @@ class TradingAgent:
                             stop_loss=sl_price,
                             target=target_price,
                             signal_id=signal_id,
+                            planned_holding_days=planned_holding_days,
+                            allow_overnight=allow_overnight,
                             option_contract=option_contract,
                         ),
                         order=executed_order,
@@ -4271,6 +4775,8 @@ class TradingAgent:
                         stop_loss=sl_price,
                         target=target_price,
                         signal_id=signal_id,
+                        planned_holding_days=planned_holding_days,
+                        allow_overnight=allow_overnight,
                         option_contract=option_contract,
                     )
                     self._persist_live_runtime_state()
@@ -4689,8 +5195,9 @@ class TradingAgent:
         market_budget = float(allocation["allocated_capital"])
         market_remaining_budget = self._market_available_capital(market)
         max_instrument_budget = float(allocation["max_instrument_capital"])
+        weighted_budgeting = bool(self.config.strategy_budget_weights_by_market.get(market))
 
-        if not self.config.strategy_capital_bucket_enabled:
+        if not self.config.strategy_capital_bucket_enabled and not weighted_budgeting:
             return {
                 "market_budget": market_budget,
                 "market_remaining_budget": market_remaining_budget,
@@ -4703,9 +5210,15 @@ class TradingAgent:
                 "available_slots": float(max(int(self.config.strategy_max_concurrent_positions), 1)),
             }
 
-        enabled = self._enabled_strategy_names() or list(self.config.strategies)
-        strategy_count = max(len(enabled), 1)
-        strategy_budget = market_budget / strategy_count
+        enabled = self._enabled_strategy_names_for_market(market) or [
+            name for name in self.config.strategies if self._is_strategy_allowed_for_market(name, market)
+        ]
+        weights = {
+            name: self._strategy_budget_weight(name, market)
+            for name in enabled
+        }
+        total_weight = max(sum(weights.values()), 1.0)
+        strategy_budget = market_budget * (weights.get(strategy, 1.0) / total_weight)
         max_slots = max(int(self.config.strategy_max_concurrent_positions), 1)
         per_trade_budget = min(strategy_budget / max_slots, max_instrument_budget)
 
@@ -4739,7 +5252,7 @@ class TradingAgent:
             "remaining_budget": remaining_budget,
             "remaining_trade_budget": remaining_trade_budget,
             "open_positions": float(len(open_symbols)),
-            "available_slots": float(available_slots),
+                "available_slots": float(available_slots),
         }
 
     def _portfolio_used_capital(self) -> float:
@@ -5458,6 +5971,39 @@ class TradingAgent:
             return max(base_minutes, tf_minutes * 3)
         return base_minutes
 
+    def _future_market_close(self, symbol: str, trading_days: int, now: datetime) -> datetime:
+        market = self._symbol_market(symbol)
+        if market == "US":
+            local_now = now.astimezone(US_EASTERN)
+            close_time = US_MARKET_CLOSE
+            tz = US_EASTERN
+        else:
+            local_now = now.astimezone(IST)
+            close_time = MARKET_CLOSE
+            tz = IST
+
+        target_date = local_now.date()
+        remaining_sessions = max(int(trading_days), 0)
+        while remaining_sessions > 0:
+            target_date += timedelta(days=1)
+            if target_date.weekday() < 5:
+                remaining_sessions -= 1
+        return datetime.combine(target_date, close_time, tzinfo=tz)
+
+    def _resolve_time_exit_at(
+        self,
+        *,
+        symbol: str,
+        execution_timeframe: str,
+        planned_holding_days: int = 0,
+        allow_overnight: bool = False,
+    ) -> datetime:
+        now = datetime.now(tz=IST)
+        if allow_overnight and planned_holding_days > 0:
+            return self._future_market_close(symbol, planned_holding_days, now)
+        minutes = self._resolve_time_exit_minutes(execution_timeframe)
+        return now + timedelta(minutes=minutes)
+
     def _upsert_option_exit_plan(
         self,
         symbol: str,
@@ -5469,9 +6015,16 @@ class TradingAgent:
         stop_loss: float,
         target: float,
         signal_id: str = "",
+        planned_holding_days: int = 0,
+        allow_overnight: bool = False,
     ) -> None:
         now = datetime.now(tz=IST)
-        minutes = self._resolve_time_exit_minutes(execution_timeframe)
+        resolved_exit_at = self._resolve_time_exit_at(
+            symbol=symbol,
+            execution_timeframe=execution_timeframe,
+            planned_holding_days=planned_holding_days,
+            allow_overnight=allow_overnight,
+        )
         strategy_map = self._option_exit_plans.setdefault(symbol, {})
         existing = strategy_map.get(strategy)
         incoming_qty = max(int(quantity), 0)
@@ -5486,8 +6039,10 @@ class TradingAgent:
                 stop_loss=float(stop_loss),
                 target=float(target),
                 opened_at=now,
-                time_exit_at=now + timedelta(minutes=minutes),
+                time_exit_at=resolved_exit_at,
                 signal_id=signal_id,
+                planned_holding_days=max(int(planned_holding_days), 0),
+                allow_overnight=bool(allow_overnight),
             )
             self._persist_live_runtime_state()
             return
@@ -5510,7 +6065,9 @@ class TradingAgent:
             + (float(target) * incoming_qty)
         ) / divisor
         existing.opened_at = min(existing.opened_at, now)
-        existing.time_exit_at = max(existing.time_exit_at, now + timedelta(minutes=minutes))
+        existing.time_exit_at = max(existing.time_exit_at, resolved_exit_at)
+        existing.planned_holding_days = max(int(existing.planned_holding_days), int(planned_holding_days))
+        existing.allow_overnight = bool(existing.allow_overnight or allow_overnight)
         self._persist_live_runtime_state()
 
     @contextmanager
@@ -6268,6 +6825,28 @@ class TradingAgent:
 
         return stale_candidate.copy(deep=False) if stale_candidate is not None else None
 
+    @staticmethod
+    def _minimum_history_rows(timeframe: str) -> int:
+        token = str(timeframe or "").strip().upper()
+        if token == "D":
+            return 90
+        if token == "W":
+            return 52
+        if token == "M":
+            return 24
+        if token.isdigit():
+            minutes = max(int(token), 1)
+            if minutes <= 15:
+                return 120
+            if minutes <= 60:
+                return 90
+            return 60
+        return 60
+
+    @classmethod
+    def _has_sufficient_history(cls, frame: Optional[pd.DataFrame], timeframe: str) -> bool:
+        return frame is not None and not frame.empty and len(frame) >= cls._minimum_history_rows(timeframe)
+
     async def _fetch_market_data(
         self,
         symbol: str,
@@ -6288,7 +6867,7 @@ class TradingAgent:
                 memory_frame = await self._fetch_market_data_from_memory(symbol, tf)
                 if memory_frame is not None and not memory_frame.empty:
                     fresh, _ = self._data_freshness(memory_frame, tf)
-                    if fresh:
+                    if fresh and self._has_sufficient_history(memory_frame, tf):
                         return memory_frame
                 if live_only and self._event_driven_hot_path_timeframe_supported(tf):
                     return memory_frame
@@ -6305,7 +6884,7 @@ class TradingAgent:
                     cached_at, cached_df = local_cached
                     if now - cached_at <= self._market_data_cache_ttl:
                         fresh, _ = self._data_freshness(cached_df, tf)
-                        if fresh:
+                        if fresh and self._has_sufficient_history(cached_df, tf):
                             return cached_df.copy(deep=False)
                         if not require_live_bars and stale_candidate is None:
                             stale_candidate = cached_df.copy(deep=False)
@@ -6316,7 +6895,7 @@ class TradingAgent:
                 db_df = await self._fetch_database_market_data(symbol, tf)
                 if db_df is not None and not db_df.empty:
                     fresh, _ = self._data_freshness(db_df, tf)
-                    if fresh:
+                    if fresh and self._has_sufficient_history(db_df, tf):
                         self._market_data_cache[cache_key] = (now, db_df)
                         return db_df
                     if not require_live_bars:
@@ -6547,6 +7126,8 @@ class TradingAgent:
         return grouped.sort_values("timestamp").reset_index(drop=True)
 
     async def _fetch_us_yahoo_ohlcv(self, ticker: str, interval: str, period: str, symbol: str) -> Optional[pd.DataFrame]:
+        if not self._us_provider_available("yahoo"):
+            return None
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
         timeout = httpx.Timeout(8.0, connect=4.0)
         payload: Dict[str, Any] = {}
@@ -6555,6 +7136,7 @@ class TradingAgent:
                 res = await http.get(url, params={"interval": interval, "range": period})
                 if res.status_code < 400:
                     payload = res.json()
+                    self._record_us_provider_success("yahoo")
                 else:
                     logger.warning(
                         "fetch_us_market_data_yahoo_http_error",
@@ -6562,8 +7144,21 @@ class TradingAgent:
                         ticker=ticker,
                         status_code=res.status_code,
                     )
+                    self._record_us_provider_http_error(
+                        "yahoo",
+                        status_code=int(res.status_code),
+                        symbol=symbol,
+                        ticker=ticker,
+                    )
+                    return None
         except Exception as exc:
             logger.warning("fetch_us_market_data_yahoo_failed", symbol=symbol, error=str(exc))
+            self._record_us_provider_exception(
+                "yahoo",
+                symbol=symbol,
+                ticker=ticker,
+                error=str(exc),
+            )
             return None
 
         chart = payload.get("chart", {}) if isinstance(payload, dict) else {}
@@ -6610,7 +7205,7 @@ class TradingAgent:
     async def _fetch_us_finnhub_ohlcv(self, ticker: str, resolution: str, span_seconds: int, symbol: str) -> Optional[pd.DataFrame]:
         settings = get_settings()
         token = str(settings.finnhub_api_key or "").strip()
-        if not token:
+        if not token or not self._us_provider_available("finnhub"):
             return None
         now_utc = datetime.now(tz=timezone.utc)
         end_ts = int(now_utc.timestamp())
@@ -6635,10 +7230,23 @@ class TradingAgent:
                         ticker=ticker,
                         status_code=res.status_code,
                     )
+                    self._record_us_provider_http_error(
+                        "finnhub",
+                        status_code=int(res.status_code),
+                        symbol=symbol,
+                        ticker=ticker,
+                    )
                     return None
                 payload = res.json()
+                self._record_us_provider_success("finnhub")
         except Exception as exc:
             logger.warning("fetch_us_market_data_finnhub_failed", symbol=symbol, error=str(exc))
+            self._record_us_provider_exception(
+                "finnhub",
+                symbol=symbol,
+                ticker=ticker,
+                error=str(exc),
+            )
             return None
 
         if not isinstance(payload, dict) or payload.get("s") != "ok":
@@ -6790,7 +7398,7 @@ class TradingAgent:
     ) -> Optional[pd.DataFrame]:
         settings = get_settings()
         token = str(settings.alphavantage_api_key or "").strip()
-        if not token:
+        if not token or not self._us_provider_available("alphavantage"):
             return None
 
         params: Dict[str, Any] = {
@@ -6818,10 +7426,22 @@ class TradingAgent:
                         ticker=ticker,
                         status_code=res.status_code,
                     )
+                    self._record_us_provider_http_error(
+                        "alphavantage",
+                        status_code=int(res.status_code),
+                        symbol=symbol,
+                        ticker=ticker,
+                    )
                     return None
                 payload = res.json()
         except Exception as exc:
             logger.warning("fetch_us_market_data_alphavantage_failed", symbol=symbol, error=str(exc))
+            self._record_us_provider_exception(
+                "alphavantage",
+                symbol=symbol,
+                ticker=ticker,
+                error=str(exc),
+            )
             return None
 
         if not isinstance(payload, dict):
@@ -6829,6 +7449,12 @@ class TradingAgent:
         if payload.get("Error Message"):
             logger.warning(
                 "fetch_us_market_data_alphavantage_error",
+                symbol=symbol,
+                ticker=ticker,
+                error=str(payload.get("Error Message")),
+            )
+            self._record_us_provider_exception(
+                "alphavantage",
                 symbol=symbol,
                 ticker=ticker,
                 error=str(payload.get("Error Message")),
@@ -6841,7 +7467,15 @@ class TradingAgent:
                 ticker=ticker,
                 note=str(payload.get("Note")),
             )
+            self._set_us_provider_cooldown(
+                "alphavantage",
+                int(self._runtime_settings.us_provider_rate_limit_cooldown_seconds),
+                "rate_limited",
+                symbol=symbol,
+                ticker=ticker,
+            )
             return None
+        self._record_us_provider_success("alphavantage")
 
         if daily:
             series_key = "Time Series (Daily)"
@@ -6896,7 +7530,7 @@ class TradingAgent:
                 return cached_df.copy(deep=False)
 
         settings = get_settings()
-        prefer_finnhub = bool(str(settings.finnhub_api_key or "").strip())
+        prefer_finnhub = bool(str(settings.finnhub_api_key or "").strip()) and self._us_provider_available("finnhub")
 
         frame: Optional[pd.DataFrame] = None
         if prefer_finnhub:
@@ -6907,17 +7541,24 @@ class TradingAgent:
                 symbol=symbol,
             )
         if frame is None or frame.empty or self._us_intraday_frame_is_stale(frame):
-            frame = await self._fetch_us_alphavantage_ohlcv(
-                ticker=ticker,
-                interval="1min",
-                symbol=symbol,
-                daily=False,
-            )
+            if self._us_provider_available("alphavantage"):
+                frame = await self._fetch_us_alphavantage_ohlcv(
+                    ticker=ticker,
+                    interval="1min",
+                    symbol=symbol,
+                    daily=False,
+                )
         if frame is None or frame.empty or self._us_intraday_frame_is_stale(frame):
-            frame = await self._fetch_us_yahoo_ohlcv(ticker=ticker, interval="1m", period="7d", symbol=symbol)
+            if self._us_provider_available("yahoo"):
+                frame = await self._fetch_us_yahoo_ohlcv(
+                    ticker=ticker,
+                    interval="1m",
+                    period="7d",
+                    symbol=symbol,
+                )
         if frame is None or frame.empty or self._us_intraday_frame_is_stale(frame):
             frame = await self._fetch_us_nasdaq_ohlcv(ticker=ticker, symbol=symbol, daily=False)
-        if frame is None or frame.empty or self._us_intraday_frame_is_stale(frame):
+        if (frame is None or frame.empty or self._us_intraday_frame_is_stale(frame)) and self._us_provider_available("finnhub"):
             frame = await self._fetch_us_finnhub_ohlcv(
                 ticker=ticker,
                 resolution="1",
@@ -6958,7 +7599,7 @@ class TradingAgent:
                 return cached_df.copy(deep=False)
 
         settings = get_settings()
-        prefer_finnhub = bool(str(settings.finnhub_api_key or "").strip())
+        prefer_finnhub = bool(str(settings.finnhub_api_key or "").strip()) and self._us_provider_available("finnhub")
 
         frame: Optional[pd.DataFrame] = None
         if prefer_finnhub:
@@ -6969,17 +7610,24 @@ class TradingAgent:
                 symbol=symbol,
             )
         if frame is None or frame.empty:
-            frame = await self._fetch_us_alphavantage_ohlcv(
-                ticker=ticker,
-                interval="60min",
-                symbol=symbol,
-                daily=True,
-            )
+            if self._us_provider_available("alphavantage"):
+                frame = await self._fetch_us_alphavantage_ohlcv(
+                    ticker=ticker,
+                    interval="60min",
+                    symbol=symbol,
+                    daily=True,
+                )
         if frame is None or frame.empty:
-            frame = await self._fetch_us_yahoo_ohlcv(ticker=ticker, interval="1d", period="2y", symbol=symbol)
+            if self._us_provider_available("yahoo"):
+                frame = await self._fetch_us_yahoo_ohlcv(
+                    ticker=ticker,
+                    interval="1d",
+                    period="2y",
+                    symbol=symbol,
+                )
         if frame is None or frame.empty:
             frame = await self._fetch_us_nasdaq_ohlcv(ticker=ticker, symbol=symbol, daily=True)
-        if frame is None or frame.empty:
+        if (frame is None or frame.empty) and self._us_provider_available("finnhub"):
             frame = await self._fetch_us_finnhub_ohlcv(
                 ticker=ticker,
                 resolution="D",
@@ -7150,16 +7798,31 @@ class TradingAgent:
             return {}
         payload: Dict[str, Any] = {}
         timeout = httpx.Timeout(8.0, connect=4.0)
-        try:
-            async with httpx.AsyncClient(timeout=timeout, headers=_YAHOO_HEADERS) as http:
-                res = await http.get(
-                    "https://query1.finance.yahoo.com/v7/finance/quote",
-                    params={"symbols": ",".join(tickers)},
+        if self._us_provider_available("yahoo"):
+            try:
+                async with httpx.AsyncClient(timeout=timeout, headers=_YAHOO_HEADERS) as http:
+                    res = await http.get(
+                        "https://query1.finance.yahoo.com/v7/finance/quote",
+                        params={"symbols": ",".join(tickers)},
+                    )
+                    if res.status_code < 400:
+                        payload = res.json()
+                        self._record_us_provider_success("yahoo")
+                    else:
+                        self._record_us_provider_http_error(
+                            "yahoo",
+                            status_code=int(res.status_code),
+                            symbol="US:BATCH",
+                            ticker=",".join(tickers[:5]),
+                        )
+            except Exception as exc:
+                logger.warning("fetch_live_prices_error", market="us_yahoo", error=str(exc), symbols=tickers)
+                self._record_us_provider_exception(
+                    "yahoo",
+                    symbol="US:BATCH",
+                    ticker=",".join(tickers[:5]),
+                    error=str(exc),
                 )
-                if res.status_code < 400:
-                    payload = res.json()
-        except Exception as exc:
-            logger.warning("fetch_live_prices_error", market="us_yahoo", error=str(exc), symbols=tickers)
 
         prices: Dict[str, float] = {}
         rows = (
@@ -7252,6 +7915,8 @@ class TradingAgent:
         parsed = self._parse_us_option_symbol(contract_symbol)
         if parsed is None:
             return None
+        if not self._us_provider_available("yahoo"):
+            return await self._fetch_us_option_quote_nasdaq(parsed)
 
         try:
             res = await http.get(
@@ -7259,9 +7924,22 @@ class TradingAgent:
                 params={"date": parsed["expiry_unix"]},
             )
             if res.status_code >= 400:
+                self._record_us_provider_http_error(
+                    "yahoo",
+                    status_code=int(res.status_code),
+                    symbol=contract_symbol,
+                    ticker=str(parsed["root"]),
+                )
                 return await self._fetch_us_option_quote_nasdaq(parsed)
             payload = res.json()
-        except Exception:
+            self._record_us_provider_success("yahoo")
+        except Exception as exc:
+            self._record_us_provider_exception(
+                "yahoo",
+                symbol=contract_symbol,
+                ticker=str(parsed["root"]),
+                error=str(exc),
+            )
             return await self._fetch_us_option_quote_nasdaq(parsed)
 
         chain = payload.get("optionChain", {}) if isinstance(payload, dict) else {}
@@ -7759,6 +8437,9 @@ class TradingAgent:
         market = self._symbol_market(symbol)
         if market == "CRYPTO":
             return False
+        symbol_plans = self._symbol_exit_plans(symbol)
+        if any(plan.allow_overnight for plan in symbol_plans):
+            return False
         if market == "US":
             us_now = now_ist.astimezone(US_EASTERN)
             if us_now.weekday() > 4:
@@ -7882,6 +8563,11 @@ class TradingAgent:
         "Bollinger_MeanReversion": ["3", "5", "15"],
         "Supertrend_Breakout":     ["5", "15", "60"],
         "ML_Ensemble":             ["5", "15", "60", "D"],
+        "FnO_Swing_Radar":         ["15"],
+        "US_Swing_Radar":          ["15"],
+        "Profile_Swing_Radar":     ["15", "60"],
+        "Profile_AI_Swing_Radar":  ["15", "60"],
+        "Crypto_Swing_Radar":      ["240"],
     }
 
     @staticmethod
@@ -7909,6 +8595,10 @@ class TradingAgent:
         tfs.add(self.config.timeframe)
         for strat in self.config.strategies:
             tfs.update(self.STRATEGY_TIMEFRAMES.get(strat, [self.config.timeframe]))
+            if strat in {"FnO_Swing_Radar", "US_Swing_Radar", "Crypto_Swing_Radar"}:
+                tfs.add("D")
+            if strat in {"Profile_Swing_Radar", "Profile_AI_Swing_Radar"}:
+                tfs.add("60")
         return self._sort_timeframes(tfs)
 
     async def _ensure_data_available(self, symbols: Optional[List[str]] = None) -> None:

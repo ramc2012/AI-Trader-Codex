@@ -21,9 +21,18 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const runtimeWsBase = (
+    process.env.PUBLIC_WS_URL ??
+    process.env.NEXT_PUBLIC_WS_URL ??
+    ''
+  ).trim();
+
   return (
     <html lang="en" className="dark">
-      <body className={`${inter.variable} bg-slate-950 text-slate-100 antialiased`}>
+      <body
+        className={`${inter.variable} bg-slate-950 text-slate-100 antialiased`}
+        data-ws-base={runtimeWsBase}
+      >
         <Providers>
           {/* Top navigation bar (h-11 = 44px) */}
           <TopNav />

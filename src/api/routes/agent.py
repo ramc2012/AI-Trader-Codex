@@ -43,7 +43,7 @@ from src.api.schemas import AgentConfigRequest, AgentEventResponse, AgentStatusR
 from src.config.settings import get_settings
 from src.database.operations import get_ohlc_candles
 from src.utils.logger import get_logger
-from src.config.constants import DEFAULT_AGENT_NSE_SYMBOLS
+from src.config.agent_universe import DEFAULT_AGENT_NSE_SYMBOLS
 
 logger = get_logger(__name__)
 
@@ -447,6 +447,10 @@ def _strategy_min_bars(strategy: Any) -> int:
         return int(getattr(strategy, "min_bars", 60))
     if name == "ML_Ensemble":
         return 50
+    if name in {"FnO_Swing_Radar", "US_Swing_Radar"}:
+        return int(getattr(strategy, "min_daily_bars", 90))
+    if name in {"Profile_Swing_Radar", "Profile_AI_Swing_Radar"}:
+        return int(getattr(strategy, "min_hourly_bars", 90))
     return 30
 
 
@@ -589,6 +593,10 @@ def _rsi_snapshot(strategy: Any, frame: pd.DataFrame) -> dict[str, Any]:
         "prev_rsi": _json_safe(previous),
         "atr": _last_valid(atr),
         "zone": zone,
+        "oversold": _json_safe(getattr(strategy, "oversold", None)),
+        "overbought": _json_safe(getattr(strategy, "overbought", None)),
+        "require_volume_surge": _json_safe(getattr(strategy, "require_volume_surge", None)),
+        "volume_surge_multiplier": _json_safe(getattr(strategy, "volume_surge_multiplier", None)),
     }
 
 
@@ -608,14 +616,32 @@ def _macd_snapshot(strategy: Any, frame: pd.DataFrame) -> dict[str, Any]:
     histogram = None
     if macd_value is not None and signal_value is not None:
         histogram = round(macd_value - signal_value, 4)
+    atr_value = _last_valid(atr)
+    zero_line_distance_atr = None
+    if macd_value is not None and atr_value not in (None, 0):
+        zero_line_distance_atr = round(abs(macd_value) / atr_value, 4)
 
     return {
         "macd": macd_value,
         "macd_signal": signal_value,
         "histogram": histogram,
         "rsi": _last_valid(rsi),
-        "atr": _last_valid(atr),
+        "atr": atr_value,
         "bias": "bullish" if histogram and histogram > 0 else "bearish" if histogram and histogram < 0 else "neutral",
+        "zero_line_mode": _json_safe(getattr(strategy, "zero_line_mode", None)),
+        "buy_zero_line_mode": _json_safe(getattr(strategy, "buy_zero_line_mode", None)),
+        "sell_zero_line_mode": _json_safe(getattr(strategy, "sell_zero_line_mode", None)),
+        "max_zero_line_distance_atr": _json_safe(getattr(strategy, "max_zero_line_distance_atr", None)),
+        "zero_line_relation": (
+            "above_zero"
+            if macd_value is not None and macd_value > 0
+            else "below_zero"
+            if macd_value is not None and macd_value < 0
+            else "at_zero"
+            if macd_value == 0
+            else None
+        ),
+        "zero_line_distance_atr": zero_line_distance_atr,
     }
 
 
@@ -830,6 +856,42 @@ def _strategy_indicator_snapshot(
         return _fractal_snapshot(strategy, frame)
     if name == "ML_Ensemble":
         return _ml_snapshot(strategy, frame, latest_signal)
+    if name in {"FnO_Swing_Radar", "US_Swing_Radar"}:
+        metadata = latest_signal.get("metadata", {}) if isinstance(latest_signal, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return {
+            "score": metadata.get("swing_candidate_score"),
+            "direction_probability": metadata.get("direction_probability"),
+            "direction_edge": metadata.get("direction_edge"),
+            "horizon": metadata.get("horizon"),
+            "planned_holding_days": metadata.get("planned_holding_days"),
+            "market_regime": metadata.get("research_market_regime"),
+            "matched_conditions": metadata.get("matched_conditions", []),
+            "short_probabilities": metadata.get("short_probabilities", {}),
+            "long_probabilities": metadata.get("long_probabilities", {}),
+            "effective_thresholds": metadata.get("effective_thresholds", {}),
+            "learning_profile": metadata.get("learning_profile", {}),
+        }
+    if name in {"Profile_Swing_Radar", "Profile_AI_Swing_Radar"}:
+        metadata = latest_signal.get("metadata", {}) if isinstance(latest_signal, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return {
+            "score": metadata.get("profile_candidate_score"),
+            "direction_probability": metadata.get("direction_probability"),
+            "direction_edge": metadata.get("direction_edge"),
+            "planned_holding_days": metadata.get("planned_holding_days"),
+            "market_regime": metadata.get("research_market_regime"),
+            "profile_target_name": metadata.get("profile_target_name"),
+            "profile_variant": metadata.get("profile_variant"),
+            "matched_conditions": metadata.get("matched_conditions", []),
+            "active_conditions": metadata.get("active_conditions", []),
+            "model_available": metadata.get("model_available"),
+            "ai_adjustment": metadata.get("ai_adjustment"),
+            "effective_thresholds": metadata.get("effective_thresholds", {}),
+            "learning_profile": metadata.get("learning_profile", {}),
+        }
     return {}
 
 
@@ -992,6 +1054,8 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
         reinforcement_size_boost_pct=body.reinforcement_size_boost_pct,
         strategy_capital_bucket_enabled=body.strategy_capital_bucket_enabled,
         strategy_max_concurrent_positions=body.strategy_max_concurrent_positions,
+        disabled_strategies_by_market=body.disabled_strategies_by_market,
+        strategy_budget_weights_by_market=body.strategy_budget_weights_by_market,
         telegram_status_interval_minutes=body.telegram_status_interval_minutes,
     )
 
@@ -1318,6 +1382,8 @@ class SimulateRequest(BaseModel):
         "EMA_Crossover",
         "RSI_Reversal",
         "Supertrend_Breakout",
+        "FnO_Swing_Radar",
+        "US_Swing_Radar",
         "MP_OrderFlow_Breakout",
         "Fractal_Profile_Breakout",
     ]

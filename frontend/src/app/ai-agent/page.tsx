@@ -40,7 +40,12 @@ import { useAgentWS } from '@/hooks/use-agent-ws';
 import { useWatchlistUniverse } from '@/hooks/use-watchlist';
 import { buildInstrumentOptions } from '@/lib/instrument-universe';
 import { cn } from '@/lib/utils';
-import type { AgentConfig, AgentEvent } from '@/types/api';
+import type {
+  AgentBackendConfig,
+  AgentConfig,
+  AgentEvent,
+  AgentExecutionCoreSnapshot,
+} from '@/types/api';
 
 // ─── Helpers ──────────────────────────────────────────────
 
@@ -95,6 +100,51 @@ function eventIcon(eventType: string) {
   return <Zap className="h-4 w-4" />;
 }
 
+function formatBackendName(name: string) {
+  switch (name) {
+    case 'nats':
+      return 'NATS';
+    case 'kafka':
+      return 'Kafka';
+    case 'clickhouse':
+      return 'ClickHouse';
+    case 'questdb':
+      return 'QuestDB';
+    default:
+      return name.replace(/_/g, ' ');
+  }
+}
+
+function backendDetail(config?: AgentBackendConfig) {
+  if (!config) return 'Not configured';
+  return config.url ?? config.bootstrap_servers ?? config.stream_prefix ?? config.topic_prefix ?? 'Configured';
+}
+
+function infrastructureBadgeClasses(enabled: boolean) {
+  return enabled
+    ? 'bg-cyan-900/40 text-cyan-300'
+    : 'bg-slate-800 text-slate-400';
+}
+
+function executionCoreBadge(snapshot?: AgentExecutionCoreSnapshot) {
+  if (!snapshot) {
+    return {
+      label: 'OFF',
+      className: 'bg-slate-800 text-slate-400',
+    };
+  }
+  if (snapshot.reachable) {
+    return {
+      label: 'LIVE',
+      className: 'bg-emerald-900/40 text-emerald-300',
+    };
+  }
+  return {
+    label: 'DOWN',
+    className: 'bg-red-900/40 text-red-300',
+  };
+}
+
 const STATE_BADGES: Record<string, { label: string; color: string }> = {
   idle: { label: 'Idle', color: 'bg-slate-600 text-slate-200' },
   running: { label: 'Running', color: 'bg-emerald-600 text-emerald-100' },
@@ -107,6 +157,8 @@ const DEFAULT_STRATEGIES = [
   'EMA_Crossover',
   'RSI_Reversal',
   'Supertrend_Breakout',
+  'FnO_Swing_Radar',
+  'US_Swing_Radar',
   'MP_OrderFlow_Breakout',
   'Fractal_Profile_Breakout',
 ];
@@ -159,6 +211,30 @@ function EventCard({ event }: { event: AgentEvent }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function InfrastructureRow({
+  label,
+  detail,
+  badge,
+  badgeClassName,
+}: {
+  label: string;
+  detail: string;
+  badge: string;
+  badgeClassName: string;
+}) {
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] text-slate-300">{label}</span>
+        <span className={cn('rounded px-1.5 py-0.5 text-[10px] font-semibold', badgeClassName)}>
+          {badge}
+        </span>
+      </div>
+      <div className="mt-1 break-all text-[10px] text-slate-500">{detail}</div>
     </div>
   );
 }
@@ -373,6 +449,19 @@ export default function AIAgentPage() {
   const strategyStatRows = Object.entries(status?.strategy_stats ?? {}).sort(
     (a, b) => (b[1]?.net_pnl_inr ?? 0) - (a[1]?.net_pnl_inr ?? 0)
   );
+  const executionCoreStatus = status?.execution_core_status;
+  const hasExecutionCoreSnapshot = Boolean(executionCoreStatus && Object.keys(executionCoreStatus).length > 0);
+  const executionCoreHealth = (executionCoreStatus?.health ?? {}) as Record<string, unknown>;
+  const executionCoreStats = (executionCoreStatus?.stats ?? {}) as Record<string, unknown>;
+  const streamingBackends = Object.entries(status?.streaming_backends ?? {});
+  const analyticsBackends = Object.entries(status?.analytics_backends ?? {});
+  const optionalServicesEnabled = [...streamingBackends, ...analyticsBackends].filter(([, cfg]) => Boolean(cfg?.enabled)).length;
+  const stackProfileLabel =
+    optionalServicesEnabled >= 4
+      ? 'Complete'
+      : optionalServicesEnabled > 0 || status?.execution_backend === 'rust'
+        ? 'Hybrid'
+        : 'Core';
   const marketPnl = status?.market_pnl_inr ?? Object.fromEntries(
     marketStatRows.map(([market, row]) => [market, Number(row?.net_pnl_inr ?? 0)])
   );
@@ -1261,6 +1350,76 @@ export default function AIAgentPage() {
                 </div>
               </div>
             )}
+
+            <div>
+              <span className="text-xs text-slate-500">Infrastructure</span>
+              <div className="mt-2 space-y-2">
+                <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-300">Stack Profile</span>
+                    <span className="rounded bg-indigo-900/40 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-300">
+                      {stackProfileLabel}
+                    </span>
+                  </div>
+                  <div className="mt-1 grid grid-cols-2 gap-1 text-[10px] text-slate-500">
+                    <span>Exec {String(status?.execution_backend ?? 'python').toUpperCase()}</span>
+                    <span>Transport {String(status?.execution_transport ?? 'inmemory').toUpperCase()}</span>
+                    <span>Event-driven {status?.event_driven_enabled ? 'ON' : 'OFF'}</span>
+                    <span>
+                      Markets {status?.event_driven_markets?.length ? status.event_driven_markets.join(', ') : '—'}
+                    </span>
+                  </div>
+                </div>
+
+                {(status?.execution_backend === 'rust' || hasExecutionCoreSnapshot) && (
+                  <InfrastructureRow
+                    label="Execution Core"
+                    detail={
+                      executionCoreStatus?.reachable
+                        ? [
+                            executionCoreStatus.url ?? 'reachable',
+                            typeof executionCoreHealth.nats_connected === 'boolean'
+                              ? `NATS ${executionCoreHealth.nats_connected ? 'connected' : 'disconnected'}`
+                              : null,
+                            typeof executionCoreHealth.signal_candidates === 'number'
+                              ? `signals ${String(executionCoreHealth.signal_candidates)}`
+                              : null,
+                            typeof executionCoreStats.signal_subject === 'string'
+                              ? String(executionCoreStats.signal_subject)
+                              : null,
+                          ].filter(Boolean).join(' • ')
+                        : executionCoreStatus?.error ?? executionCoreStatus?.url ?? 'Execution core not reachable'
+                    }
+                    badge={executionCoreBadge(executionCoreStatus).label}
+                    badgeClassName={executionCoreBadge(executionCoreStatus).className}
+                  />
+                )}
+
+                {streamingBackends.map(([name, config]) => (
+                  <InfrastructureRow
+                    key={name}
+                    label={formatBackendName(name)}
+                    detail={backendDetail(config)}
+                    badge={config?.enabled ? 'ENABLED' : 'DISABLED'}
+                    badgeClassName={infrastructureBadgeClasses(Boolean(config?.enabled))}
+                  />
+                ))}
+
+                {analyticsBackends.map(([name, config]) => (
+                  <InfrastructureRow
+                    key={name}
+                    label={formatBackendName(name)}
+                    detail={
+                      config?.database
+                        ? `${backendDetail(config)} • db ${config.database}`
+                        : backendDetail(config)
+                    }
+                    badge={config?.enabled ? 'ENABLED' : 'DISABLED'}
+                    badgeClassName={infrastructureBadgeClasses(Boolean(config?.enabled))}
+                  />
+                ))}
+              </div>
+            </div>
 
             <div>
               <span className="text-xs text-slate-500">Active Symbols</span>

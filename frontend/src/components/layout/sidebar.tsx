@@ -25,6 +25,8 @@ const navItems = [
   { href: '/',              label: 'Dashboard',  icon: LayoutDashboard },
   { href: '/watchlist',     label: 'Watchlist',   icon: List },
   { href: '/fno-radar',     label: 'FnO Radar',    icon: Radar },
+  { href: '/us-swing-radar', label: 'US Radar',   icon: Radar },
+  { href: '/profile-swing-radar', label: 'Profile Swing', icon: Radar },
   { href: '/analytics?tab=charts',  label: 'Charts',  icon: CandlestickChart, matchPrefix: '/analytics' },
   { href: '/analytics?tab=profile', label: 'Profile', icon: BarChart3, matchPrefix: '/analytics' },
   { href: '/indices/nifty/options', matchPrefix: '/indices', label: 'Options', icon: TrendingUp },

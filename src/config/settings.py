@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     app_log_level: str = "DEBUG"
+    app_startup_task_stagger_ms: int = Field(default=750, ge=0, le=10000)
     secret_key: str = "change_me_to_random_string_in_production"
 
     # --- Persistent data directory ---
@@ -115,6 +116,10 @@ class Settings(BaseSettings):
     fyers_rate_limit_per_sec: int = 1
     tick_batch_insert_interval: int = 10
     historical_data_retention_days: int = 730
+    us_provider_rate_limit_cooldown_seconds: int = Field(default=900, ge=30, le=86400)
+    us_provider_auth_cooldown_seconds: int = Field(default=3600, ge=60, le=86400)
+    us_provider_error_cooldown_seconds: int = Field(default=180, ge=5, le=3600)
+    us_provider_error_threshold: int = Field(default=3, ge=1, le=20)
 
     # --- Monitoring ---
     prometheus_port: int = 9090
@@ -131,7 +136,12 @@ class Settings(BaseSettings):
 
     # --- AI Agent ---
     agent_auto_start: bool = False
+    agent_auto_start_delay_seconds: int = Field(default=20, ge=0, le=600)
     agent_scan_interval: int = 30
+    agent_periodic_scan_batch_size: int = Field(default=96, ge=0, le=500)
+    agent_startup_initial_scan_limit: int = Field(default=24, ge=1, le=500)
+    agent_startup_scan_limit_step: int = Field(default=24, ge=1, le=500)
+    agent_startup_ramp_cycles: int = Field(default=4, ge=0, le=50)
     agent_default_timeframe: str = "5"
     agent_execution_timeframes: str = "3,5,15"
     agent_reference_timeframes: str = "60,D"

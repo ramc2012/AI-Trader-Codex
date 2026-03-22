@@ -8,7 +8,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from src.config.agent_universe import DEFAULT_AGENT_NSE_SYMBOLS
+from src.config.agent_universe import (
+    DEFAULT_AGENT_NSE_SYMBOLS,
+    DEFAULT_WATCHLIST_NSE_SYMBOLS,
+)
 
 # =============================================================================
 # Supported Symbols
@@ -21,7 +24,7 @@ MIDCPNIFTY_SYMBOL = "NSE:NIFTYMIDCAP50-INDEX"
 
 INDEX_SYMBOLS = [NIFTY_SYMBOL, BANKNIFTY_SYMBOL, SENSEX_SYMBOL, FINNIFTY_SYMBOL, MIDCPNIFTY_SYMBOL]
 FUTURES_SYMBOLS: list[str] = []
-ALL_WATCHLIST_SYMBOLS = list(DEFAULT_AGENT_NSE_SYMBOLS)
+ALL_WATCHLIST_SYMBOLS = list(DEFAULT_WATCHLIST_NSE_SYMBOLS)
 
 
 @dataclass(frozen=True)

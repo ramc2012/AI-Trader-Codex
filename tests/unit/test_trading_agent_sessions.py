@@ -231,6 +231,27 @@ def test_market_open_position_count_is_scoped_per_market() -> None:
     assert agent._market_open_position_count("CRYPTO") == 1
 
 
+def test_crypto_swing_timeframe_is_added_only_for_crypto_market() -> None:
+    agent = _build_agent(
+        AgentConfig(
+            strategies=["Crypto_Swing_Radar", "Fractal_Profile_Breakout"],
+            execution_timeframes=["3", "5", "15"],
+        )
+    )
+
+    assert "240" in agent._execution_timeframes_for_symbol("CRYPTO:BTCUSDT")
+    assert "240" not in agent._execution_timeframes_for_symbol("NSE:NIFTY50-INDEX")
+
+
+def test_crypto_market_disable_map_blocks_bootstrap_and_ema() -> None:
+    agent = _build_agent(AgentConfig())
+
+    assert agent._is_strategy_allowed_for_market("Bootstrap_Explorer", "CRYPTO") is False
+    assert agent._is_strategy_allowed_for_market("EMA_Crossover", "CRYPTO") is False
+    assert agent._is_strategy_allowed_for_market("Fractal_Profile_Breakout", "CRYPTO") is True
+    assert agent._is_strategy_allowed_for_market("MP_OrderFlow_Breakout", "CRYPTO") is True
+
+
 @pytest.mark.asyncio
 async def test_init_online_learning_does_not_require_ml_ensemble(tmp_path) -> None:
     agent = _build_agent(AgentConfig(strategies=["EMA_Crossover"]))
@@ -337,7 +358,7 @@ async def test_rank_execution_timeframes_prefers_faster_frames_in_bracket() -> N
 async def test_fetch_market_data_prefers_fresh_db_frame_over_stale_cache(monkeypatch) -> None:
     agent = _build_agent(AgentConfig())
     stale_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(days=2))
-    fresh_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(minutes=3))
+    fresh_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(minutes=3), bars=180)
 
     class _Cache:
         def as_dataframe(self, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
@@ -397,6 +418,31 @@ async def test_fetch_market_data_live_only_skips_db_and_rest_fallbacks(monkeypat
     agent._fetch_fyers_market_data.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_fetch_market_data_ignores_shallow_fresh_crypto_cache(monkeypatch) -> None:
+    agent = _build_agent(AgentConfig())
+    shallow_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(minutes=3), minutes=3, bars=2)
+    shallow_frame["symbol"] = "CRYPTO:BTCUSDT"
+    live_frame = _frame_with_end(datetime.now(tz=IST) - timedelta(minutes=3), minutes=3, bars=180)
+    live_frame["symbol"] = "CRYPTO:BTCUSDT"
+
+    class _Cache:
+        def as_dataframe(self, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+            return shallow_frame.set_index("timestamp")
+
+    monkeypatch.setattr("src.data.ohlc_cache.get_ohlc_cache", lambda: _Cache())
+    agent._requires_live_bars = MagicMock(return_value=True)
+    agent._fetch_database_market_data = AsyncMock(return_value=None)
+    agent._fetch_crypto_market_data = AsyncMock(return_value=live_frame)
+    agent._fetch_fyers_market_data = AsyncMock(return_value=None)
+
+    frame = await agent._fetch_market_data("CRYPTO:BTCUSDT", timeframe="3")
+
+    assert frame is not None
+    assert len(frame) == len(live_frame)
+    agent._fetch_crypto_market_data.assert_awaited_once()
+
+
 def test_periodic_scan_symbols_skip_event_driven_symbols() -> None:
     agent = _build_agent(AgentConfig(event_driven_execution_enabled=True))
     agent._candle_broker = MagicMock()
@@ -423,6 +469,61 @@ def test_periodic_scan_symbols_skip_execution_core_lane_symbols() -> None:
     filtered = agent._periodic_scan_symbols(["CRYPTO:BTCUSDT", "US:SPY"])
 
     assert filtered == ["US:SPY"]
+
+
+def test_periodic_scan_symbols_rotate_with_batch_budget() -> None:
+    agent = _build_agent(
+        AgentConfig(
+            periodic_scan_batch_size=3,
+            startup_initial_scan_limit=2,
+            startup_scan_limit_step=1,
+            startup_ramp_cycles=2,
+        )
+    )
+    symbols = ["US:SPY", "US:QQQ", "US:MSFT", "US:AAPL"]
+
+    agent._cycle_count = 1
+    first = agent._periodic_scan_symbols(symbols)
+
+    agent._cycle_count = 2
+    second = agent._periodic_scan_symbols(symbols)
+
+    agent._cycle_count = 3
+    third = agent._periodic_scan_symbols(symbols)
+
+    assert first == ["US:SPY", "US:QQQ"]
+    assert second == ["US:MSFT", "US:AAPL", "US:SPY"]
+    assert third == ["US:QQQ", "US:MSFT", "US:AAPL"]
+
+
+def test_periodic_scan_symbols_always_include_open_positions() -> None:
+    position_manager = PositionManager(state_path=None)
+    position_manager.open_position(
+        symbol="US:QQQ",
+        quantity=1,
+        side=PositionSide.LONG,
+        price=500.0,
+        strategy_tag="US_Swing_Radar",
+    )
+    agent = TradingAgent(
+        config=AgentConfig(
+            periodic_scan_batch_size=1,
+            startup_initial_scan_limit=1,
+            startup_scan_limit_step=1,
+            startup_ramp_cycles=1,
+        ),
+        strategy_executor=MagicMock(),
+        order_manager=MagicMock(),
+        position_manager=position_manager,
+        risk_manager=MagicMock(),
+        event_bus=MagicMock(),
+        fyers_client=MagicMock(),
+    )
+    agent._cycle_count = 1
+
+    filtered = agent._periodic_scan_symbols(["US:SPY", "US:QQQ", "US:AAPL"])
+
+    assert filtered == ["US:QQQ"]
 
 
 def test_crypto_symbol_becomes_event_driven_only_after_live_candle() -> None:
@@ -489,6 +590,56 @@ async def test_fetch_live_prices_prefers_streamed_tick_snapshot() -> None:
     prices = await agent._fetch_live_prices(["CRYPTO:BTCUSDT"])
 
     assert prices == {"CRYPTO:BTCUSDT": 43125.5}
+
+
+@pytest.mark.asyncio
+async def test_fetch_us_yahoo_http_429_sets_provider_cooldown(monkeypatch) -> None:
+    agent = _build_agent(AgentConfig())
+
+    class _Response:
+        status_code = 429
+
+        def json(self) -> dict:
+            return {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return _Response()
+
+    monkeypatch.setattr("src.agent.trading_agent.httpx.AsyncClient", lambda *args, **kwargs: _Client())
+
+    frame = await agent._fetch_us_yahoo_ohlcv("SPY", "1d", "2y", "US:SPY")
+
+    assert frame is None
+    assert agent._us_provider_available("yahoo") is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_us_intraday_base_skips_finnhub_during_cooldown(monkeypatch) -> None:
+    agent = _build_agent(AgentConfig())
+    frame = _frame_with_end(datetime.now(tz=IST), minutes=1, bars=20, price=100.0)
+
+    monkeypatch.setattr(
+        "src.agent.trading_agent.get_settings",
+        lambda: SimpleNamespace(finnhub_api_key="token", alphavantage_api_key=""),
+    )
+    agent._set_us_provider_cooldown("finnhub", 600, "test")
+    agent._fetch_us_finnhub_ohlcv = AsyncMock(side_effect=AssertionError("finnhub should be skipped"))
+    agent._fetch_us_alphavantage_ohlcv = AsyncMock(return_value=None)
+    agent._fetch_us_yahoo_ohlcv = AsyncMock(return_value=frame)
+    agent._fetch_us_nasdaq_ohlcv = AsyncMock(return_value=None)
+
+    result = await agent._fetch_us_intraday_base("US:SPY", "SPY")
+
+    assert result is not None
+    agent._fetch_us_yahoo_ohlcv.assert_awaited_once()
+    agent._fetch_us_finnhub_ohlcv.assert_not_called()
 
 
 def test_event_driven_exit_symbol_requires_position_and_live_tick() -> None:

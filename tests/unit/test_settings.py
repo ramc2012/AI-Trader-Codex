@@ -4,6 +4,8 @@ from pathlib import Path
 
 from src.config.agent_universe import (
     DEFAULT_AGENT_NSE_SYMBOLS,
+    DEFAULT_AGENT_US_SYMBOLS,
+    DEFAULT_WATCHLIST_NSE_SYMBOLS,
     LEGACY_AGENT_NSE_INDEX_ONLY_SYMBOLS,
     LEGACY_AGENT_NSE_SYMBOLS_PRE_MARCH_2026,
     to_csv,
@@ -33,6 +35,16 @@ class TestSettings:
         assert settings.analytics_consumer_enabled is False
         assert settings.analytics_consumer_embedded_enabled is True
         assert settings.analytics_consumer_source == "kafka"
+        assert settings.app_startup_task_stagger_ms == 750
+        assert settings.agent_auto_start_delay_seconds == 20
+        assert settings.agent_periodic_scan_batch_size == 96
+        assert settings.agent_startup_initial_scan_limit == 24
+        assert settings.agent_startup_scan_limit_step == 24
+        assert settings.agent_startup_ramp_cycles == 4
+        assert settings.us_provider_rate_limit_cooldown_seconds == 900
+        assert settings.us_provider_auth_cooldown_seconds == 3600
+        assert settings.us_provider_error_cooldown_seconds == 180
+        assert settings.us_provider_error_threshold == 3
 
     def test_database_url(self) -> None:
         settings = Settings(
@@ -114,3 +126,17 @@ class TestSettings:
         )
 
         assert settings.agent_default_symbols == to_csv(DEFAULT_AGENT_NSE_SYMBOLS)
+
+    def test_agent_default_symbols_upgrade_previous_watchlist_default(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            agent_default_symbols=to_csv(DEFAULT_WATCHLIST_NSE_SYMBOLS),
+        )
+
+        assert settings.agent_default_symbols == to_csv(DEFAULT_AGENT_NSE_SYMBOLS)
+
+    def test_agent_us_default_symbols_use_curated_200_stock_universe(self) -> None:
+        settings = Settings(_env_file=None)
+
+        assert settings.agent_us_symbols == to_csv(DEFAULT_AGENT_US_SYMBOLS)
+        assert len(DEFAULT_AGENT_US_SYMBOLS) == 200

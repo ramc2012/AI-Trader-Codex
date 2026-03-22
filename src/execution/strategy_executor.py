@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Collection, Dict, List, Optional
 
 from src.utils.logger import get_logger
 
@@ -146,7 +146,12 @@ class StrategyExecutor:
         self._alert_manager = am
 
     def process_data(
-        self, data: Any, symbol: str = ""
+        self,
+        data: Any,
+        symbol: str = "",
+        *,
+        strategy_filter: Collection[str] | None = None,
+        strategy_inputs: Dict[str, Dict[str, Any]] | None = None,
     ) -> List[Dict[str, Any]]:
         """Feed market data to all enabled strategies and collect signals.
 
@@ -166,14 +171,21 @@ class StrategyExecutor:
 
         results: List[Dict[str, Any]] = []
 
+        allowed = None if strategy_filter is None else set(strategy_filter)
+
         for name, strategy in self._strategies.items():
             state = self._strategy_states[name]
             if state.last_symbol_signal_time is None:
                 state.last_symbol_signal_time = {}
             if not state.enabled:
                 continue
+            if allowed is not None and name not in allowed:
+                continue
 
             try:
+                set_runtime_context = getattr(strategy, "set_runtime_context", None)
+                if callable(set_runtime_context):
+                    set_runtime_context((strategy_inputs or {}).get(name))
                 signals = strategy.generate_signals(data)
                 new_signals = self._filter_new_signals(state, symbol, signals)
                 state.signals_generated += len(new_signals)

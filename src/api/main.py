@@ -2,7 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,8 +40,11 @@ from src.api.routes.money_flow import router as money_flow_router
 from src.api.routes.crypto_flow import router as crypto_flow_router
 from src.api.routes.history import router as history_router
 from src.api.routes.agent import router as agent_router
+from src.api.routes.fno_radar import router as fno_radar_router
 from src.api.routes.fractal_profile import router as fractal_profile_router
+from src.api.routes.profile_swing_radar import router as profile_swing_radar_router
 from src.api.routes.scanner import router as scanner_router
+from src.api.routes.us_swing_radar import router as us_swing_radar_router
 from src.config.constants import (
     API_V1_PREFIX,
     ALL_TIMEFRAMES,
@@ -168,6 +171,22 @@ async def _warm_ohlc_cache() -> None:
     await cache.warm_up(data)
 
 
+async def _run_startup_task(
+    name: str,
+    starter: Callable[[], Awaitable[None]],
+    delay_seconds: float = 0.0,
+) -> None:
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
+    try:
+        logger.info("startup_task_launching", task=name, delay_seconds=round(delay_seconds, 3))
+        await starter()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("startup_task_failed", task=name, error=str(exc))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application startup/shutdown lifecycle."""
@@ -178,31 +197,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     get_engine()
     await apply_runtime_migrations()
 
-    # Warm in-memory OHLC cache (DB → Fyers fallback)
-    asyncio.create_task(_warm_ohlc_cache())
-    # Start background data collectors and runtime services
-    asyncio.create_task(start_auto_collection())
     runtime_manager = get_runtime_manager()
-    asyncio.create_task(runtime_manager.start())
-    asyncio.create_task(get_execution_event_publisher().start())
-    if settings.analytics_consumer_enabled and settings.analytics_consumer_embedded_enabled:
-        asyncio.create_task(get_transport_analytics_consumer().start())
-    if settings.transport_mirror_enabled and settings.transport_mirror_embedded_enabled:
-        asyncio.create_task(get_transport_mirror().start())
-    asyncio.create_task(warm_global_watchlist_cache())
-    # Start real-time tick aggregator (footprint/orderflow)
     aggregator = get_tick_aggregator()
-    asyncio.create_task(aggregator.start())
     notifier = get_telegram_notifier()
-    if notifier.is_configured:
-        asyncio.create_task(notifier.start())
     fractal_scan_notifier = get_fractal_scan_notifier()
-    asyncio.create_task(fractal_scan_notifier.start())
+    stagger_seconds = max(int(settings.app_startup_task_stagger_ms or 0), 0) / 1000.0
+    launch_index = 0
+
+    def _schedule_startup(name: str, starter: Callable[[], Awaitable[None]]) -> None:
+        nonlocal launch_index
+        delay_seconds = launch_index * stagger_seconds
+        launch_index += 1
+        asyncio.create_task(_run_startup_task(name, starter, delay_seconds))
+
+    _schedule_startup("runtime_manager", runtime_manager.start)
+    _schedule_startup("execution_event_publisher", get_execution_event_publisher().start)
+    if settings.analytics_consumer_enabled and settings.analytics_consumer_embedded_enabled:
+        _schedule_startup("transport_analytics_consumer", get_transport_analytics_consumer().start)
+    if settings.transport_mirror_enabled and settings.transport_mirror_embedded_enabled:
+        _schedule_startup("transport_mirror", get_transport_mirror().start)
+    _schedule_startup("tick_aggregator", aggregator.start)
+    if notifier.is_configured:
+        _schedule_startup("telegram_notifier", notifier.start)
+    _schedule_startup("fractal_scan_notifier", fractal_scan_notifier.start)
+    _schedule_startup("global_watchlist_warmup", warm_global_watchlist_cache)
+    _schedule_startup("ohlc_cache_warmup", _warm_ohlc_cache)
+    _schedule_startup("auto_collection", start_auto_collection)
 
     if settings.agent_auto_start:
         async def _auto_start_agent() -> None:
-            # Small delay so runtime/cache tasks begin first.
-            await asyncio.sleep(2)
+            await asyncio.sleep(max(int(settings.agent_auto_start_delay_seconds or 0), 0))
             try:
                 agent = get_trading_agent()
                 await agent.start()
@@ -298,6 +322,9 @@ def create_app() -> FastAPI:
     app.include_router(scanner_router, prefix=API_V1_PREFIX)
     app.include_router(fractal_profile_router, prefix=API_V1_PREFIX)
     app.include_router(agent_router, prefix=API_V1_PREFIX)
+    app.include_router(fno_radar_router, prefix=API_V1_PREFIX)
+    app.include_router(us_swing_radar_router, prefix=API_V1_PREFIX)
+    app.include_router(profile_swing_radar_router, prefix=API_V1_PREFIX)
 
     return app
 

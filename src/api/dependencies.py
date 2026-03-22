@@ -154,6 +154,10 @@ def _agent_config_from_settings() -> AgentConfig:
         reinforcement_size_boost_pct=settings.agent_reinforcement_size_boost_pct,
         strategy_capital_bucket_enabled=settings.agent_strategy_capital_bucket_enabled,
         strategy_max_concurrent_positions=settings.agent_strategy_max_concurrent_positions,
+        periodic_scan_batch_size=settings.agent_periodic_scan_batch_size,
+        startup_initial_scan_limit=settings.agent_startup_initial_scan_limit,
+        startup_scan_limit_step=settings.agent_startup_scan_limit_step,
+        startup_ramp_cycles=settings.agent_startup_ramp_cycles,
         telegram_status_interval_minutes=settings.telegram_status_interval_minutes,
     )
     config.capital = _agent_total_capital_inr(config)

@@ -22,6 +22,15 @@ class _MockStrategy:
         return list(self._signals)
 
 
+class _ContextStrategy(_MockStrategy):
+    def __init__(self, signals: list | None = None) -> None:
+        super().__init__(signals=signals)
+        self.runtime_context = None
+
+    def set_runtime_context(self, context):  # noqa: ANN001, ANN201
+        self.runtime_context = context
+
+
 class _ErrorStrategy:
     """A strategy that always raises an exception."""
 
@@ -227,6 +236,31 @@ class TestProcessData:
         states = executor.get_strategy_states()
         assert states["alpha"].last_signal_time is None
         assert states["alpha"].signals_generated == 0
+
+    def test_process_data_applies_strategy_filter(self) -> None:
+        executor = StrategyExecutor()
+        executor.register_strategy("alpha", _MockStrategy([MagicMock()]))
+        executor.register_strategy("beta", _MockStrategy([MagicMock()]))
+
+        results = executor.process_data(data=None, strategy_filter=["beta"])
+
+        assert len(results) == 1
+        assert results[0]["strategy"] == "beta"
+
+    def test_process_data_passes_runtime_context(self) -> None:
+        executor = StrategyExecutor()
+        strategy = _ContextStrategy([MagicMock()])
+        executor.register_strategy("alpha", strategy)
+
+        executor.process_data(
+            data=None,
+            strategy_inputs={"alpha": {"execution_timeframe": "15", "symbol": "NSE:RELIANCE-EQ"}},
+        )
+
+        assert strategy.runtime_context == {
+            "execution_timeframe": "15",
+            "symbol": "NSE:RELIANCE-EQ",
+        }
 
     def test_process_data_normalizes_mixed_timezone_signal_timestamps(self) -> None:
         """Mixed tz-aware/naive signal timestamps should not break dedupe logic."""

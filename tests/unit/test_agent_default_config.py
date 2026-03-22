@@ -6,6 +6,7 @@ from src.api.schemas import AgentConfigRequest
 from src.api.dependencies import get_trading_agent, reset_managers
 from src.config.agent_universe import (
     DEFAULT_AGENT_NSE_SYMBOLS,
+    DEFAULT_WATCHLIST_NSE_SYMBOLS,
     LEGACY_AGENT_NSE_INDEX_ONLY_SYMBOLS,
     LEGACY_AGENT_NSE_SYMBOLS_PRE_MARCH_2026,
 )
@@ -62,3 +63,20 @@ def test_agent_start_request_upgrades_legacy_full_nse_universe() -> None:
     request = AgentConfigRequest(symbols=list(LEGACY_AGENT_NSE_SYMBOLS_PRE_MARCH_2026))
 
     assert request.symbols == list(DEFAULT_AGENT_NSE_SYMBOLS)
+
+
+def test_agent_start_request_upgrades_previous_watchlist_nse_universe() -> None:
+    request = AgentConfigRequest(symbols=list(DEFAULT_WATCHLIST_NSE_SYMBOLS))
+
+    assert request.symbols == list(DEFAULT_AGENT_NSE_SYMBOLS)
+
+
+def test_agent_start_request_defaults_include_crypto_swing_controls() -> None:
+    request = AgentConfigRequest()
+
+    assert "Crypto_Swing_Radar" in request.strategies
+    assert "Profile_Swing_Radar" in request.strategies
+    assert "Profile_AI_Swing_Radar" in request.strategies
+    assert request.disabled_strategies_by_market["CRYPTO"] == ["Bootstrap_Explorer", "EMA_Crossover"]
+    assert request.strategy_budget_weights_by_market["CRYPTO"]["MP_OrderFlow_Breakout"] == 1.8
+    assert request.strategy_budget_weights_by_market["CRYPTO"]["Fractal_Profile_Breakout"] == 1.8

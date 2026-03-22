@@ -58,7 +58,7 @@ cp .env.example .env
 
 5. **Start databases**
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 6. **Initialize database**
@@ -72,6 +72,26 @@ uvicorn src.api.main:app --reload
 ```
 
 Visit http://localhost:8000/docs for API documentation
+
+### Stack Modes
+
+- Core app: `docker compose up -d`
+  - Frontend `3200`, backend `8000`, TimescaleDB `5432`, Redis `6379`
+- Complete app with optional event/analytics stack:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.subsecond.yml up -d
+```
+  - Adds NATS `4222`, NATS monitor `8222`, Kafka `9092`, ClickHouse `8123`/`9000`, QuestDB `9001`/`8812`/`9009`, execution-core `8081`
+
+For single-EC2 AWS deploys, set `DEPLOY_SUBSECOND_STACK=true` in `.env.aws.single` before running [deploy_single_ec2.sh](scripts/aws/deploy_single_ec2.sh). The script now blocks the complete stack on undersized hosts unless you explicitly override it.
+
+The AI agent now defaults to the full NSE FnO equity universe plus a curated 200-stock US swing universe, while the generic local watchlist stays smaller. `FnO Radar` and `US Swing Radar` are backed by the swing-research artifacts and expose current ranked candidates at `/api/v1/fno-radar/overview` and `/api/v1/us-swing-radar/overview`.
+
+To build or refresh the persistent swing artifacts inside the runtime data directory, run:
+
+```bash
+python -m src.research.bootstrap_runtime_artifacts --skip-existing
+```
 
 ---
 

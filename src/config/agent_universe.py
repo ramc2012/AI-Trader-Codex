@@ -4,11 +4,24 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from src.config.fno_constants import FNO_SYMBOLS
+from src.config.us_swing_universe import US_SWING_SYMBOLS
+
 NIFTY_SYMBOL = "NSE:NIFTY50-INDEX"
 BANKNIFTY_SYMBOL = "NSE:NIFTYBANK-INDEX"
 SENSEX_SYMBOL = "BSE:SENSEX-INDEX"
 FINNIFTY_SYMBOL = "NSE:FINNIFTY-INDEX"
 MIDCPNIFTY_SYMBOL = "NSE:NIFTYMIDCAP50-INDEX"
+
+FNO_SPOT_SYMBOL_OVERRIDES: dict[str, str] = {
+    "M&M": "NSE:M&M-EQ",
+    "M&MFIN": "NSE:M&MFIN-EQ",
+}
+FNO_SPOT_TO_ROOT_OVERRIDES: dict[str, str] = {
+    "NSE:MM-EQ": "M&M",
+    "NSE:M&M-EQ": "M&M",
+    "NSE:M&MFIN-EQ": "M&MFIN",
+}
 
 # Current Nifty 50 constituents (updated March 2026).
 # Key changes applied vs original list:
@@ -79,27 +92,7 @@ LEGACY_AGENT_NSE_SYMBOLS_PRE_MARCH_2026: list[str] = [
     "NSE:LTIM-EQ", "NSE:MM-EQ",
 ]
 
-DEFAULT_AGENT_NSE_SYMBOLS: list[str] = [
-    NIFTY_SYMBOL,
-    BANKNIFTY_SYMBOL,
-    FINNIFTY_SYMBOL,
-    MIDCPNIFTY_SYMBOL,
-    SENSEX_SYMBOL,
-    *NIFTY50_WATCHLIST_SYMBOLS,
-]
-
-DEFAULT_AGENT_US_SYMBOLS: list[str] = [
-    "US:SPY",
-    "US:QQQ",
-    "US:DIA",
-    "US:IWM",
-    "US:AAPL",
-    "US:AMZN",
-    "US:JPM",
-    "US:XOM",
-    "US:UNH",
-    "US:CAT",
-]
+DEFAULT_AGENT_US_SYMBOLS: list[str] = list(US_SWING_SYMBOLS)
 
 DEFAULT_AGENT_CRYPTO_SYMBOLS: list[str] = [
     "CRYPTO:BTCUSDT",
@@ -114,6 +107,8 @@ DEFAULT_AGENT_CRYPTO_SYMBOLS: list[str] = [
     "CRYPTO:LINKUSDT",
 ]
 
+CRYPTO_SWING_BENCHMARK_SYMBOL = "CRYPTO:BTCUSDT"
+
 
 def unique_symbols(values: Iterable[str]) -> list[str]:
     seen: set[str] = set()
@@ -125,6 +120,54 @@ def unique_symbols(values: Iterable[str]) -> list[str]:
         seen.add(symbol)
         items.append(symbol)
     return items
+
+
+DEFAULT_WATCHLIST_NSE_SYMBOLS: list[str] = [
+    NIFTY_SYMBOL,
+    BANKNIFTY_SYMBOL,
+    FINNIFTY_SYMBOL,
+    MIDCPNIFTY_SYMBOL,
+    SENSEX_SYMBOL,
+    *NIFTY50_WATCHLIST_SYMBOLS,
+]
+
+
+def fno_root_to_spot_symbol(symbol: str) -> str:
+    token = str(symbol or "").strip().upper()
+    if not token:
+        return ""
+    return FNO_SPOT_SYMBOL_OVERRIDES.get(token, f"NSE:{token}-EQ")
+
+
+def spot_symbol_to_fno_root(symbol: str) -> str:
+    token = str(symbol or "").strip().upper()
+    if token in FNO_SPOT_TO_ROOT_OVERRIDES:
+        return FNO_SPOT_TO_ROOT_OVERRIDES[token]
+    if token.startswith("NSE:") and token.endswith("-EQ"):
+        return token[4:-3]
+    return token
+
+
+def us_symbol_to_ticker(symbol: str) -> str:
+    token = str(symbol or "").strip().upper()
+    if token.startswith(("US:", "NASDAQ:", "NYSE:", "AMEX:")):
+        return token.split(":", 1)[1]
+    return token
+
+
+def build_fno_agent_equity_symbols(values: Iterable[str] | None = None) -> list[str]:
+    roots = list(values or FNO_SYMBOLS)
+    return unique_symbols(fno_root_to_spot_symbol(root) for root in roots)
+
+
+DEFAULT_AGENT_NSE_SYMBOLS: list[str] = [
+    NIFTY_SYMBOL,
+    BANKNIFTY_SYMBOL,
+    FINNIFTY_SYMBOL,
+    MIDCPNIFTY_SYMBOL,
+    SENSEX_SYMBOL,
+    *build_fno_agent_equity_symbols(),
+]
 
 
 def parse_symbol_values(values: str | Iterable[str] | None) -> list[str]:
@@ -142,6 +185,8 @@ def normalize_nse_agent_symbols(values: str | Iterable[str] | None) -> list[str]
     if parsed == LEGACY_AGENT_NSE_INDEX_ONLY_SYMBOLS:
         return list(DEFAULT_AGENT_NSE_SYMBOLS)
     if parsed == LEGACY_AGENT_NSE_SYMBOLS_PRE_MARCH_2026:
+        return list(DEFAULT_AGENT_NSE_SYMBOLS)
+    if parsed == DEFAULT_WATCHLIST_NSE_SYMBOLS:
         return list(DEFAULT_AGENT_NSE_SYMBOLS)
     return parsed
 

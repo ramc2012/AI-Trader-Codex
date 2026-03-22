@@ -120,7 +120,7 @@ services:
       # Note: Fyers credentials are read from mounted .env file, not from environment
     volumes:
       - ./.env:/app/.env
-      - ./.fyers_token.json:/app/.fyers_token.json
+      - ./.fyers_token.json:/app/data/.fyers_token.json
       - agent_data:/app/data
     depends_on:
       timescaledb:
@@ -152,7 +152,7 @@ services:
     container_name: nifty-frontend
     restart: unless-stopped
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      - "${FRONTEND_PORT:-3200}:3000"
     environment:
       # Tell Next.js rewrites to proxy to the backend container (internal Docker network)
       API_HOST: backend

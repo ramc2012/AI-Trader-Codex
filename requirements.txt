@@ -30,6 +30,7 @@ aiokafka>=0.10.0
 # Data Processing
 pandas>=2.1.0
 numpy>=1.26.0
+yfinance>=0.2.54
 
 # Technical Analysis
 ta-lib>=0.4.28

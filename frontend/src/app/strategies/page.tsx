@@ -207,6 +207,10 @@ const STRATEGY_DESCRIPTIONS: Record<string, string> = {
   Bollinger_MeanReversion: 'Bollinger Band mean-reversion with RSI confirmation. ADX regime filter blocks signals in trending (ADX > 25) markets.',
   Supertrend_Breakout: 'Supertrend directional bias shifts used as entry triggers.',
   ML_Ensemble: 'Online-learning ensemble of GBM, XGBoost, and RF models with adaptive confidence threshold.',
+  FnO_Swing_Radar: 'Research-driven daily FnO swing strategy that scores 2-day and 10-15 day volatility-adjusted moves and allows multi-day option holds.',
+  US_Swing_Radar: 'Research-driven US equity swing strategy for the 200-stock sector universe, with tuned live filters and multi-day option holds in paper/live simulation.',
+  Profile_Swing_Radar: 'Rules-based swing strategy built from daily, weekly, and monthly profile interactions mined from the hourly research dataset.',
+  Profile_AI_Swing_Radar: 'Learning-assisted profile swing strategy that blends the profile interaction research with optional model probabilities and online strategy learning.',
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

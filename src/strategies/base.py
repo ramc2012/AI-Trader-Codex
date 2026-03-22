@@ -203,5 +203,9 @@ class BaseStrategy(ABC):
         """
         ...
 
+    def set_runtime_context(self, context: dict[str, Any] | None) -> None:
+        """Inject per-scan runtime context for strategies that need extra inputs."""
+        self._runtime_context = dict(context or {})
+
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}>"

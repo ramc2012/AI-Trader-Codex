@@ -510,6 +510,23 @@ export interface AgentEvent {
   metadata: Record<string, unknown>;
 }
 
+export interface AgentBackendConfig {
+  enabled?: boolean;
+  url?: string;
+  stream_prefix?: string;
+  bootstrap_servers?: string;
+  topic_prefix?: string;
+  database?: string;
+}
+
+export interface AgentExecutionCoreSnapshot {
+  reachable?: boolean;
+  url?: string;
+  error?: string;
+  health?: Record<string, unknown>;
+  stats?: Record<string, unknown>;
+}
+
 export interface AgentStatus {
   state: 'idle' | 'running' | 'paused' | 'stopped' | 'error';
   paper_mode: boolean;
@@ -554,7 +571,34 @@ export interface AgentStatus {
   strategy_controls?: Array<{
     name: string;
     enabled: boolean;
+    learning?: {
+      reward_ema?: number;
+      trade_count?: number;
+      win_rate?: number;
+      rolling_sharpe?: number;
+      enabled?: boolean;
+      disabled_reason?: string;
+    };
+    learning_by_market?: Record<
+      string,
+      {
+        reward_ema?: number;
+        trade_count?: number;
+        win_rate?: number;
+        rolling_sharpe?: number;
+        enabled?: boolean;
+        disabled_reason?: string;
+      }
+    >;
   }>;
+  event_driven_enabled?: boolean;
+  event_driven_markets?: string[];
+  execution_backend?: string;
+  execution_transport?: string;
+  execution_core_status?: AgentExecutionCoreSnapshot;
+  streaming_backends?: Record<string, AgentBackendConfig>;
+  analytics_backends?: Record<string, AgentBackendConfig>;
+  execution_latency?: Record<string, unknown>;
   last_scan_time: string | null;
   emergency_stop?: boolean;
   error: string | null;

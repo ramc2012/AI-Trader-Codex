@@ -244,6 +244,32 @@ class StrategyPerformanceTracker:
             for name, stats in self._stats.items()
         }
 
+    def get_strategy_snapshot(
+        self,
+        strategy: str,
+        market: str | None = None,
+        *,
+        prefer_market: bool = False,
+    ) -> dict[str, Any]:
+        market_key = self._normalize_market(market)
+        stats = (
+            self._get_market_stats(strategy, market_key)
+            if prefer_market and market_key
+            else None
+        )
+        if stats is None:
+            stats = self._get_or_create(strategy)
+        return {
+            "strategy": strategy,
+            "market": market_key,
+            "reward_ema": round(stats.reward_ema, 6),
+            "trade_count": int(stats.trade_count),
+            "win_rate": round(stats.win_rate, 6),
+            "rolling_sharpe": round(stats.rolling_sharpe, 6),
+            "enabled": bool(stats.enabled),
+            "disabled_reason": str(stats.disabled_reason or ""),
+        }
+
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def load_state(self) -> None:

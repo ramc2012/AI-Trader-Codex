@@ -31,6 +31,7 @@ const NAV_ITEMS = [
   { href: '/',           label: 'Dashboard',  icon: LayoutDashboard, exact: true },
   { href: '/watchlist',  label: 'Watchlist',  icon: List },
   { href: '/fno-radar',  label: 'FnO Radar',  icon: Radar },
+  { href: '/us-swing-radar', label: 'US Radar', icon: Radar },
   // 'charts' is rendered separately as a direct link
   { href: '/indices/nifty/options', label: 'Options', icon: TrendingUp, matchPrefix: '/indices' },
   { href: '/positions',  label: 'Positions',  icon: Briefcase },
@@ -93,7 +94,7 @@ export function TopNav() {
 
       {/* Nav items */}
       <nav className="flex flex-1 items-center gap-0.5 overflow-x-auto scrollbar-none">
-        {NAV_ITEMS.slice(0, 3).map(renderNavItem)}
+        {NAV_ITEMS.slice(0, 4).map(renderNavItem)}
 
         <Link
           href="/analytics?tab=charts"
@@ -108,7 +109,7 @@ export function TopNav() {
           Charts
         </Link>
 
-        {NAV_ITEMS.slice(3).map(renderNavItem)}
+        {NAV_ITEMS.slice(4).map(renderNavItem)}
       </nav>
 
       {/* Right status strip */}

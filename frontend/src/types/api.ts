@@ -680,6 +680,10 @@ export interface AgentInspectorReferenceBias {
   timeframes: Record<string, Record<string, unknown>>;
   bullish_votes: number;
   bearish_votes: number;
+  weighted_bullish_votes?: number;
+  weighted_bearish_votes?: number;
+  weighted_edge?: number;
+  confidence_pct?: number;
   dominant_trend: string;
 }
 

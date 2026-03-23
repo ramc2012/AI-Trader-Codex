@@ -42,6 +42,7 @@ from src.api.routes.trading import _build_currency_aware_portfolio, _refresh_ope
 from src.api.schemas import AgentConfigRequest, AgentEventResponse, AgentStatusResponse
 from src.config.settings import get_settings
 from src.database.operations import get_ohlc_candles
+from src.strategies.base import Signal, SignalStrength, SignalType
 from src.utils.logger import get_logger
 from src.config.agent_universe import DEFAULT_AGENT_NSE_SYMBOLS
 
@@ -482,6 +483,8 @@ async def _reference_bias_snapshot(agent: Any, symbol: str) -> dict[str, Any]:
     timeframes: dict[str, Any] = {}
     bullish_votes = 0
     bearish_votes = 0
+    weighted_bullish = 0.0
+    weighted_bearish = 0.0
 
     for timeframe in agent.get_reference_timeframes():
         df = await agent._fetch_market_data(symbol, timeframe=timeframe)
@@ -491,33 +494,209 @@ async def _reference_bias_snapshot(agent: Any, symbol: str) -> dict[str, Any]:
 
         frame = _prepare_inspection_frame(df, symbol, 300)
         fresh, freshness = agent._data_freshness(frame, timeframe)
-        trend, close, ema20 = agent._infer_trend(frame)
+        trend_profile = agent._trend_strength_profile(frame, timeframe)
         payload = {
-            "trend": trend if fresh else "stale",
+            "trend": str(trend_profile.get("trend") or "neutral") if fresh else "stale",
             "fresh": fresh,
-            "close": round(close, 4) if math.isfinite(close) else None,
-            "ema20": round(ema20, 4) if math.isfinite(ema20) else None,
+            **_json_safe(trend_profile),
             **_json_safe(freshness),
         }
         timeframes[timeframe] = payload
         if fresh:
-            if trend == "bullish":
+            if trend_profile.get("trend") == "bullish":
                 bullish_votes += 1
-            elif trend == "bearish":
+                weighted_bullish += float(trend_profile.get("weighted_score", 0.0) or 0.0)
+            elif trend_profile.get("trend") == "bearish":
                 bearish_votes += 1
+                weighted_bearish += float(trend_profile.get("weighted_score", 0.0) or 0.0)
 
     dominant_trend = "neutral"
-    if bullish_votes > bearish_votes:
+    if weighted_bullish > weighted_bearish:
+        dominant_trend = "bullish"
+    elif weighted_bearish > weighted_bullish:
+        dominant_trend = "bearish"
+    elif bullish_votes > bearish_votes:
         dominant_trend = "bullish"
     elif bearish_votes > bullish_votes:
         dominant_trend = "bearish"
+    total_weight = weighted_bullish + weighted_bearish
+    confidence_pct = (max(weighted_bullish, weighted_bearish) / total_weight * 100.0) if total_weight > 0 else 0.0
 
     return {
         "timeframes": timeframes,
         "bullish_votes": bullish_votes,
         "bearish_votes": bearish_votes,
+        "weighted_bullish_votes": round(weighted_bullish, 4),
+        "weighted_bearish_votes": round(weighted_bearish, 4),
+        "weighted_edge": round(weighted_bullish - weighted_bearish, 4),
+        "confidence_pct": round(confidence_pct, 2),
         "dominant_trend": dominant_trend,
     }
+
+
+def _signal_type_from_token(value: Any) -> SignalType | None:
+    token = str(value or "").strip().upper()
+    try:
+        return SignalType[token]
+    except KeyError:
+        return None
+
+
+def _signal_strength_from_token(value: Any) -> SignalStrength:
+    token = str(value or "").strip().lower()
+    return {
+        SignalStrength.STRONG.value: SignalStrength.STRONG,
+        SignalStrength.MODERATE.value: SignalStrength.MODERATE,
+        SignalStrength.WEAK.value: SignalStrength.WEAK,
+    }.get(token, SignalStrength.WEAK)
+
+
+def _build_signal_from_payload(
+    strategy_name: str,
+    symbol: str,
+    payload: dict[str, Any] | None,
+) -> Signal | None:
+    if not isinstance(payload, dict):
+        return None
+    signal_type = _signal_type_from_token(payload.get("signal_type"))
+    if signal_type is None or signal_type == SignalType.HOLD:
+        return None
+    timestamp = pd.to_datetime(payload.get("timestamp"), errors="coerce")
+    if pd.isna(timestamp):
+        ts_value = datetime.now(tz=timezone.utc)
+    else:
+        ts_value = timestamp.to_pydatetime()
+    return Signal(
+        timestamp=ts_value,
+        symbol=symbol,
+        signal_type=signal_type,
+        strength=_signal_strength_from_token(payload.get("strength")),
+        price=float(payload.get("price") or 0.0) or None,
+        stop_loss=float(payload.get("stop_loss") or 0.0) or None,
+        target=float(payload.get("target") or 0.0) or None,
+        strategy_name=strategy_name,
+        metadata=dict(payload.get("metadata") or {}),
+    )
+
+
+async def _enrich_latest_signal_payload(
+    *,
+    agent: Any,
+    symbol: str,
+    timeframe: str,
+    frame: pd.DataFrame,
+    strategy_name: str,
+    latest_signal_payload: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, Signal | None]:
+    signal = _build_signal_from_payload(strategy_name, symbol, latest_signal_payload)
+    if signal is None or latest_signal_payload is None:
+        return latest_signal_payload, None
+
+    market = agent._symbol_market(symbol)
+    regime_meta = agent._market_regime_profile(frame, market)
+    confirmed, reference_meta = await agent._confirm_reference_timeframes(
+        symbol=symbol,
+        signal_type=signal.signal_type,
+        live_only=True,
+    )
+    benchmark_context = await agent._benchmark_alignment_profile(
+        symbol=symbol,
+        signal_type=signal.signal_type,
+        execution_timeframe=timeframe,
+        execution_frame=frame,
+        live_only=True,
+    )
+    risk_reward_profile = agent._signal_risk_reward_profile(signal)
+    recent_trade_memory = agent._recent_trade_outcome_policy(symbol, strategy_name)
+
+    signal.metadata.update({
+        "execution_timeframe": timeframe,
+        "reference_timeframe_bias": reference_meta,
+        "market_regime": regime_meta,
+        "benchmark_context": benchmark_context,
+        "risk_reward_profile": risk_reward_profile,
+        "recent_trade_memory": {
+            key: value
+            for key, value in recent_trade_memory.items()
+            if key != "min_strength_enum"
+        },
+    })
+
+    priority_score = agent._signal_priority_score(
+        strategy_name,
+        signal,
+        timeframe,
+        regime_meta,
+    )
+    priority_threshold = agent._trade_priority_threshold(
+        market,
+        timeframe,
+        regime_meta,
+    )
+    learning_policy = agent._learning_signal_policy(
+        strategy_name,
+        market,
+        timeframe,
+        signal,
+    )
+
+    signal.metadata.update({
+        "trade_priority_base_score": round(priority_score, 2),
+        "trade_priority_score": round(priority_score, 2),
+        "trade_priority_threshold": round(priority_threshold, 2),
+        "learning_priority_delta": float(learning_policy["priority_delta"]),
+        "learning_priority_threshold": round(priority_threshold + float(learning_policy["priority_delta"]), 2),
+        "learning_min_strength": str(learning_policy["min_strength"]),
+        "learning_profile": learning_policy["learning_profile"],
+        "decision_intelligence": {
+            "reference_confirmed": bool(confirmed),
+            "reference_confidence_pct": round(float(reference_meta.get("confidence_pct", 0.0) or 0.0), 2),
+            "benchmark_alignment": benchmark_context.get("alignment"),
+            "benchmark_score": round(float(benchmark_context.get("score", 0.0) or 0.0), 2),
+            "risk_reward_ratio": round(float(risk_reward_profile.get("ratio", 0.0) or 0.0), 4),
+            "priority_score": round(priority_score, 2),
+            "priority_threshold": round(priority_threshold, 2),
+            "learning_priority_threshold": round(
+                priority_threshold + float(learning_policy["priority_delta"]),
+                2,
+            ),
+        },
+    })
+    latest_signal_payload["metadata"] = _json_safe(signal.metadata)
+    return latest_signal_payload, signal
+
+
+def _apply_inspector_consensus(agent: Any, symbol: str, strategy_details: list[dict[str, Any]]) -> None:
+    candidates: list[dict[str, Any]] = []
+    for detail in strategy_details:
+        latest_signal_payload = detail.get("latest_signal")
+        signal = _build_signal_from_payload(
+            str(detail.get("name") or ""),
+            symbol,
+            latest_signal_payload if isinstance(latest_signal_payload, dict) else None,
+        )
+        if signal is None or signal.signal_type not in {SignalType.BUY, SignalType.SELL}:
+            continue
+        if isinstance(latest_signal_payload, dict):
+            signal.metadata = dict(latest_signal_payload.get("metadata") or {})
+        candidates.append({
+            "signal": signal,
+            "strategy": str(detail.get("name") or ""),
+            "timeframe": str(detail.get("timeframe") or ""),
+            "priority_score": float(signal.metadata.get("trade_priority_score", 0.0) or 0.0),
+            "detail": detail,
+        })
+
+    if not candidates:
+        return
+
+    agent._apply_candidate_consensus(candidates)
+    for candidate in candidates:
+        detail = candidate["detail"]
+        latest_signal_payload = detail.get("latest_signal")
+        if not isinstance(latest_signal_payload, dict):
+            continue
+        latest_signal_payload["metadata"] = _json_safe(candidate["signal"].metadata)
 
 
 def _serialize_signal(signal: Any, frame: pd.DataFrame) -> dict[str, Any]:
@@ -929,6 +1108,14 @@ async def _build_strategy_inspection(
                 )
                 metadata["options_analytics"] = options_analytics
                 metadata["selected_option_candidate"] = selected_side
+        latest_signal_payload, _ = await _enrich_latest_signal_payload(
+            agent=agent,
+            symbol=symbol,
+            timeframe=timeframe,
+            frame=frame,
+            strategy_name=strategy_name,
+            latest_signal_payload=latest_signal_payload,
+        )
         indicator_snapshot = _strategy_indicator_snapshot(strategy, frame, latest_signal_payload)
     except Exception as exc:
         error = str(exc)
@@ -1346,6 +1533,7 @@ async def get_agent_inspector(
         )
         for name in selected_strategies
     ]
+    _apply_inspector_consensus(agent, selected_symbol, strategy_details)
 
     return {
         "symbol": selected_symbol,

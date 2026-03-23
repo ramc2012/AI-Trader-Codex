@@ -74,6 +74,30 @@ def _frame_with_end(end: datetime, minutes: int = 3, bars: int = 20, price: floa
     return pd.DataFrame(rows)
 
 
+def _recent_frame_from_prices(
+    prices: list[float],
+    *,
+    minutes: int,
+    symbol: str,
+) -> pd.DataFrame:
+    rows = []
+    end = datetime.now(tz=IST).replace(second=0, microsecond=0)
+    for index, price in enumerate(prices):
+        ts = end - timedelta(minutes=minutes * (len(prices) - index - 1))
+        rows.append(
+            {
+                "timestamp": ts,
+                "open": price,
+                "high": price * 1.002,
+                "low": price * 0.998,
+                "close": price,
+                "volume": 1000 + index,
+                "symbol": symbol,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def test_active_symbols_when_nse_closed_and_us_open() -> None:
     agent = _build_agent(
         AgentConfig(
@@ -134,6 +158,191 @@ def test_learning_signal_policy_tightens_underperforming_short_term_strategy() -
 
     assert policy["priority_delta"] > 0
     assert policy["min_strength"] == SignalStrength.MODERATE.value
+
+
+@pytest.mark.asyncio
+async def test_confirm_reference_timeframes_prefers_weighted_daily_bias() -> None:
+    agent = _build_agent(AgentConfig(reference_timeframes=["60", "D"]))
+    hourly_frame = _recent_frame_from_prices(
+        [120.0, 119.8, 119.5, 119.2, 118.9, 118.6, 118.4, 118.2],
+        minutes=60,
+        symbol="US:NVDA",
+    )
+    daily_frame = _recent_frame_from_prices(
+        [100.0 + (index * 1.8) for index in range(24)],
+        minutes=24 * 60,
+        symbol="US:NVDA",
+    )
+
+    async def _fake_fetch(symbol: str, timeframe: str, live_only: bool = False):  # noqa: ARG001
+        if symbol == "US:NVDA" and timeframe == "60":
+            return hourly_frame
+        if symbol == "US:NVDA" and timeframe == "D":
+            return daily_frame
+        raise AssertionError(f"unexpected fetch: {symbol} {timeframe}")
+
+    agent._fetch_market_data = AsyncMock(side_effect=_fake_fetch)
+
+    confirmed, meta = await agent._confirm_reference_timeframes("US:NVDA", SignalType.BUY, live_only=True)
+
+    assert confirmed is True
+    assert meta["bullish_votes"] == 1
+    assert meta["bearish_votes"] == 1
+    assert meta["weighted_bullish_votes"] > meta["weighted_bearish_votes"]
+
+
+@pytest.mark.asyncio
+async def test_benchmark_alignment_profile_rewards_relative_strength() -> None:
+    agent = _build_agent(AgentConfig())
+    execution_frame = _recent_frame_from_prices(
+        [200.0 + index for index in range(20)],
+        minutes=15,
+        symbol="US:NVDA",
+    )
+    symbol_daily = _recent_frame_from_prices(
+        [100.0 + (index * 2.0) for index in range(30)],
+        minutes=24 * 60,
+        symbol="US:NVDA",
+    )
+    benchmark_daily = _recent_frame_from_prices(
+        [100.0 + (index * 0.5) for index in range(30)],
+        minutes=24 * 60,
+        symbol="US:SPY",
+    )
+
+    async def _fake_fetch(symbol: str, timeframe: str, live_only: bool = False):  # noqa: ARG001
+        if symbol == "US:NVDA" and timeframe == "D":
+            return symbol_daily
+        if symbol == "US:SPY" and timeframe == "D":
+            return benchmark_daily
+        raise AssertionError(f"unexpected fetch: {symbol} {timeframe}")
+
+    agent._fetch_market_data = AsyncMock(side_effect=_fake_fetch)
+
+    profile = await agent._benchmark_alignment_profile(
+        symbol="US:NVDA",
+        signal_type=SignalType.BUY,
+        execution_timeframe="15",
+        execution_frame=execution_frame,
+        live_only=True,
+    )
+
+    assert profile["available"] is True
+    assert profile["alignment"] == "aligned"
+    assert profile["relative_strength_20d"] > 0
+    assert profile["score"] > 0
+
+
+def test_recent_trade_outcome_policy_penalizes_fresh_option_loss_streak() -> None:
+    agent = _build_agent(AgentConfig())
+    agent.position_manager.get_closed_trades.return_value = [
+        {
+            "symbol": "NSE:NIFTY26MAR22500CE",
+            "strategy_tag": "EMA_Crossover",
+            "pnl": -2500.0,
+            "quantity": 25,
+            "entry_price": 200.0,
+            "closed_at": datetime.now(tz=IST) - timedelta(minutes=90),
+        },
+        {
+            "symbol": "NSE:NIFTY26MAR22400PE",
+            "strategy_tag": "EMA_Crossover",
+            "pnl": -1500.0,
+            "quantity": 25,
+            "entry_price": 180.0,
+            "closed_at": datetime.now(tz=IST) - timedelta(minutes=30),
+        },
+    ]
+
+    recent_policy = agent._recent_trade_outcome_policy("NSE:NIFTY50-INDEX", "EMA_Crossover")
+    signal = Signal(
+        timestamp=datetime.now(tz=IST),
+        symbol="NSE:NIFTY50-INDEX",
+        signal_type=SignalType.BUY,
+        strength=SignalStrength.MODERATE,
+        price=100.0,
+        stop_loss=95.0,
+        target=110.0,
+        strategy_name="EMA_Crossover",
+        metadata={"recent_trade_memory": recent_policy},
+    )
+    learning_policy = agent._learning_signal_policy("EMA_Crossover", "NSE", "5", signal)
+
+    assert recent_policy["symbol_identity"] == "NSE:NIFTY"
+    assert recent_policy["loss_streak"] == 2
+    assert recent_policy["priority_delta"] >= 6.0
+    assert learning_policy["min_strength"] == SignalStrength.STRONG.value
+
+
+def test_apply_candidate_consensus_rewards_support_and_penalizes_conflict() -> None:
+    agent = _build_agent(AgentConfig())
+    buy_primary = Signal(
+        timestamp=datetime.now(tz=IST),
+        symbol="CRYPTO:BTCUSDT",
+        signal_type=SignalType.BUY,
+        strength=SignalStrength.MODERATE,
+        price=100.0,
+        strategy_name="EMA_Crossover",
+        metadata={},
+    )
+    buy_secondary = Signal(
+        timestamp=datetime.now(tz=IST),
+        symbol="CRYPTO:BTCUSDT",
+        signal_type=SignalType.BUY,
+        strength=SignalStrength.MODERATE,
+        price=100.0,
+        strategy_name="RSI_Reversal",
+        metadata={},
+    )
+    sell_conflict = Signal(
+        timestamp=datetime.now(tz=IST),
+        symbol="CRYPTO:BTCUSDT",
+        signal_type=SignalType.SELL,
+        strength=SignalStrength.MODERATE,
+        price=100.0,
+        strategy_name="Supertrend_Breakout",
+        metadata={},
+    )
+    candidates = [
+        {"signal": buy_primary, "strategy": "EMA_Crossover", "timeframe": "15", "priority_score": 60.0},
+        {"signal": buy_secondary, "strategy": "RSI_Reversal", "timeframe": "5", "priority_score": 61.0},
+        {"signal": sell_conflict, "strategy": "Supertrend_Breakout", "timeframe": "15", "priority_score": 60.0},
+    ]
+
+    agent._apply_candidate_consensus(candidates)
+
+    assert candidates[0]["priority_score"] > 60.0
+    assert candidates[1]["priority_score"] > 61.0
+    assert candidates[2]["priority_score"] < 60.0
+    assert buy_primary.metadata["consensus_context"]["supporting_candidates"] == 1
+    assert sell_conflict.metadata["consensus_context"]["opposing_candidates"] == 2
+
+
+def test_market_condition_size_multiplier_uses_execution_risk_reward_profile() -> None:
+    agent = _build_agent(AgentConfig())
+    high_rr_signal = Signal(
+        timestamp=datetime.now(tz=IST),
+        symbol="US:NVDA",
+        signal_type=SignalType.BUY,
+        strength=SignalStrength.MODERATE,
+        price=100.0,
+        strategy_name="EMA_Crossover",
+        metadata={"execution_risk_reward_profile": {"valid": True, "ratio": 2.4}},
+    )
+    low_rr_signal = Signal(
+        timestamp=datetime.now(tz=IST),
+        symbol="US:NVDA",
+        signal_type=SignalType.BUY,
+        strength=SignalStrength.MODERATE,
+        price=100.0,
+        strategy_name="EMA_Crossover",
+        metadata={"execution_risk_reward_profile": {"valid": True, "ratio": 0.9}},
+    )
+
+    high_rr = agent._market_condition_size_multiplier(high_rr_signal, "15")
+    low_rr = agent._market_condition_size_multiplier(low_rr_signal, "15")
+
+    assert high_rr > low_rr
 
 
 def test_us_positions_force_eod_exit_near_close() -> None:

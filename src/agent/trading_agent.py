@@ -3445,6 +3445,8 @@ class TradingAgent:
         symbol_market = self._symbol_market(symbol)
         timeframe_frames: Dict[str, pd.DataFrame] = {}
         candidate_signals: List[Dict[str, Any]] = []
+        benchmark_context_cache: Dict[str, Dict[str, Any]] = {}
+        recent_trade_policy_cache: Dict[str, Dict[str, Any]] = {}
 
         if emit_verbose_events:
             await self.event_bus.emit(AgentEvent(
@@ -3634,6 +3636,53 @@ class TradingAgent:
                         "reference_timeframe_bias": reference_meta,
                         "market_regime": regime_meta,
                     })
+                    risk_reward_profile = self._signal_risk_reward_profile(signal)
+                    signal.metadata["risk_reward_profile"] = risk_reward_profile
+                    if (
+                        risk_reward_profile.get("valid")
+                        and float(risk_reward_profile.get("ratio", 0.0) or 0.0) < 0.85
+                        and not signal.metadata.get("bootstrap_exploration")
+                    ):
+                        if emit_verbose_events:
+                            await self.event_bus.emit(AgentEvent(
+                                event_type=AgentEventType.NO_SIGNAL,
+                                title=f"{strat_name}: Risk/Reward Filtered",
+                                message=(
+                                    f"{strat_name} on {tf_label} was skipped because the setup only offers "
+                                    f"{float(risk_reward_profile.get('ratio', 0.0) or 0.0):.2f}R."
+                                ),
+                                severity="info",
+                                metadata={
+                                    "symbol": symbol,
+                                    "strategy": strat_name,
+                                    "timeframe": timeframe,
+                                    "risk_reward_profile": risk_reward_profile,
+                                },
+                            ))
+                        continue
+
+                    benchmark_cache_key = f"{timeframe}:{signal.signal_type.value}"
+                    benchmark_context = benchmark_context_cache.get(benchmark_cache_key)
+                    if benchmark_context is None:
+                        benchmark_context = await self._benchmark_alignment_profile(
+                            symbol=symbol,
+                            signal_type=signal.signal_type,
+                            execution_timeframe=timeframe,
+                            execution_frame=df,
+                            live_only=live_only,
+                        )
+                        benchmark_context_cache[benchmark_cache_key] = benchmark_context
+                    signal.metadata["benchmark_context"] = benchmark_context
+
+                    recent_trade_policy = recent_trade_policy_cache.get(strat_name)
+                    if recent_trade_policy is None:
+                        recent_trade_policy = self._recent_trade_outcome_policy(symbol, strat_name)
+                        recent_trade_policy_cache[strat_name] = recent_trade_policy
+                    signal.metadata["recent_trade_memory"] = {
+                        key: value
+                        for key, value in recent_trade_policy.items()
+                        if key != "min_strength_enum"
+                    }
 
                     priority_score = self._signal_priority_score(
                         strat_name,
@@ -3655,6 +3704,7 @@ class TradingAgent:
                     signal.metadata.setdefault("learning_profile", learning_policy["learning_profile"])
                     signal.metadata["learning_priority_delta"] = float(learning_policy["priority_delta"])
                     signal.metadata["learning_min_strength"] = str(learning_policy["min_strength"])
+                    signal.metadata["trade_priority_base_score"] = round(priority_score, 2)
                     effective_priority_threshold = priority_threshold + float(learning_policy["priority_delta"])
                     signal.metadata["trade_priority_score"] = round(priority_score, 2)
                     signal.metadata["trade_priority_threshold"] = round(priority_threshold, 2)
@@ -3718,6 +3768,11 @@ class TradingAgent:
                     )
 
         if candidate_signals:
+            self._apply_candidate_consensus(candidate_signals)
+            for candidate in candidate_signals:
+                signal_meta = candidate["signal"].metadata if isinstance(candidate["signal"].metadata, dict) else None
+                if signal_meta is not None:
+                    signal_meta["trade_priority_score"] = round(float(candidate["priority_score"]), 2)
             candidate_signals.sort(
                 key=lambda item: (
                     float(item["priority_score"]),
@@ -3819,6 +3874,8 @@ class TradingAgent:
             reference_timeframes = self.get_reference_timeframes()
             bullish_votes = 0
             bearish_votes = 0
+            weighted_bullish = 0.0
+            weighted_bearish = 0.0
             references: Dict[str, Any] = {}
 
             for timeframe in reference_timeframes:
@@ -3834,50 +3891,62 @@ class TradingAgent:
                     }
                     continue
 
-                trend, close, ema = self._infer_trend(df)
+                trend_profile = self._trend_strength_profile(df, timeframe)
+                trend = str(trend_profile["trend"])
+                weighted_score = float(trend_profile["weighted_score"])
                 references[timeframe] = {
-                    "trend": trend,
-                    "close": round(close, 2),
-                    "ema20": round(ema, 2),
+                    **trend_profile,
                 }
 
                 if trend == "bullish":
                     bullish_votes += 1
+                    weighted_bullish += weighted_score
                 elif trend == "bearish":
                     bearish_votes += 1
+                    weighted_bearish += weighted_score
 
             # If reference data is missing entirely, avoid blind execution.
-            total_votes = bullish_votes + bearish_votes
+            total_weight = weighted_bullish + weighted_bearish
             dominant_trend = "neutral"
-            if bullish_votes > bearish_votes:
+            if weighted_bullish > weighted_bearish:
+                dominant_trend = "bullish"
+            elif weighted_bearish > weighted_bullish:
+                dominant_trend = "bearish"
+            elif bullish_votes > bearish_votes:
                 dominant_trend = "bullish"
             elif bearish_votes > bullish_votes:
                 dominant_trend = "bearish"
-            confidence_pct = (max(bullish_votes, bearish_votes) / total_votes * 100.0) if total_votes > 0 else 0.0
+            confidence_pct = (max(weighted_bullish, weighted_bearish) / total_weight * 100.0) if total_weight > 0 else 0.0
 
-            if bullish_votes == 0 and bearish_votes == 0:
+            if weighted_bullish <= 0 and weighted_bearish <= 0:
                 return False, {
                     "timeframes": references,
                     "bullish_votes": bullish_votes,
                     "bearish_votes": bearish_votes,
+                    "weighted_bullish_votes": round(weighted_bullish, 4),
+                    "weighted_bearish_votes": round(weighted_bearish, 4),
+                    "weighted_edge": round(weighted_bullish - weighted_bearish, 4),
                     "dominant_trend": dominant_trend,
                     "confidence_pct": round(confidence_pct, 2),
                     "reason": "no_reference_bias",
                 }
 
             if signal_type == SignalType.BUY:
-                confirmed = bullish_votes > bearish_votes
+                confirmed = weighted_bullish > weighted_bearish and confidence_pct >= 52.0
                 if not confirmed and self._is_bootstrap_phase():
-                    confirmed = bullish_votes > 0 and bullish_votes >= bearish_votes
+                    confirmed = weighted_bullish > 0 and weighted_bullish >= (weighted_bearish * 0.95)
             else:
-                confirmed = bearish_votes > bullish_votes
+                confirmed = weighted_bearish > weighted_bullish and confidence_pct >= 52.0
                 if not confirmed and self._is_bootstrap_phase():
-                    confirmed = bearish_votes > 0 and bearish_votes >= bullish_votes
+                    confirmed = weighted_bearish > 0 and weighted_bearish >= (weighted_bullish * 0.95)
 
             return confirmed, {
                 "timeframes": references,
                 "bullish_votes": bullish_votes,
                 "bearish_votes": bearish_votes,
+                "weighted_bullish_votes": round(weighted_bullish, 4),
+                "weighted_bearish_votes": round(weighted_bearish, 4),
+                "weighted_edge": round(weighted_bullish - weighted_bearish, 4),
                 "dominant_trend": dominant_trend,
                 "confidence_pct": round(confidence_pct, 2),
                 "signal": signal_type.value,
@@ -4374,6 +4443,35 @@ class TradingAgent:
             else:
                 target_price = entry_price * 0.99
 
+        execution_rr_profile = self._signal_risk_reward_profile(
+            signal,
+            entry_price=entry_price,
+            stop_loss=sl_price,
+            target=target_price,
+        )
+        signal.metadata["execution_risk_reward_profile"] = execution_rr_profile
+        if (
+            execution_rr_profile.get("valid")
+            and float(execution_rr_profile.get("ratio", 0.0) or 0.0) < 0.8
+            and not signal.metadata.get("bootstrap_exploration")
+        ):
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.ORDER_REJECTED,
+                title=f"Order Rejected — {short_name}",
+                message=(
+                    f"Execution geometry is too weak at {float(execution_rr_profile.get('ratio', 0.0) or 0.0):.2f}R. "
+                    "Waiting for a cleaner setup."
+                ),
+                severity="warning",
+                metadata={
+                    "symbol": execution_symbol,
+                    "underlying_symbol": underlying_symbol,
+                    "strategy": strat_name,
+                    "execution_risk_reward_profile": execution_rr_profile,
+                },
+            ))
+            return
+
         await self.event_bus.emit(AgentEvent(
             event_type=AgentEventType.SIGNAL_GENERATED,
             title=f"{signal.signal_type.value} Signal — {short_name}",
@@ -4401,6 +4499,8 @@ class TradingAgent:
                 "planned_holding_days": planned_holding_days,
                 "allow_overnight": allow_overnight,
                 "reference": reference_meta,
+                "benchmark_context": signal.metadata.get("benchmark_context"),
+                "execution_risk_reward_profile": execution_rr_profile,
                 "option_contract": (
                     {
                         "symbol": option_contract.option_symbol,
@@ -5421,6 +5521,394 @@ class TradingAgent:
         }
 
     @staticmethod
+    def _reference_timeframe_weight(timeframe: str) -> float:
+        token = str(timeframe or "").strip().upper()
+        if token == "D":
+            return 2.4
+        if token == "W":
+            return 3.2
+        if token == "60":
+            return 1.35
+        if token == "30":
+            return 1.1
+        if token.isdigit():
+            minutes = max(int(token), 1)
+            return max(0.8, min(minutes / 45.0, 1.2))
+        return 1.0
+
+    def _trend_strength_profile(self, df: pd.DataFrame, timeframe: str) -> Dict[str, Any]:
+        trend, close, ema_now = self._infer_trend(df)
+        closes = pd.to_numeric(df.get("close"), errors="coerce").dropna()
+        if closes.empty:
+            return {
+                "trend": trend,
+                "close": round(close, 2),
+                "ema20": round(ema_now, 2),
+                "ema_slope_pct": 0.0,
+                "ema_distance_pct": 0.0,
+                "quality": 0.0,
+                "weight": round(self._reference_timeframe_weight(timeframe), 4),
+                "weighted_score": 0.0,
+            }
+
+        ema_series = closes.ewm(span=20, adjust=False).mean()
+        ema_prev = float(ema_series.iloc[-3]) if len(ema_series) >= 3 else float(ema_series.iloc[0])
+        slope_pct = abs(float(ema_now) - ema_prev) / max(abs(float(ema_now)), 1e-6)
+        distance_pct = abs(float(close) - float(ema_now)) / max(abs(float(close)), 1e-6)
+        quality = min(max((slope_pct * 900.0) + (distance_pct * 450.0), 0.35), 1.65)
+        if trend == "neutral":
+            quality *= 0.45
+        weight = self._reference_timeframe_weight(timeframe)
+        return {
+            "trend": trend,
+            "close": round(close, 2),
+            "ema20": round(ema_now, 2),
+            "ema_slope_pct": round(slope_pct, 5),
+            "ema_distance_pct": round(distance_pct, 5),
+            "quality": round(quality, 4),
+            "weight": round(weight, 4),
+            "weighted_score": round(weight * quality, 4),
+        }
+
+    def _benchmark_symbol_for(self, symbol: str) -> str | None:
+        token = str(symbol or "").strip().upper()
+        if not token:
+            return None
+        market = self._symbol_market(token)
+        if market == "NSE":
+            return None if token == NIFTY_SYMBOL else NIFTY_SYMBOL
+        if market == "US":
+            benchmark = US_SWING_BENCHMARK_SYMBOL
+            return None if self._normalize_us_ticker(token) == self._normalize_us_ticker(benchmark) else benchmark
+        if market == "CRYPTO":
+            benchmark = CRYPTO_SWING_BENCHMARK_SYMBOL
+            return None if self._normalize_crypto_pair(token) == self._normalize_crypto_pair(benchmark) else benchmark
+        return None
+
+    @staticmethod
+    def _frame_return(frame: pd.DataFrame, lookback: int) -> float:
+        closes = pd.to_numeric(frame.get("close"), errors="coerce").dropna()
+        if len(closes) < 2:
+            return 0.0
+        span = min(max(int(lookback), 1), len(closes) - 1)
+        start = float(closes.iloc[-1 - span])
+        end = float(closes.iloc[-1])
+        if start == 0:
+            return 0.0
+        return (end / start) - 1.0
+
+    async def _benchmark_alignment_profile(
+        self,
+        *,
+        symbol: str,
+        signal_type: SignalType,
+        execution_timeframe: str,
+        execution_frame: pd.DataFrame | None,
+        live_only: bool = False,
+    ) -> Dict[str, Any]:
+        benchmark_symbol = self._benchmark_symbol_for(symbol)
+        if not benchmark_symbol:
+            return {
+                "available": False,
+                "reason": "self_benchmark",
+                "benchmark_symbol": None,
+                "score": 0.0,
+            }
+
+        symbol_daily = await self._fetch_market_data(symbol, timeframe="D", live_only=live_only)
+        benchmark_daily = await self._fetch_market_data(benchmark_symbol, timeframe="D", live_only=live_only)
+        if (
+            symbol_daily is None
+            or symbol_daily.empty
+            or benchmark_daily is None
+            or benchmark_daily.empty
+        ):
+            return {
+                "available": False,
+                "reason": "missing_daily_context",
+                "benchmark_symbol": benchmark_symbol,
+                "score": 0.0,
+            }
+
+        symbol_trend, _, _ = self._infer_trend(symbol_daily)
+        benchmark_trend, _, _ = self._infer_trend(benchmark_daily)
+        execution_trend = (
+            self._infer_trend(execution_frame)[0]
+            if execution_frame is not None and not execution_frame.empty
+            else symbol_trend
+        )
+        symbol_return_20d = self._frame_return(symbol_daily, 20)
+        benchmark_return_20d = self._frame_return(benchmark_daily, 20)
+        relative_strength_20d = symbol_return_20d - benchmark_return_20d
+
+        score = 0.0
+        if signal_type == SignalType.BUY:
+            if benchmark_trend == "bullish":
+                score += 3.0
+            elif benchmark_trend == "bearish":
+                score -= 4.0
+            if symbol_trend == "bullish":
+                score += 2.0
+            elif symbol_trend == "bearish":
+                score -= 2.5
+            if execution_trend == "bullish":
+                score += 1.0
+            elif execution_trend == "bearish":
+                score -= 1.0
+            if relative_strength_20d >= 0.02:
+                score += 3.0
+            elif relative_strength_20d >= 0.008:
+                score += 1.5
+            elif relative_strength_20d <= -0.02:
+                score -= 4.0
+            elif relative_strength_20d <= -0.008:
+                score -= 2.0
+        else:
+            if benchmark_trend == "bearish":
+                score += 3.0
+            elif benchmark_trend == "bullish":
+                score -= 3.5
+            if symbol_trend == "bearish":
+                score += 2.0
+            elif symbol_trend == "bullish":
+                score -= 2.5
+            if execution_trend == "bearish":
+                score += 1.0
+            elif execution_trend == "bullish":
+                score -= 1.0
+            if relative_strength_20d <= -0.02:
+                score += 3.5
+            elif relative_strength_20d <= -0.008:
+                score += 1.5
+            elif relative_strength_20d >= 0.02:
+                score -= 4.0
+            elif relative_strength_20d >= 0.008:
+                score -= 2.0
+
+        alignment = "mixed"
+        if score >= 3.0:
+            alignment = "aligned"
+        elif score <= -3.0:
+            alignment = "divergent"
+
+        return {
+            "available": True,
+            "reason": "ok",
+            "benchmark_symbol": benchmark_symbol,
+            "execution_timeframe": execution_timeframe,
+            "symbol_trend": symbol_trend,
+            "execution_trend": execution_trend,
+            "benchmark_trend": benchmark_trend,
+            "symbol_return_20d": round(symbol_return_20d, 4),
+            "benchmark_return_20d": round(benchmark_return_20d, 4),
+            "relative_strength_20d": round(relative_strength_20d, 4),
+            "alignment": alignment,
+            "score": round(max(min(score, 8.0), -8.0), 2),
+        }
+
+    @staticmethod
+    def _signal_risk_reward_profile(
+        signal: Signal,
+        *,
+        entry_price: float | None = None,
+        stop_loss: float | None = None,
+        target: float | None = None,
+    ) -> Dict[str, Any]:
+        entry = float(entry_price if entry_price is not None else (signal.price or 0.0) or 0.0)
+        stop = float(stop_loss if stop_loss is not None else (signal.stop_loss or 0.0) or 0.0)
+        target_value = float(target if target is not None else (signal.target or 0.0) or 0.0)
+        if entry <= 0 or stop <= 0 or target_value <= 0:
+            return {
+                "valid": False,
+                "ratio": 0.0,
+                "risk_pct": 0.0,
+                "reward_pct": 0.0,
+                "quality_score": 0.0,
+            }
+
+        if signal.signal_type == SignalType.BUY:
+            risk = entry - stop
+            reward = target_value - entry
+        else:
+            risk = stop - entry
+            reward = entry - target_value
+
+        if risk <= 0 or reward <= 0:
+            return {
+                "valid": False,
+                "ratio": 0.0,
+                "risk_pct": 0.0,
+                "reward_pct": 0.0,
+                "quality_score": -10.0,
+            }
+
+        ratio = reward / max(risk, 1e-6)
+        risk_pct = risk / max(abs(entry), 1e-6)
+        reward_pct = reward / max(abs(entry), 1e-6)
+        if ratio >= 2.4:
+            quality_score = 6.0
+        elif ratio >= 1.8:
+            quality_score = 4.0
+        elif ratio >= 1.25:
+            quality_score = 1.5
+        elif ratio >= 0.9:
+            quality_score = -2.0
+        else:
+            quality_score = -7.0
+        if risk_pct >= 0.05:
+            quality_score -= 1.0
+
+        return {
+            "valid": True,
+            "ratio": round(ratio, 4),
+            "risk_pct": round(risk_pct, 4),
+            "reward_pct": round(reward_pct, 4),
+            "quality_score": round(quality_score, 2),
+        }
+
+    def _symbol_trade_identity(self, symbol: str) -> str:
+        token = str(symbol or "").strip().upper()
+        if not token:
+            return ""
+        market = self._symbol_market(token)
+        if market == "NSE":
+            raw = token.split(":", 1)[-1]
+            if raw.endswith(("CE", "PE")) and any(ch.isdigit() for ch in raw):
+                match = re.match(r"^([A-Z&]+)", raw)
+                if match is not None:
+                    return f"NSE:{match.group(1)}"
+            root = self._normalize_nse_underlying_root(token)
+            return f"NSE:{root}" if root else f"NSE:{raw}"
+        if market == "US":
+            raw = self._normalize_us_ticker(token)
+            parsed = self._parse_us_option_symbol(raw)
+            base = parsed["root"] if parsed is not None else raw
+            return f"US:{base}"
+        if market == "CRYPTO":
+            return f"CRYPTO:{self._normalize_crypto_pair(token)}"
+        return token
+
+    def _recent_trade_outcome_policy(self, symbol: str, strategy: str) -> Dict[str, Any]:
+        identity = self._symbol_trade_identity(symbol)
+        strategy_key = self._normalize_strategy_tag(strategy)
+        matched: List[Dict[str, Any]] = []
+        for trade in reversed(self.position_manager.get_closed_trades()):
+            if self._normalize_strategy_tag(trade.get("strategy_tag")) != strategy_key:
+                continue
+            if self._symbol_trade_identity(str(trade.get("symbol") or "")) != identity:
+                continue
+            quantity = max(int(trade.get("quantity") or 0), 0)
+            entry_price = float(trade.get("entry_price") or 0.0)
+            pnl = float(trade.get("pnl") or 0.0)
+            basis = entry_price * max(quantity, 1)
+            pnl_pct = (pnl / basis) * 100.0 if basis > 0 else 0.0
+            matched.append(
+                {
+                    "pnl_pct": pnl_pct,
+                    "closed_at": self._coerce_ist_timestamp(trade.get("closed_at")),
+                }
+            )
+            if len(matched) >= 6:
+                break
+
+        priority_delta = 0.0
+        min_strength = SignalStrength.WEAK
+        wins = sum(1 for trade in matched if float(trade["pnl_pct"]) > 0)
+        losses = sum(1 for trade in matched if float(trade["pnl_pct"]) < 0)
+        avg_pnl_pct = (
+            sum(float(trade["pnl_pct"]) for trade in matched) / len(matched)
+            if matched
+            else 0.0
+        )
+        loss_streak = 0
+        for trade in matched:
+            if float(trade["pnl_pct"]) < 0:
+                loss_streak += 1
+                continue
+            break
+
+        last_trade_age_minutes: float | None = None
+        if matched and matched[0]["closed_at"] is not None:
+            last_trade_age_minutes = max(
+                (datetime.now(tz=IST) - matched[0]["closed_at"]).total_seconds() / 60.0,
+                0.0,
+            )
+
+        if loss_streak >= 2 and (last_trade_age_minutes is None or last_trade_age_minutes <= 720):
+            priority_delta += 8.0 if (last_trade_age_minutes is None or last_trade_age_minutes <= 180) else 6.0
+            min_strength = SignalStrength.STRONG if (last_trade_age_minutes is None or last_trade_age_minutes <= 180) else SignalStrength.MODERATE
+        elif losses >= 2 and avg_pnl_pct <= -0.6:
+            priority_delta += 4.5
+            min_strength = SignalStrength.MODERATE
+        elif wins >= 2 and avg_pnl_pct >= 0.8:
+            priority_delta -= 3.0
+        elif matched and float(matched[0]["pnl_pct"]) >= 1.5:
+            priority_delta -= 1.5
+
+        return {
+            "symbol_identity": identity,
+            "trade_count": len(matched),
+            "wins": wins,
+            "losses": losses,
+            "loss_streak": loss_streak,
+            "avg_pnl_pct": round(avg_pnl_pct, 3),
+            "last_trade_age_minutes": (
+                round(last_trade_age_minutes, 2) if last_trade_age_minutes is not None else None
+            ),
+            "priority_delta": round(priority_delta, 2),
+            "min_strength": min_strength.value,
+            "min_strength_enum": min_strength,
+        }
+
+    def _apply_candidate_consensus(self, candidate_signals: List[Dict[str, Any]]) -> None:
+        if len(candidate_signals) <= 1:
+            return
+
+        for candidate in candidate_signals:
+            signal = candidate["signal"]
+            supporting = [
+                other
+                for other in candidate_signals
+                if other is not candidate and other["signal"].signal_type == signal.signal_type
+            ]
+            opposing = [
+                other
+                for other in candidate_signals
+                if other is not candidate and other["signal"].signal_type != signal.signal_type
+            ]
+            supporting_strategies = {str(other["strategy"]) for other in supporting}
+            opposing_strategies = {str(other["strategy"]) for other in opposing}
+            supporting_timeframes = {str(other["timeframe"]) for other in supporting}
+
+            consensus_bonus = 0.0
+            if supporting:
+                consensus_bonus += 2.0
+            if supporting_strategies:
+                consensus_bonus += min(len(supporting_strategies) * 1.75, 3.5)
+            if supporting_timeframes and len(supporting_timeframes) >= 2:
+                consensus_bonus += 1.5
+            conflict_penalty = min(len(opposing_strategies) * 2.5, 6.0)
+            net_consensus = consensus_bonus - conflict_penalty
+
+            candidate["priority_score"] = max(
+                0.0,
+                min(float(candidate["priority_score"]) + net_consensus, 100.0),
+            )
+
+            metadata = signal.metadata if isinstance(signal.metadata, dict) else None
+            if metadata is not None:
+                metadata["consensus_context"] = {
+                    "supporting_candidates": len(supporting),
+                    "supporting_strategies": sorted(supporting_strategies),
+                    "supporting_timeframes": sorted(supporting_timeframes),
+                    "opposing_candidates": len(opposing),
+                    "opposing_strategies": sorted(opposing_strategies),
+                    "consensus_bonus": round(consensus_bonus, 2),
+                    "conflict_penalty": round(conflict_penalty, 2),
+                    "net_score": round(net_consensus, 2),
+                }
+
+    @staticmethod
     def _signal_conviction_score(signal: Signal) -> float:
         metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
         for key in ("trade_priority_score", "conviction_score", "conviction"):
@@ -5567,32 +6055,65 @@ class TradingAgent:
         reference_meta = metadata.get("reference_timeframe_bias", {})
         vote_component = 0.0
         if isinstance(reference_meta, dict):
-            bullish_votes = int(reference_meta.get("bullish_votes", 0) or 0)
-            bearish_votes = int(reference_meta.get("bearish_votes", 0) or 0)
-            vote_advantage = (
-                bullish_votes - bearish_votes
-                if signal.signal_type == SignalType.BUY
-                else bearish_votes - bullish_votes
-            )
-            if vote_advantage >= 2:
-                vote_component = 8.0
-            elif vote_advantage == 1:
-                vote_component = 4.0
-            elif vote_advantage < 0:
-                vote_component = -10.0
+            weighted_bullish = float(reference_meta.get("weighted_bullish_votes", 0.0) or 0.0)
+            weighted_bearish = float(reference_meta.get("weighted_bearish_votes", 0.0) or 0.0)
+            confidence_pct = float(reference_meta.get("confidence_pct", 0.0) or 0.0)
+            if weighted_bullish > 0.0 or weighted_bearish > 0.0:
+                weighted_advantage = (
+                    weighted_bullish - weighted_bearish
+                    if signal.signal_type == SignalType.BUY
+                    else weighted_bearish - weighted_bullish
+                )
+                if weighted_advantage >= 1.75:
+                    vote_component = 10.0
+                elif weighted_advantage >= 0.75:
+                    vote_component = 6.0
+                elif weighted_advantage >= 0.2:
+                    vote_component = 3.0
+                elif weighted_advantage < 0:
+                    vote_component = -12.0
+                if confidence_pct >= 78.0:
+                    vote_component += 2.0
+                elif confidence_pct < 55.0:
+                    vote_component -= 2.0
+            else:
+                bullish_votes = int(reference_meta.get("bullish_votes", 0) or 0)
+                bearish_votes = int(reference_meta.get("bearish_votes", 0) or 0)
+                vote_advantage = (
+                    bullish_votes - bearish_votes
+                    if signal.signal_type == SignalType.BUY
+                    else bearish_votes - bullish_votes
+                )
+                if vote_advantage >= 2:
+                    vote_component = 8.0
+                elif vote_advantage == 1:
+                    vote_component = 4.0
+                elif vote_advantage < 0:
+                    vote_component = -10.0
 
         rr_component = 0.0
-        try:
-            adaptive_rr = float(metadata.get("adaptive_risk_reward", 0.0))
-        except (TypeError, ValueError):
-            adaptive_rr = 0.0
-        if adaptive_rr >= 2.5:
-            rr_component = 4.0
-        elif adaptive_rr >= 2.0:
-            rr_component = 2.0
+        rr_meta = metadata.get("execution_risk_reward_profile")
+        if not isinstance(rr_meta, dict):
+            rr_meta = metadata.get("risk_reward_profile", {})
+        if isinstance(rr_meta, dict) and bool(rr_meta.get("valid")):
+            rr_component = float(rr_meta.get("quality_score", 0.0) or 0.0)
+        else:
+            try:
+                adaptive_rr = float(metadata.get("adaptive_risk_reward", 0.0))
+            except (TypeError, ValueError):
+                adaptive_rr = 0.0
+            if adaptive_rr >= 2.5:
+                rr_component = 4.0
+            elif adaptive_rr >= 2.0:
+                rr_component = 2.0
 
         if metadata.get("bootstrap_exploration"):
             rr_component -= 10.0
+
+        benchmark_meta = metadata.get("benchmark_context", {})
+        benchmark_component = 0.0
+        if isinstance(benchmark_meta, dict):
+            benchmark_component = max(min(float(benchmark_meta.get("score", 0.0) or 0.0), 8.0), -8.0)
 
         market_fit_component = self._strategy_market_fit_score(
             strategy,
@@ -5609,6 +6130,7 @@ class TradingAgent:
             + reward_component
             + vote_component
             + rr_component
+            + benchmark_component
             + conviction_meta_bonus
             + market_fit_component
         )
@@ -5643,6 +6165,15 @@ class TradingAgent:
             SignalStrength.STRONG: 3,
         }.get(strength, 0)
 
+    @staticmethod
+    def _signal_strength_from_value(value: Any) -> SignalStrength:
+        token = str(value or "").strip().lower()
+        return {
+            SignalStrength.WEAK.value: SignalStrength.WEAK,
+            SignalStrength.MODERATE.value: SignalStrength.MODERATE,
+            SignalStrength.STRONG.value: SignalStrength.STRONG,
+        }.get(token, SignalStrength.WEAK)
+
     def _learning_signal_policy(
         self,
         strategy: str,
@@ -5673,13 +6204,26 @@ class TradingAgent:
                 priority_delta -= 2.0
 
         metadata = signal.metadata if isinstance(signal.metadata, dict) else {}
+        recent_trade_memory = metadata.get("recent_trade_memory", {})
+        if isinstance(recent_trade_memory, dict):
+            priority_delta += float(recent_trade_memory.get("priority_delta", 0.0) or 0.0)
+            recent_min_strength = self._signal_strength_from_value(recent_trade_memory.get("min_strength"))
+            if self._signal_strength_rank(recent_min_strength) > self._signal_strength_rank(min_strength):
+                min_strength = recent_min_strength
+
         try:
             adaptive_rr = float(metadata.get("adaptive_risk_reward", 0.0) or 0.0)
         except (TypeError, ValueError):
             adaptive_rr = 0.0
-        if adaptive_rr >= 2.5:
+        rr_meta = metadata.get("risk_reward_profile", {})
+        rr_ratio = 0.0
+        if isinstance(rr_meta, dict) and bool(rr_meta.get("valid")):
+            rr_ratio = float(rr_meta.get("ratio", 0.0) or 0.0)
+        elif adaptive_rr > 0.0:
+            rr_ratio = adaptive_rr
+        if rr_ratio >= 2.5:
             priority_delta -= 1.5
-        elif trade_count >= 8 and adaptive_rr > 0.0 and adaptive_rr <= 1.2:
+        elif trade_count >= 8 and rr_ratio > 0.0 and rr_ratio <= 1.2:
             priority_delta += 1.5
 
         return {
@@ -5761,6 +6305,20 @@ class TradingAgent:
             multiplier *= 0.9
         if metadata.get("bootstrap_exploration"):
             multiplier *= 0.7
+
+        rr_meta = metadata.get("execution_risk_reward_profile")
+        if not isinstance(rr_meta, dict):
+            rr_meta = metadata.get("risk_reward_profile", {})
+        if isinstance(rr_meta, dict) and bool(rr_meta.get("valid")):
+            rr_ratio = float(rr_meta.get("ratio", 0.0) or 0.0)
+            if rr_ratio >= 2.2:
+                multiplier *= 1.08
+            elif rr_ratio >= 1.5:
+                multiplier *= 1.03
+            elif rr_ratio > 0 and rr_ratio < 1.0:
+                multiplier *= 0.76
+            elif rr_ratio < 1.25:
+                multiplier *= 0.9
 
         return max(0.35, min(multiplier, 1.75))
 

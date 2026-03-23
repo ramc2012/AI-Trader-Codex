@@ -19,6 +19,31 @@ import { buildInstrumentOptions } from '@/lib/instrument-universe';
 import { cn } from '@/lib/utils';
 import type { AgentInspectorStrategy } from '@/types/api';
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || Array.isArray(value) || typeof value !== 'object') {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function asNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function asBoolean(value: unknown): boolean | null {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  return null;
+}
+
 function formatNumber(value: unknown, digits = 2): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return '—';
@@ -125,6 +150,155 @@ function DataGrid({
   );
 }
 
+function IntelligenceMetric({
+  label,
+  value,
+  hint,
+  tone = 'neutral',
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+  tone?: 'positive' | 'negative' | 'neutral';
+}) {
+  const toneClass =
+    tone === 'positive'
+      ? 'text-emerald-300'
+      : tone === 'negative'
+        ? 'text-rose-300'
+        : 'text-slate-100';
+
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-[0.18em] text-slate-500">{label}</div>
+      <div className={cn('mt-1 font-mono text-sm font-semibold', toneClass)}>{value}</div>
+      {hint ? <div className="mt-1 text-[11px] text-slate-500">{hint}</div> : null}
+    </div>
+  );
+}
+
+function StrategyDecisionPanel({ strategy }: { strategy: AgentInspectorStrategy }) {
+  const latestSignal = strategy.latest_signal;
+  const metadata = asRecord(latestSignal?.metadata);
+  const decision = asRecord(metadata?.decision_intelligence);
+  const referenceBias = asRecord(metadata?.reference_timeframe_bias);
+  const benchmarkContext = asRecord(metadata?.benchmark_context);
+  const consensusContext = asRecord(metadata?.consensus_context);
+  const recentTradeMemory = asRecord(metadata?.recent_trade_memory);
+  const riskRewardProfile = asRecord(metadata?.risk_reward_profile);
+
+  if (!metadata) {
+    return null;
+  }
+
+  const priorityScore =
+    asNumber(decision?.priority_score)
+    ?? asNumber(metadata.trade_priority_score)
+    ?? asNumber(metadata.trade_priority_base_score);
+  const priorityThreshold =
+    asNumber(decision?.learning_priority_threshold)
+    ?? asNumber(metadata.learning_priority_threshold)
+    ?? asNumber(metadata.trade_priority_threshold);
+  const benchmarkScore =
+    asNumber(decision?.benchmark_score)
+    ?? asNumber(benchmarkContext?.score);
+  const benchmarkAlignment = String(
+    benchmarkContext?.alignment
+    ?? decision?.benchmark_alignment
+    ?? 'mixed',
+  );
+  const rrRatio =
+    asNumber(decision?.risk_reward_ratio)
+    ?? asNumber(riskRewardProfile?.ratio);
+  const referenceConfidence =
+    asNumber(decision?.reference_confidence_pct)
+    ?? asNumber(referenceBias?.confidence_pct);
+  const referenceConfirmed = asBoolean(decision?.reference_confirmed);
+  const supportCount = asNumber(consensusContext?.supporting_candidates) ?? 0;
+  const opposeCount = asNumber(consensusContext?.opposing_candidates) ?? 0;
+  const lossStreak = asNumber(recentTradeMemory?.loss_streak);
+  const recentTrades = asNumber(recentTradeMemory?.trade_count);
+  const learningMinStrength = String(metadata.learning_min_strength ?? '—');
+
+  return (
+    <div className="mt-4 space-y-4">
+      <section className="rounded-xl border border-slate-800 bg-slate-950/45 p-4">
+        <div className="mb-3">
+          <h3 className="text-sm font-semibold text-slate-200">Decision Intelligence</h3>
+          <p className="mt-1 text-xs text-slate-500">
+            These overlays come from the agent&apos;s execution filter, not just the raw strategy output.
+          </p>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <IntelligenceMetric
+            label="Priority"
+            value={
+              priorityScore !== null
+                ? `${formatNumber(priorityScore)}${priorityThreshold !== null ? ` / ${formatNumber(priorityThreshold)}` : ''}`
+                : '—'
+            }
+            hint="score / live threshold"
+            tone={
+              priorityScore !== null && priorityThreshold !== null
+                ? priorityScore >= priorityThreshold ? 'positive' : 'negative'
+                : 'neutral'
+            }
+          />
+          <IntelligenceMetric
+            label="Reference"
+            value={referenceConfidence !== null ? `${formatNumber(referenceConfidence)}%` : '—'}
+            hint={referenceConfirmed === null ? 'confirmation unavailable' : referenceConfirmed ? 'confirmed' : 'not confirmed'}
+            tone={referenceConfirmed === null ? 'neutral' : referenceConfirmed ? 'positive' : 'negative'}
+          />
+          <IntelligenceMetric
+            label="Benchmark"
+            value={benchmarkScore !== null ? `${benchmarkAlignment} · ${formatNumber(benchmarkScore)}` : benchmarkAlignment}
+            hint={String(benchmarkContext?.benchmark_symbol ?? 'benchmark unavailable')}
+            tone={benchmarkScore === null ? 'neutral' : benchmarkScore > 0 ? 'positive' : benchmarkScore < 0 ? 'negative' : 'neutral'}
+          />
+          <IntelligenceMetric
+            label="Risk / Reward"
+            value={rrRatio !== null ? `${formatNumber(rrRatio, 2)}R` : '—'}
+            hint={`learning floor ${learningMinStrength}`}
+            tone={rrRatio === null ? 'neutral' : rrRatio >= 1.5 ? 'positive' : rrRatio < 1 ? 'negative' : 'neutral'}
+          />
+        </div>
+        <div className="mt-3 grid gap-3 md:grid-cols-3">
+          <IntelligenceMetric
+            label="Consensus"
+            value={`+${formatNumber(supportCount, 0)} / -${formatNumber(opposeCount, 0)}`}
+            hint="supporting vs opposing candidates"
+            tone={supportCount > opposeCount ? 'positive' : opposeCount > supportCount ? 'negative' : 'neutral'}
+          />
+          <IntelligenceMetric
+            label="Recent Trade Memory"
+            value={recentTrades !== null ? `${formatNumber(recentTrades, 0)} trades` : '—'}
+            hint={lossStreak !== null ? `loss streak ${formatNumber(lossStreak, 0)}` : 'no recent trade history'}
+            tone={lossStreak !== null && lossStreak >= 2 ? 'negative' : 'neutral'}
+          />
+          <IntelligenceMetric
+            label="Execution Bias"
+            value={String(metadata.execution_timeframe ?? strategy.timeframe)}
+            hint={String(metadata.market_regime && asRecord(metadata.market_regime)?.regime ? `regime ${String(asRecord(metadata.market_regime)?.regime)}` : 'market regime pending')}
+          />
+        </div>
+      </section>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <DataGrid title="Weighted Reference Bias" value={referenceBias} />
+        <DataGrid title="Benchmark Alignment" value={benchmarkContext} />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <DataGrid title="Consensus Context" value={consensusContext} />
+        <DataGrid title="Recent Trade Memory" value={recentTradeMemory} />
+      </div>
+
+      <DataGrid title="Risk / Reward Profile" value={riskRewardProfile} />
+    </div>
+  );
+}
+
 function StrategyCard({ strategy }: { strategy: AgentInspectorStrategy }) {
   const latestSignal = strategy.latest_signal;
   const signalTone =
@@ -195,6 +369,8 @@ function StrategyCard({ strategy }: { strategy: AgentInspectorStrategy }) {
         <DataGrid title="Parameters" value={strategy.params} />
         <DataGrid title="Indicator Snapshot" value={strategy.indicator_snapshot} />
       </div>
+
+      {latestSignal ? <StrategyDecisionPanel strategy={strategy} /> : null}
 
       {latestSignal?.metadata && Object.keys(latestSignal.metadata).length > 0 ? (
         <div className="mt-4">
@@ -433,6 +609,11 @@ export default function AgentInputsPage() {
               <div className="mt-1 text-xs text-slate-500">
                 Bulls {inspectorQuery.data.reference_bias.bullish_votes} · Bears{' '}
                 {inspectorQuery.data.reference_bias.bearish_votes}
+              </div>
+              <div className="mt-1 text-xs text-slate-500">
+                Weighted {formatNumber(inspectorQuery.data.reference_bias.weighted_bullish_votes)} /{' '}
+                {formatNumber(inspectorQuery.data.reference_bias.weighted_bearish_votes)} · Confidence{' '}
+                {formatNumber(inspectorQuery.data.reference_bias.confidence_pct)}%
               </div>
             </div>
 

@@ -1,15 +1,9 @@
 import type { Metadata } from 'next';
-import { Inter } from 'next/font/google';
 import './globals.css';
 import { Providers } from '@/lib/providers';
 import { TopNav } from '@/components/layout/top-nav';
 import { TickerStrip } from '@/components/layout/ticker-strip';
 import { APP_DISPLAY_NAME } from '@/lib/app-brand';
-
-const inter = Inter({
-  variable: '--font-inter',
-  subsets: ['latin'],
-});
 
 export const metadata: Metadata = {
   title: APP_DISPLAY_NAME,
@@ -30,7 +24,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body
-        className={`${inter.variable} bg-slate-950 text-slate-100 antialiased`}
+        className="bg-slate-950 text-slate-100 antialiased"
         data-ws-base={runtimeWsBase}
       >
         <Providers>

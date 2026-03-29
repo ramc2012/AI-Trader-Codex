@@ -1108,7 +1108,9 @@ class TradingAgent:
                     await asyncio.sleep(self.config.scan_interval_seconds)
                     continue
                 self._circuit_breaker_notified = False
-                active_symbols, sessions = self._get_active_symbols_and_sessions()
+                sessions = self._session_snapshot()
+                readiness = await self._compute_market_readiness(sessions)
+                active_symbols = self._resolve_active_symbols(sessions=sessions, readiness=readiness)
 
 
                 # Emit thinking summary

@@ -1537,6 +1537,9 @@ class TradingAgent:
         execution_timeframes: List[str],
     ) -> None:
         """Enter one exploratory bootstrap trade when no normal trade fired."""
+        if not self.config.liberal_bootstrap_enabled:
+            return
+
         # Keep one active option position per underlying in bootstrap.
         if self._has_exit_plan_for_underlying(symbol):
             return

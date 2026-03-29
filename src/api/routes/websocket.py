@@ -449,6 +449,10 @@ def _build_dashboard_payload() -> Dict[str, Any]:
             "available_risk": 0.0,
         }
 
+    try:
+        am = get_alert_manager()
+        alert_counts = am.get_alert_counts()
+    except Exception:
         alert_counts = {
             "info": 0,
             "warning": 0,

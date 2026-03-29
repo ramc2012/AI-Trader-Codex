@@ -4,10 +4,11 @@ import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '@/lib/api';
 import type { ExecutorSummary } from '@/types/api';
 
-export function useStrategies() {
+export function useStrategies(enabled = true) {
   return useQuery<ExecutorSummary>({
     queryKey: ['strategies'],
     queryFn: () => apiFetch<ExecutorSummary>('/strategies'),
-    refetchInterval: 5000,
+    refetchInterval: enabled ? 5000 : false,
+    enabled,
   });
 }

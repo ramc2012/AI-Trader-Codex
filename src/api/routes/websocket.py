@@ -21,6 +21,8 @@ from src.api.dependencies import (
     get_risk_manager,
     get_runtime_manager,
     get_tick_aggregator,
+    get_state_change_bus,
+    get_strategy_executor,
 )
 from src.api.routes.trading import _build_currency_aware_portfolio
 from src.config.constants import INDEX_INSTRUMENTS
@@ -107,22 +109,66 @@ agent_manager = ConnectionManager()
 
 @router.websocket("/ws/dashboard")
 async def dashboard_ws(websocket: WebSocket) -> None:
-    """Stream dashboard data every 1 second.
-
-    Sends a JSON payload containing portfolio summary, risk state,
-    and alert counts. The connection stays open until the client
-    disconnects.
-    """
+    """Stream dashboard data on state changes."""
+    bus = get_state_change_bus()
+    queue = bus.subscribe()
     await dashboard_manager.connect(websocket)
     try:
+        # Initial push
+        payload = _build_dashboard_payload()
+        await dashboard_manager.send_json(websocket, payload)
+
         while True:
-            payload = _build_dashboard_payload()
-            await dashboard_manager.send_json(websocket, payload)
-            await asyncio.sleep(1.0)
+            try:
+                # Wait for ANY state change (portfolio, risk, alerts)
+                # or timeout after 5s for a heartbeat/periodic sync
+                topic = await asyncio.wait_for(queue.get(), timeout=5.0)
+                if topic in ("portfolio", "risk", "alerts"):
+                    payload = _build_dashboard_payload()
+                    await dashboard_manager.send_json(websocket, payload)
+            except asyncio.TimeoutError:
+                # Periodic heartbeat/sync
+                payload = _build_dashboard_payload()
+                await dashboard_manager.send_json(websocket, payload)
     except WebSocketDisconnect:
         dashboard_manager.disconnect(websocket)
     except Exception:
         dashboard_manager.disconnect(websocket)
+    finally:
+        bus.unsubscribe(queue)
+
+
+@router.websocket("/ws/positions")
+async def positions_ws(websocket: WebSocket) -> None:
+    """Stream live position updates."""
+    bus = get_state_change_bus()
+    queue = bus.subscribe()
+    pm = get_position_manager()
+    await websocket.accept()
+    try:
+        # Initial push
+        await websocket.send_json({
+            "type": "positions_update",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "positions": [p.__dict__ for p in pm.get_all_positions()],
+        })
+
+        while True:
+            try:
+                topic = await asyncio.wait_for(queue.get(), timeout=10.0)
+                if topic == "positions":
+                    await websocket.send_json({
+                        "type": "positions_update",
+                        "timestamp": datetime.now(tz=IST).isoformat(),
+                        "positions": [p.__dict__ for p in pm.get_all_positions()],
+                    })
+            except asyncio.TimeoutError:
+                # Heartbeat
+                await websocket.send_json({"type": "heartbeat"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        bus.unsubscribe(queue)
 
 
 @router.websocket("/ws/ticks/{symbol:path}")
@@ -403,15 +449,22 @@ def _build_dashboard_payload() -> Dict[str, Any]:
             "available_risk": 0.0,
         }
 
-    try:
-        am = get_alert_manager()
-        alert_counts = am.get_alert_counts()
-    except Exception:
         alert_counts = {
             "info": 0,
             "warning": 0,
             "critical": 0,
             "emergency": 0,
+        }
+
+    try:
+        se = get_strategy_executor()
+        strategies = se.get_executor_summary()
+    except Exception:
+        strategies = {
+            "enabled_count": 0,
+            "total_signals": 0,
+            "total_trades": 0,
+            "active_strategies": [],
         }
 
     return {
@@ -420,6 +473,7 @@ def _build_dashboard_payload() -> Dict[str, Any]:
         "portfolio": portfolio,
         "risk": risk,
         "alerts": alert_counts,
+        "strategies": strategies,
         "equity_snapshot": {
             "time": datetime.now(tz=IST).isoformat(),
             "value": portfolio.get("total_market_value_inr", portfolio.get("total_market_value", 0))

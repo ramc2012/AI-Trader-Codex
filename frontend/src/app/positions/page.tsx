@@ -16,6 +16,8 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { useOrderPairs } from '@/hooks/use-orders';
 import { usePortfolio } from '@/hooks/use-portfolio';
 import { usePositions } from '@/hooks/use-positions';
+import { usePositionsWS } from '@/hooks/use-positions-ws';
+import { useDashboardWS } from '@/hooks/use-dashboard-ws';
 import { formatCurrency, formatDateTime, formatNumber, formatPercent } from '@/lib/formatters';
 import { cn } from '@/lib/utils';
 import type { PortfolioSummary, Position, TradePair } from '@/types/api';
@@ -423,14 +425,18 @@ function PositionDetailsDialog({
 export default function PositionsPage() {
   const [activeTab, setActiveTab] = useState<PositionsTab>('positions');
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
+  const { isConnected: isDashboardConnected } = useDashboardWS();
+  const { isConnected: isPositionsConnected } = usePositionsWS();
+
   const {
     data: positions,
     isLoading: positionsLoading,
     error: positionsError,
     isFetching: positionsFetching,
     dataUpdatedAt,
-  } = usePositions();
-  const { data: portfolio, isLoading: portfolioLoading } = usePortfolio();
+  } = usePositions(!isPositionsConnected);
+
+  const { data: portfolio, isLoading: portfolioLoading } = usePortfolio(!isDashboardConnected);
   const { data: orderPairs, isLoading: historyLoading, error: historyError } = useOrderPairs();
 
   const sortedPositions = useMemo(() => sortPositions(positions ?? []), [positions]);
@@ -461,9 +467,12 @@ export default function PositionsPage() {
                 )}
               >
                 <span
-                  className={cn('h-1.5 w-1.5 rounded-full', positionsFetching ? 'bg-emerald-400' : 'bg-slate-500')}
+                  className={cn(
+                    'h-1.5 w-1.5 rounded-full',
+                    isPositionsConnected ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'
+                  )}
                 />
-                {positionsFetching ? 'Live refresh' : 'Live idle'}
+                {isPositionsConnected ? 'Live stream' : positionsFetching ? 'Polling' : 'Idle'}
               </span>
             </div>
             <div className="text-xs text-slate-500">

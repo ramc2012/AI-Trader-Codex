@@ -38,6 +38,9 @@ export function useDashboardWS() {
       if (payload.alerts) {
         queryClient.setQueryData(['alert-counts'], payload.alerts);
       }
+      if (payload.strategies) {
+        queryClient.setQueryData(['strategies'], payload.strategies);
+      }
 
       // Accumulate equity snapshots for live chart
       if (payload.equity_snapshot) {

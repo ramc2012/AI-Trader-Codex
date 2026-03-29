@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from src.config.settings import get_settings
 from src.config.market_hours import IST
 from src.utils.logger import get_logger
+from src.utils.pubsub import get_state_change_bus
 
 logger = get_logger(__name__)
 MULTI_STRATEGY_TAG = "MULTI"
@@ -260,6 +261,8 @@ class PositionManager:
                     new_avg=existing.avg_price,
                 )
                 self._persist_state()
+                get_state_change_bus().notify("portfolio")
+                get_state_change_bus().notify("positions")
                 return existing
             else:
                 if quantity < existing.quantity:
@@ -310,6 +313,8 @@ class PositionManager:
                         close_pnl=close_pnl,
                     )
                     self._persist_state()
+                    get_state_change_bus().notify("portfolio")
+                    get_state_change_bus().notify("positions")
                     return new_pos
         else:
             # New position
@@ -342,6 +347,8 @@ class PositionManager:
                 price=price,
             )
             self._persist_state()
+            get_state_change_bus().notify("portfolio")
+            get_state_change_bus().notify("positions")
             return pos
 
     def close_position(
@@ -442,6 +449,8 @@ class PositionManager:
                 pnl=realized,
             )
         self._persist_state()
+        get_state_change_bus().notify("portfolio")
+        get_state_change_bus().notify("positions")
 
         return realized
 
@@ -458,6 +467,7 @@ class PositionManager:
         if symbol in self._positions:
             self._positions[symbol].current_price = price
             self._persist_state()
+            get_state_change_bus().notify("portfolio")
             return self._positions[symbol]
         return None
 

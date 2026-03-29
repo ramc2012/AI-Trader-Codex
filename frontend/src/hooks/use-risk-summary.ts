@@ -4,10 +4,11 @@ import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '@/lib/api';
 import type { RiskSummary } from '@/types/api';
 
-export function useRiskSummary() {
+export function useRiskSummary(enabled = true) {
   return useQuery<RiskSummary>({
     queryKey: ['risk-summary'],
     queryFn: () => apiFetch<RiskSummary>('/risk/summary'),
-    refetchInterval: 5000,
+    refetchInterval: enabled ? 5000 : false,
+    enabled,
   });
 }

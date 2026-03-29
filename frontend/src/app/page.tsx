@@ -107,10 +107,13 @@ export default function DashboardPage() {
     market_breadth_ratio: number;
   } | null>(null);
 
-  const { data: portfolio, isLoading: portfolioLoading } = usePortfolio();
-  const { data: risk, isLoading: riskLoading } = useRiskSummary();
-  const { data: strategies, isLoading: strategiesLoading } = useStrategies();
-  const { data: alertCounts, isLoading: alertsLoading } = useAlertCounts();
+  // Wire WebSocket for real-time updates (injects into React Query cache)
+  const { isConnected } = useDashboardWS();
+
+  const { data: portfolio, isLoading: portfolioLoading } = usePortfolio(!isConnected);
+  const { data: risk, isLoading: riskLoading } = useRiskSummary(!isConnected);
+  const { data: strategies, isLoading: strategiesLoading } = useStrategies(!isConnected);
+  const { data: alertCounts, isLoading: alertsLoading } = useAlertCounts(!isConnected);
 
   useWebSocket({
     path: '/ws/stream',
@@ -121,9 +124,6 @@ export default function DashboardPage() {
     }, []),
     enabled: true,
   });
-
-  // Wire WebSocket for real-time updates (injects into React Query cache)
-  const { isConnected } = useDashboardWS();
 
   // Fetch equity curve from API (or use live WS snapshots)
   const { data: equityCurveApi } = useQuery<EquitySnapshot[]>({

@@ -484,6 +484,7 @@ export interface DashboardWSPayload {
   portfolio: PortfolioSummary;
   risk: Partial<RiskSummary>;
   alerts: AlertCounts;
+  strategies: ExecutorSummary;
   equity_snapshot: EquitySnapshot;
   ws_connections: number;
 }

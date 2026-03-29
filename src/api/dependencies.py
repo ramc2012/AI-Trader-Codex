@@ -24,6 +24,7 @@ from src.risk.risk_calculator import RiskCalculator
 from src.risk.risk_manager import RiskConfig, RiskManager
 from src.config.settings import get_settings
 from src.watchlist.instrument_registry_service import InstrumentRegistryService
+from src.utils.pubsub import StateChangeBus, get_state_change_bus as _get_bus
 
 
 # =========================================================================
@@ -378,6 +379,11 @@ def reset_fyers_client() -> None:
     _fyers_client = None
     _instrument_registry = None
     _runtime_manager = None
+
+
+def get_state_change_bus() -> StateChangeBus:
+    """Get the singleton state change bus."""
+    return _get_bus()
 
 
 def reset_managers() -> None:

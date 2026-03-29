@@ -4,11 +4,11 @@ import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '@/lib/api';
 import type { PortfolioSummary, PortfolioInstrumentSummary, PortfolioPeriod } from '@/types/api';
 
-export function usePortfolio() {
+export function usePortfolio(enabled = true) {
   return useQuery<PortfolioSummary>({
     queryKey: ['portfolio'],
     queryFn: () => apiFetch<PortfolioSummary>('/portfolio'),
-    refetchInterval: 3000,
+    refetchInterval: enabled ? 3000 : false,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
     staleTime: 1500,

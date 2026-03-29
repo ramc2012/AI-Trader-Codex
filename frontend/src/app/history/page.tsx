@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { useOrderHistory, useTradeHistory, useTradingSummary } from '@/hooks/use-history';
 import { useOrderPairs } from '@/hooks/use-orders';
+import { useDashboardWS } from '@/hooks/use-dashboard-ws';
 import { formatINR, formatNumber, formatDateTime, formatCurrency } from '@/lib/formatters';
 import { cn } from '@/lib/utils';
 
@@ -41,8 +42,8 @@ function StatusBadge({ status }: { status: string }) {
 
 // ─── Summary cards ────────────────────────────────────────────────────────────
 
-function SummaryCards() {
-  const { data: summary, isLoading } = useTradingSummary();
+function SummaryCards({ isConnected }: { isConnected: boolean }) {
+  const { data: summary, isLoading } = useTradingSummary(!isConnected);
 
   if (isLoading) {
     return (
@@ -123,8 +124,8 @@ function SummaryCards() {
 
 // ─── Orders table ─────────────────────────────────────────────────────────────
 
-function OrdersTable() {
-  const { data, isLoading, isError, refetch, isFetching } = useOrderHistory();
+function OrdersTable({ isConnected }: { isConnected: boolean }) {
+  const { data, isLoading, isError, refetch, isFetching } = useOrderHistory(!isConnected);
   const [sideFilter, setSideFilter] = useState<'all' | 'BUY' | 'SELL'>('all');
   const [statusFilter, setStatusFilter] = useState<string>('all');
 
@@ -284,8 +285,8 @@ function OrdersTable() {
 
 // ─── Trades table ─────────────────────────────────────────────────────────────
 
-function TradesTable() {
-  const { data, isLoading, refetch, isFetching } = useTradeHistory();
+function TradesTable({ isConnected }: { isConnected: boolean }) {
+  const { data, isLoading, refetch, isFetching } = useTradeHistory(!isConnected);
   const [sideFilter, setSideFilter] = useState<'all' | 'BUY' | 'SELL'>('all');
 
   const filtered = useMemo(() => {
@@ -407,8 +408,8 @@ function TradesTable() {
   );
 }
 
-function PairedTradesTable() {
-  const { data: pairs, isLoading, isError, refetch, isFetching } = useOrderPairs();
+function PairedTradesTable({ isConnected }: { isConnected: boolean }) {
+  const { data: pairs, isLoading, isError, refetch, isFetching } = useOrderPairs(!isConnected);
 
   if (isLoading) {
     return <div className="h-64 animate-pulse rounded-xl border border-slate-800 bg-slate-900/60" />;
@@ -506,6 +507,7 @@ type Tab = 'orders' | 'trades' | 'paired';
 
 export default function HistoryPage() {
   const [tab, setTab] = useState<Tab>('orders');
+  const { isConnected } = useDashboardWS();
 
   return (
     <div className="space-y-6">
@@ -518,10 +520,16 @@ export default function HistoryPage() {
             <p className="text-xs text-slate-500">Today&apos;s order book and executed trades from Fyers</p>
           </div>
         </div>
+        <div className="flex items-center gap-2 rounded-full border border-slate-800 bg-slate-950/80 px-3 py-1 text-[11px] uppercase tracking-[0.2em]">
+          <span className={cn('h-1.5 w-1.5 rounded-full', isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500')} />
+          <span className={isConnected ? 'text-emerald-400' : 'text-slate-500'}>
+            {isConnected ? 'Live stream' : 'Polling'}
+          </span>
+        </div>
       </div>
-
+ 
       {/* Summary Cards */}
-      <SummaryCards />
+      <SummaryCards isConnected={isConnected} />
 
       {/* Tab selector */}
       <div className="flex gap-1 rounded-xl border border-slate-800 bg-slate-900/60 p-1 w-fit">
@@ -546,9 +554,9 @@ export default function HistoryPage() {
       </div>
 
       {/* Tables */}
-      {tab === 'orders' && <OrdersTable />}
-      {tab === 'trades' && <TradesTable />}
-      {tab === 'paired' && <PairedTradesTable />}
+      {tab === 'orders' && <OrdersTable isConnected={isConnected} />}
+      {tab === 'trades' && <TradesTable isConnected={isConnected} />}
+      {tab === 'paired' && <PairedTradesTable isConnected={isConnected} />}
     </div>
   );
 }

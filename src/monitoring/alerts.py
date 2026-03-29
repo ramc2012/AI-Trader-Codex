@@ -4,6 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional, Dict, Any, Callable
 from src.utils.logger import get_logger
+from src.utils.pubsub import get_state_change_bus
 
 logger = get_logger(__name__)
 
@@ -72,6 +73,10 @@ class AlertManager:
                         logger.error("Alert callback failed", error=str(e))
 
         logger.info("Alert sent", level=level.value, title=title, source=source)
+        try:
+            get_state_change_bus().notify("alerts")
+        except Exception:
+            pass
         return alert
 
     def info(self, title: str, message: str, source: str = "", **kwargs: Any) -> Alert:

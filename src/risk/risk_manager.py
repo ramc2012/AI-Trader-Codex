@@ -18,6 +18,7 @@ from src.config.settings import get_settings
 from src.config.market_hours import IST
 from src.utils.logger import get_logger
 from src.utils.market_symbols import parse_currency_context
+from src.utils.pubsub import get_state_change_bus
 
 logger = get_logger(__name__)
 
@@ -334,6 +335,7 @@ class RiskManager:
 
         self.check_circuit_breaker()
         self._persist_state()
+        get_state_change_bus().notify("risk")
 
     def check_circuit_breaker(self) -> bool:
         """Check if circuit breaker should trigger.
@@ -476,6 +478,7 @@ class RiskManager:
         if existing <= 0:
             self.daily_state.open_positions += 1
         self._persist_state()
+        get_state_change_bus().notify("risk")
 
     def remove_position(self, symbol: str, position_value: float) -> None:
         """Remove a closed position from tracking.
@@ -496,6 +499,7 @@ class RiskManager:
         else:
             self._position_values[symbol] = remaining
         self._persist_state()
+        get_state_change_bus().notify("risk")
 
     def sync_position_value(self, symbol: str, position_value: float) -> None:
         """Set absolute tracked value for a symbol and reconcile open-position count.

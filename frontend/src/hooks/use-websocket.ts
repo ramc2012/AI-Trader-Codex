@@ -9,14 +9,20 @@ function defaultWsBase(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
   const host = window.location.hostname;
   const frontendPort = window.location.port || '';
+  
+  // Map frontend ports to backend ports consistently
   const explicitMap: Record<string, string> = {
     '3000': '8000',
-    '3100': '8080',
-    '3200': '8200',
-    '3201': '8201',
+    '80': '8000',
+    '3100': '8100',
+    '3200': '8000',
+    '3201': '8001', // Cloud production port
   };
+  
   const mapped = explicitMap[frontendPort];
-  const backendPort = mapped || (frontendPort ? String(Number(frontendPort) + 5000) : '8201');
+  // Default to 8000 if no map, or use explicit mapping
+  const backendPort = mapped || '8000';
+  
   return `${protocol}://${host}:${backendPort}/api/v1`;
 }
 

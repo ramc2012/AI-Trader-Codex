@@ -80,26 +80,29 @@ export interface TradingSummaryResponse {
 
 // ─── Hooks ────────────────────────────────────────────────────────────────────
 
-export function useOrderHistory() {
+export function useOrderHistory(enabled = true) {
   return useQuery<OrderHistoryResponse>({
     queryKey: ['history', 'orders'],
     queryFn: () => apiFetch<OrderHistoryResponse>('/history/orders'),
-    refetchInterval: 30_000,
+    refetchInterval: enabled ? 30_000 : false,
+    enabled,
   });
 }
 
-export function useTradeHistory() {
+export function useTradeHistory(enabled = true) {
   return useQuery<TradeHistoryResponse>({
     queryKey: ['history', 'trades'],
     queryFn: () => apiFetch<TradeHistoryResponse>('/history/trades'),
-    refetchInterval: 30_000,
+    refetchInterval: enabled ? 30_000 : false,
+    enabled,
   });
 }
 
-export function useTradingSummary() {
+export function useTradingSummary(enabled = true) {
   return useQuery<TradingSummaryResponse>({
     queryKey: ['history', 'summary'],
     queryFn: () => apiFetch<TradingSummaryResponse>('/history/summary'),
-    refetchInterval: 60_000,
+    refetchInterval: enabled ? 60_000 : false,
+    enabled,
   });
 }

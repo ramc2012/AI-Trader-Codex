@@ -12,7 +12,7 @@ from datetime import datetime
 import pandas as pd
 import pandas_ta as ta
 
-from src.execution.signal import Signal, SignalType, SignalStrength
+from src.strategies.base import Signal, SignalType, SignalStrength
 from src.strategies.base import BaseStrategy
 
 

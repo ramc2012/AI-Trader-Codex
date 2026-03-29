@@ -41,7 +41,7 @@ echo "This will create a new Compute Engine VM ($INSTANCE_NAME) and deploy the D
 
 echo "⏳ Provisioning Compute Engine VM ($INSTANCE_NAME)..."
 
-# Create the instance
+# Create the instance (ignore error if exists)
 gcloud compute instances create $INSTANCE_NAME \
     --project=$CURRENT_PROJECT \
     --zone=$ZONE \
@@ -50,7 +50,7 @@ gcloud compute instances create $INSTANCE_NAME \
     --image-project=$IMAGE_PROJECT \
     --tags=http-server,https-server,nifty-trader \
     --boot-disk-size=50GB \
-    --boot-disk-type=pd-ssd
+    --boot-disk-type=pd-ssd || echo "⚠️ Instance $INSTANCE_NAME already exists, skipping creation."
 
 echo "✅ VM Provisioned successfully."
 
@@ -62,7 +62,7 @@ gcloud compute firewall-rules create allow-nifty-trader \
     --action=ALLOW \
     --rules=tcp:80,tcp:443,tcp:3000-3250,tcp:8000-8050 \
     --source-ranges=0.0.0.0/0 \
-    --target-tags=nifty-trader || true
+    --target-tags=nifty-trader || echo "⚠️ Firewall rule already exists."
 
 echo "✅ Firewall rules configured."
 
@@ -82,15 +82,19 @@ tar --exclude='venv' --exclude='.git' --exclude='node_modules' --exclude='.next'
 echo "📤 Uploading repository to VM..."
 gcloud compute scp nifty-trader.tar.gz $INSTANCE_NAME:~ --zone=$ZONE
 
-echo "🚀 Running deployment on the VM..."
+# Remote execution: Extract, Build, and Start
 gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command="
-    sudo apt-get update && \
-    sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release && \
-    curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg && \
-    echo \"deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian \$(lsb_release -cs) stable\" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && \
-    sudo apt-get update && \
-    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin && \
-    sudo usermod -aG docker \$USER && \
+    if ! command -v docker &> /dev/null; then
+        echo '⏳ Installing Docker...'
+        sudo apt-get update && \
+        sudo apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release && \
+        curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg && \
+        echo \"deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian \$(lsb_release -cs) stable\" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && \
+        sudo apt-get update && \
+        sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin && \
+        sudo usermod -aG docker \$USER
+    fi
+    
     mkdir -p nifty-trader && \
     tar -xzf nifty-trader.tar.gz -C nifty-trader && \
     cd nifty-trader && \

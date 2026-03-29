@@ -1,4 +1,4 @@
-"""FastAPI application entry point for the Nifty AI Trader data API."""
+"""FastAPI application entry point for the NiftyTraderGravity trading API."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -6,6 +6,7 @@ from typing import AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import make_asgi_app
 
 from datetime import datetime, timedelta
 
@@ -39,6 +40,8 @@ from src.api.routes.history import router as history_router
 from src.api.routes.agent import router as agent_router
 from src.api.routes.fractal_profile import router as fractal_profile_router
 from src.api.routes.scanner import router as scanner_router
+from src.api.routes.fno_radar import router as fno_radar_router
+from src.api.routes.options_watchlist import router as options_watchlist_router
 from src.config.constants import (
     API_V1_PREFIX,
     ALL_TIMEFRAMES,
@@ -233,8 +236,8 @@ def create_app() -> FastAPI:
     settings = get_settings()
 
     app = FastAPI(
-        title="Nifty AI Trader API",
-        description="Market data access and trading system API",
+        title="NiftyTraderGravity API",
+        description="NiftyTraderGravity — AI trading agent & market data API",
         version="0.1.0",
         lifespan=lifespan,
         debug=settings.app_debug,
@@ -271,7 +274,13 @@ def create_app() -> FastAPI:
     app.include_router(history_router, prefix=API_V1_PREFIX)
     app.include_router(scanner_router, prefix=API_V1_PREFIX)
     app.include_router(fractal_profile_router, prefix=API_V1_PREFIX)
+    app.include_router(fno_radar_router, prefix=API_V1_PREFIX)
+    app.include_router(options_watchlist_router, prefix=API_V1_PREFIX)
     app.include_router(agent_router, prefix=API_V1_PREFIX)
+
+    # Prometheus Metrics
+    metrics_app = make_asgi_app()
+    app.mount("/metrics", metrics_app)
 
     return app
 

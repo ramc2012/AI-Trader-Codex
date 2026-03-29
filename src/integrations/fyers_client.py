@@ -7,6 +7,8 @@ Provides a clean async-friendly interface around the fyers-apiv3 SDK with:
 - Retry logic with exponential backoff
 - Structured logging for all API interactions
 - Connection health checks
+
+Implements the BrokerBase interface for multi-broker support.
 """
 
 from __future__ import annotations
@@ -29,6 +31,12 @@ from tenacity import (
 )
 
 from src.config.settings import get_settings
+from src.integrations.broker_base import (
+    BrokerBase,
+    BrokerName,
+    BrokerOrderParams,
+    BrokerOrderResponse,
+)
 from src.utils.exceptions import (
     APIError,
     AuthenticationError,
@@ -51,8 +59,10 @@ _REFRESH_TOKEN_EXPIRY_BUFFER = timedelta(minutes=15)
 _AUTO_REFRESH_COOLDOWN = timedelta(seconds=30)
 
 
-class FyersClient:
+class FyersClient(BrokerBase):
     """Wrapper around Fyers API v3 with auth management and rate limiting.
+
+    Implements the BrokerBase interface for multi-broker support.
 
     Args:
         app_id: Fyers app/client ID. Defaults to settings value.
@@ -62,6 +72,8 @@ class FyersClient:
         rate_limit: Max API requests per second. Defaults to settings value.
         log_path: Directory for Fyers SDK logs. None disables SDK logging.
     """
+
+    name = BrokerName.FYERS
 
     def __init__(
         self,
@@ -797,3 +809,27 @@ class FyersClient:
         self._fyers = None
         self._access_token = None
         logger.info("fyers_client_closed")
+
+    # =========================================================================
+    # BrokerBase Interface Methods
+    # =========================================================================
+
+    def translate_symbol(self, universal_symbol: str) -> str:
+        """Fyers uses the universal symbol format natively (NSE:RELIANCE-EQ)."""
+        return universal_symbol
+
+    def translate_order_params(self, params: BrokerOrderParams) -> dict[str, Any]:
+        """Convert generic BrokerOrderParams to Fyers API format."""
+        native: dict[str, Any] = {
+            "symbol": params.symbol,
+            "qty": params.quantity,
+            "type": params.order_type,
+            "side": params.side,
+            "productType": params.product_type,
+        }
+        if params.limit_price is not None:
+            native["limitPrice"] = params.limit_price
+        if params.stop_price is not None:
+            native["stopPrice"] = params.stop_price
+        return native
+

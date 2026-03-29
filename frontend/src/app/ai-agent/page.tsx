@@ -112,10 +112,8 @@ const DEFAULT_STRATEGIES = [
 ];
 const DEFAULT_EXECUTION_TIMEFRAMES = ['3', '5', '15'];
 const DEFAULT_REFERENCE_TIMEFRAMES = ['60', 'D'];
-const DEFAULT_NSE_SYMBOLS =
-  'NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX,NSE:NIFTYMIDCAP50-INDEX,BSE:SENSEX-INDEX';
-const DEFAULT_US_SYMBOLS =
-  'US:SPY,US:QQQ,US:DIA,US:IWM,US:AAPL,US:AMZN,US:JPM,US:XOM,US:UNH,US:CAT';
+const DEFAULT_NSE_SYMBOLS = '';
+const DEFAULT_US_SYMBOLS = '';
 
 // ─── Event Card ───────────────────────────────────────────
 
@@ -234,9 +232,12 @@ export default function AIAgentPage() {
     let cancelled = false;
     queueMicrotask(() => {
       if (cancelled || configHydratedRef.current) return;
-      setSymbols((status.symbols ?? []).join(','));
-      setUsSymbols((status.us_symbols ?? []).join(','));
-      setCryptoSymbols((status.crypto_symbols ?? []).join(','));
+      const defaultNse = status.symbols?.length ? status.symbols : nseUniverseSymbols;
+      const defaultUs = status.us_symbols?.length ? status.us_symbols : usUniverseSymbols;
+      const defaultCrypto = status.crypto_symbols?.length ? status.crypto_symbols : cryptoUniverseSymbols;
+      setSymbols(defaultNse.join(','));
+      setUsSymbols(defaultUs.join(','));
+      setCryptoSymbols(defaultCrypto.join(','));
       setTradeNSEWhenOpen(status.trade_nse_when_open ?? (status.symbols ?? []).length > 0);
       setTradeUSWhenOpen(status.trade_us_when_open ?? (status.us_symbols ?? []).length > 0);
       setTradeUSOptions(status.trade_us_options ?? true);

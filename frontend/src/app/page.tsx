@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import {
   TrendingUp,
   TrendingDown,
@@ -18,6 +18,7 @@ import { useRiskSummary } from '@/hooks/use-risk-summary';
 import { useStrategies } from '@/hooks/use-strategies';
 import { useAlertCounts } from '@/hooks/use-alerts';
 import { useDashboardWS } from '@/hooks/use-dashboard-ws';
+import { useWebSocket } from '@/hooks/use-websocket';
 import { apiFetch } from '@/lib/api';
 import { formatINR, formatPercent } from '@/lib/formatters';
 import { buildEquityChartData, equityChartWidth } from '@/lib/equity-chart';
@@ -98,10 +99,28 @@ function StatCard({
 
 export default function DashboardPage() {
   const [equityPeriod, setEquityPeriod] = useState<'daily' | 'week' | 'month' | 'year'>('daily');
+  const [macroData, setMacroData] = useState<{
+    news_sentiment: string;
+    sentiment_score: number;
+    fii_net_crores: number;
+    dii_net_crores: number;
+    market_breadth_ratio: number;
+  } | null>(null);
+
   const { data: portfolio, isLoading: portfolioLoading } = usePortfolio();
   const { data: risk, isLoading: riskLoading } = useRiskSummary();
   const { data: strategies, isLoading: strategiesLoading } = useStrategies();
   const { data: alertCounts, isLoading: alertsLoading } = useAlertCounts();
+
+  useWebSocket({
+    path: '/ws/stream',
+    onMessage: useCallback((msg: any) => {
+      if (msg.event_type === 'macro_update') {
+        setMacroData(msg.payload);
+      }
+    }, []),
+    enabled: true,
+  });
 
   // Wire WebSocket for real-time updates (injects into React Query cache)
   const { isConnected } = useDashboardWS();
@@ -110,7 +129,6 @@ export default function DashboardPage() {
   const { data: equityCurveApi } = useQuery<EquitySnapshot[]>({
     queryKey: ['equity-curve', equityPeriod],
     queryFn: () => apiFetch<EquitySnapshot[]>(`/portfolio/equity-curve?period=${encodeURIComponent(equityPeriod)}`),
-    refetchInterval: 10000,
   });
   const { data: equityCurveLive } = useQuery<EquitySnapshot[]>({
     queryKey: ['equity-curve-live'],
@@ -226,6 +244,58 @@ export default function DashboardPage() {
           valueColor={winRate >= 50 ? 'text-emerald-400' : 'text-red-400'}
           isLoading={riskLoading}
         />
+      </div>
+
+      {/* Macro & Sentiment Widget */}
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        {macroData ? (
+          <>
+            <div className="rounded-xl border border-slate-800 bg-slate-900 p-5 col-span-1 lg:col-span-2">
+               <h3 className="text-sm font-medium text-slate-400 mb-4">News Sentiment (AI)</h3>
+               <div className="flex items-center gap-4">
+                 <div className={cn(
+                   "text-2xl font-bold uppercase",
+                   macroData.sentiment_score > 0.4 ? 'text-emerald-500' : macroData.sentiment_score < -0.4 ? 'text-red-500' : 'text-slate-300'
+                 )}>{macroData.news_sentiment}</div>
+                 <div className="flex-1 bg-slate-800 rounded-full h-2.5 overflow-hidden flex">
+                    <div className="bg-red-500 h-full transition-all duration-300" style={{ width: `${Math.max(0, -macroData.sentiment_score * 100)}%`, marginLeft: 'auto' }}></div>
+                    <div className="bg-emerald-500 h-full transition-all duration-300" style={{ width: `${Math.max(0, macroData.sentiment_score * 100)}%` }}></div>
+                 </div>
+                 <span className="text-xs text-slate-500 w-12 text-right">{(macroData.sentiment_score).toFixed(2)}</span>
+               </div>
+            </div>
+            
+            <div className="rounded-xl border border-slate-800 bg-slate-900 p-5 col-span-1">
+               <h3 className="text-sm font-medium text-slate-400 mb-1">Institutional Flow</h3>
+               <div className="flex flex-col gap-2 mt-3">
+                 <div className="flex justify-between text-sm">
+                   <span className="text-slate-500">FII Net</span>
+                   <span className={cn('font-medium', macroData.fii_net_crores >= 0 ? 'text-emerald-400' : 'text-red-400')}>{macroData.fii_net_crores > 0 ? '+' : ''}{macroData.fii_net_crores} Cr</span>
+                 </div>
+                 <div className="flex justify-between text-sm">
+                   <span className="text-slate-500">DII Net</span>
+                   <span className={cn('font-medium', macroData.dii_net_crores >= 0 ? 'text-emerald-400' : 'text-red-400')}>{macroData.dii_net_crores > 0 ? '+' : ''}{macroData.dii_net_crores} Cr</span>
+                 </div>
+               </div>
+            </div>
+
+            <div className="rounded-xl border border-slate-800 bg-slate-900 p-5 col-span-1">
+               <h3 className="text-sm font-medium text-slate-400 mb-1">Market Breadth</h3>
+               <div className="mt-3 text-3xl font-light text-slate-100 flex items-center justify-between">
+                 {macroData.market_breadth_ratio.toFixed(2)}
+                 <span className="text-xs text-slate-500 ml-2">A/D Ratio</span>
+               </div>
+               <div className="w-full bg-slate-800 h-1.5 mt-4 rounded-full overflow-hidden">
+                 <div className={cn('h-full transition-all', macroData.market_breadth_ratio >= 1 ? 'bg-emerald-500' : 'bg-red-500')} style={{ width: `${Math.min(100, Math.max(10, macroData.market_breadth_ratio * 30))}%` }} />
+               </div>
+            </div>
+          </>
+        ) : (
+          <div className="rounded-xl border border-slate-800 bg-slate-900 p-5 col-span-full">
+            <div className="flex justify-between items-center mb-4"><Skeleton className="h-4 w-32" /><Skeleton className="h-4 w-12" /></div>
+            <Skeleton className="h-12 w-full" />
+          </div>
+        )}
       </div>
 
       {/* Equity curve */}

@@ -291,3 +291,36 @@ class Asset(Base):
             "exchange": self.exchange,
             "is_active": self.is_active,
         }
+
+
+class AlternativeData(Base):
+    """Macro indicators, institutional flow, and NLP sentiment scores."""
+
+    __tablename__ = "alternative_data"
+
+    timestamp: Mapped[datetime] = mapped_column(primary_key=True)
+    fii_net_crores: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0.0)
+    dii_net_crores: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0.0)
+    market_breadth_ratio: Mapped[Decimal] = mapped_column(Numeric(8, 4), default=1.0)
+    news_sentiment_score: Mapped[Decimal] = mapped_column(Numeric(8, 4), default=0.0)
+    news_sentiment_label: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    __table_args__ = (
+        Index("idx_altdata_timestamp", timestamp.desc()),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AlternativeData {self.timestamp} FII={self.fii_net_crores} "
+            f"Breadth={self.market_breadth_ratio} Sent={self.news_sentiment_score}>"
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "fii_net_crores": float(self.fii_net_crores),
+            "dii_net_crores": float(self.dii_net_crores),
+            "market_breadth_ratio": float(self.market_breadth_ratio),
+            "news_sentiment_score": float(self.news_sentiment_score),
+            "news_sentiment_label": self.news_sentiment_label,
+        }

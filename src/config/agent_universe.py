@@ -1,15 +1,23 @@
-"""Shared watchlist and agent universe definitions."""
+"""Shared watchlist and agent universe definitions.
+
+Includes all NSE FNO-eligible instruments (209 stocks + 6 indices),
+diversified US symbols across sectors, and crypto assets.
+"""
 
 from __future__ import annotations
 
 from typing import Iterable
 
+from src.config.fno_constants import EQUITY_FNO, INDEX_FNO
+
+# ── Index symbols ────────────────────────────────────────────────────────────
 NIFTY_SYMBOL = "NSE:NIFTY50-INDEX"
 BANKNIFTY_SYMBOL = "NSE:NIFTYBANK-INDEX"
 SENSEX_SYMBOL = "BSE:SENSEX-INDEX"
 FINNIFTY_SYMBOL = "NSE:FINNIFTY-INDEX"
 MIDCPNIFTY_SYMBOL = "NSE:NIFTYMIDCAP50-INDEX"
 
+# ── Nifty 50 watchlist (used for ticker strip / quick view) ──────────────────
 NIFTY50_WATCHLIST_SYMBOLS: list[str] = [
     "NSE:RELIANCE-EQ", "NSE:TCS-EQ", "NSE:INFY-EQ", "NSE:HDFCBANK-EQ",
     "NSE:ICICIBANK-EQ", "NSE:HINDUNILVR-EQ", "NSE:SBIN-EQ", "NSE:BHARTIARTL-EQ",
@@ -28,28 +36,45 @@ NIFTY50_WATCHLIST_SYMBOLS: list[str] = [
     "NSE:LTIM-EQ", "NSE:MM-EQ",
 ]
 
+# ── All NSE FNO symbols (auto-generated from fno_constants) ──────────────────
+NSE_FNO_SYMBOLS: list[str] = sorted(
+    [f"NSE:{sym}-EQ" for sym in EQUITY_FNO.keys()]
+)
+
+# ── Default agent NSE universe: indices + ALL FNO stocks ─────────────────────
 DEFAULT_AGENT_NSE_SYMBOLS: list[str] = [
     NIFTY_SYMBOL,
     BANKNIFTY_SYMBOL,
     FINNIFTY_SYMBOL,
     MIDCPNIFTY_SYMBOL,
     SENSEX_SYMBOL,
-    *NIFTY50_WATCHLIST_SYMBOLS,
+    *NSE_FNO_SYMBOLS,
 ]
 
+# ── US symbols across major sectors ──────────────────────────────────────────
 DEFAULT_AGENT_US_SYMBOLS: list[str] = [
-    "US:SPY",
-    "US:QQQ",
-    "US:DIA",
-    "US:IWM",
-    "US:AAPL",
-    "US:AMZN",
-    "US:JPM",
-    "US:XOM",
-    "US:UNH",
-    "US:CAT",
+    # ETFs / Indices
+    "US:SPY", "US:QQQ", "US:DIA", "US:IWM",
+    # Technology
+    "US:AAPL", "US:MSFT", "US:GOOGL", "US:AMZN", "US:META",
+    "US:NVDA", "US:TSLA", "US:AMD", "US:CRM", "US:ORCL",
+    # Finance
+    "US:JPM", "US:GS", "US:BAC", "US:WFC", "US:MS",
+    "US:V", "US:MA", "US:AXP", "US:BLK", "US:SCHW",
+    # Healthcare
+    "US:UNH", "US:JNJ", "US:PFE", "US:ABBV", "US:MRK",
+    "US:LLY", "US:TMO",
+    # Energy
+    "US:XOM", "US:CVX", "US:COP", "US:SLB",
+    # Industrials & Defence
+    "US:CAT", "US:GE", "US:HON", "US:UPS", "US:BA",
+    "US:LMT", "US:RTX",
+    # Consumer
+    "US:PG", "US:KO", "US:PEP", "US:NKE", "US:MCD",
+    "US:WMT", "US:COST",
 ]
 
+# ── Crypto symbols ───────────────────────────────────────────────────────────
 DEFAULT_AGENT_CRYPTO_SYMBOLS: list[str] = [
     "CRYPTO:BTCUSDT",
     "CRYPTO:ETHUSDT",

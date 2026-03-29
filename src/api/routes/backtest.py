@@ -30,6 +30,7 @@ from src.strategies.directional.ema_crossover import EMACrossoverStrategy
 from src.strategies.directional.macd_strategy import MACDStrategy
 from src.strategies.directional.rsi_reversal import RSIReversalStrategy
 from src.strategies.directional.supertrend_strategy import SupertrendStrategy
+from src.strategies.positional.options_momentum_buy import OptionsMomentumBuy
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -43,6 +44,7 @@ _STRATEGY_REGISTRY: Dict[str, type[BaseStrategy]] = {
     "macd": MACDStrategy,
     "bollinger": BollingerBandStrategy,
     "supertrend": SupertrendStrategy,
+    "options_momentum_buy": OptionsMomentumBuy,
 }
 
 # In-memory result cache (id -> response)

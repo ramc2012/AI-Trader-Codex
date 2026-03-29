@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # project root (i.e. "." which resolves to where the process runs from).
     data_dir: str = "."
 
+    # --- Broker Selection ---
+    active_broker: str = "fyers"  # "fyers" | "upstox" | "fivepaisa"
+
     # --- Fyers API ---
     fyers_app_id: str = ""
     fyers_secret_key: str = ""
@@ -86,6 +89,20 @@ class Settings(BaseSettings):
     fyers_redirect_frontend_url: str = "http://localhost:3000/settings"
     finnhub_api_key: str = ""
     alphavantage_api_key: str = ""
+
+    # --- Upstox API ---
+    upstox_api_key: str = ""
+    upstox_api_secret: str = ""
+    upstox_redirect_uri: str = "http://localhost:8000/upstox/callback"
+
+    # --- 5paisa API ---
+    fivepaisa_app_name: str = ""
+    fivepaisa_app_source: str = ""
+    fivepaisa_user_id: str = ""
+    fivepaisa_password: str = ""
+    fivepaisa_user_key: str = ""
+    fivepaisa_encryption_key: str = ""
+    fivepaisa_redirect_uri: str = "http://localhost:8000/fivepaisa/callback"
 
     # --- Database ---
     db_host: str = "localhost"
@@ -128,7 +145,7 @@ class Settings(BaseSettings):
     usd_inr_reference_rate: float = Field(default=83.0, ge=1.0, le=200.0)
 
     # --- AI Agent ---
-    agent_auto_start: bool = False
+    agent_auto_start: bool = True
     agent_scan_interval: int = 30
     agent_default_timeframe: str = "5"
     agent_execution_timeframes: str = "3,5,15"

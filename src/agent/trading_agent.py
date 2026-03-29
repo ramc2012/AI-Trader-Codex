@@ -52,6 +52,7 @@ from src.strategies.directional.mp_orderflow_strategy import MarketProfileOrderF
 from src.strategies.directional.ml_ensemble import MLEnsembleStrategy
 from src.strategies.directional.rsi_reversal import RSIReversalStrategy
 from src.strategies.directional.supertrend_strategy import SupertrendStrategy
+from src.strategies.positional.options_momentum_buy import OptionsMomentumBuy
 from src.utils.logger import get_logger
 from src.utils.market_symbols import parse_currency_context
 from src.utils.us_market_data import parse_nasdaq_chart_timestamp, parse_nasdaq_historical_date
@@ -82,6 +83,7 @@ STRATEGY_REGISTRY: Dict[str, type[BaseStrategy]] = {
     "Bollinger_MeanReversion": BollingerBandStrategy,
     "Supertrend_Breakout": SupertrendStrategy,
     "ML_Ensemble": MLEnsembleStrategy,
+    "Options_Momentum_Buy": OptionsMomentumBuy,
 }
 
 
@@ -141,6 +143,7 @@ class AgentConfig:
     strategy_capital_bucket_enabled: bool = True
     strategy_max_concurrent_positions: int = 4
     telegram_status_interval_minutes: int = 30
+    agent_style: str = "default"
 
 
 @dataclass(frozen=True)
@@ -199,6 +202,9 @@ class TradingAgent:
         self.fyers_client = fyers_client
         self.position_sizer = PositionSizer(capital=config.capital)
         self.options_service = OptionsDataService(fyers_client)
+        from src.data.alt_data_collector import AltDataCollector
+        self.alt_data = AltDataCollector()
+        self._macro_context = None
         self._spot_to_index_name = {item.spot_symbol: name for name, item in INDEX_INSTRUMENTS.items()}
         self._option_contract_cache: Dict[Tuple[str, str], Tuple[datetime, OptionContract]] = {}
         self._option_contract_cache_ttl = timedelta(seconds=20)
@@ -302,7 +308,17 @@ class TradingAgent:
             },
         ))
 
-        self._task = asyncio.create_task(self._main_loop())
+        self._tasks: List[asyncio.Task] = []
+        if self.config.agent_style in ("default", "scalping"):
+            self._tasks.append(asyncio.create_task(self._scalping_loop()))
+        if self.config.agent_style in ("default", "swing"):
+            self._tasks.append(asyncio.create_task(self._swing_loop()))
+        if self.config.agent_style in ("default", "positional"):
+            self._tasks.append(asyncio.create_task(self._positional_loop()))
+        
+        # We still need a background task for housekeeping (exits, daily summary, etc.)
+        self._tasks.append(asyncio.create_task(self._housekeeping_loop()))
+        
         logger.info("trading_agent_started", config=self.config.__dict__)
 
     async def stop(self) -> None:
@@ -311,12 +327,16 @@ class TradingAgent:
             return
 
         self.state = AgentState.STOPPED
-        if self._task and not self._task.done():
-            self._task.cancel()
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
+        
+        for task in self._tasks:
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
+        self._tasks.clear()
 
         self.executor.stop()
 
@@ -907,8 +927,17 @@ class TradingAgent:
     # Main Loop
     # ------------------------------------------------------------------
 
-    async def _main_loop(self) -> None:
-        """Core agent loop — scans, analyzes, trades, sleeps, repeat."""
+    async def _scalping_loop(self) -> None:
+        await self._run_style_loop("scalping", 30, ["1", "3", "5"])
+
+    async def _swing_loop(self) -> None:
+        await self._run_style_loop("swing", 300, ["15", "60", "D"])
+
+    async def _positional_loop(self) -> None:
+        await self._run_style_loop("positional", 3600, ["D", "W"])
+
+    async def _run_style_loop(self, style: str, interval: int, timeframes: List[str]) -> None:
+        """Generic loop for a specific trading style."""
         try:
             while self.state in (AgentState.RUNNING, AgentState.PAUSED):
                 if self.state == AgentState.PAUSED:
@@ -983,20 +1012,86 @@ class TradingAgent:
                     await self._ensure_data_available(symbols_to_warm)
                     self._warmed_symbols.update(symbols_to_warm)
 
-                # Scan each symbol
-                for symbol in active_symbols:
-                    await self._scan_symbol(symbol)
+                execution_symbols = list(active_symbols)
+                
+                # Expand symbols with ATM Options for the Positional loop
+                if style == "positional" and "Options_Momentum_Buy" in self.config.strategies:
+                    option_contracts = await self._resolve_atm_options_for_underlyings(active_symbols)
+                    if option_contracts:
+                        execution_symbols.extend(option_contracts)
+                        if self._cycle_count % 10 == 0:
+                            await self.event_bus.emit(AgentEvent(
+                                event_type=AgentEventType.MARKET_SCAN,
+                                title="Options Watchlist Built",
+                                message=f"Added {len(option_contracts)} ATM CE/PE contracts to positional scan list.",
+                                severity="info",
+                                metadata={"options_symbols": option_contracts},
+                            ))
 
+                # Scan each symbol for this style
+                for symbol in execution_symbols:
+                    await self._scan_symbol_for_style(symbol, style, timeframes)
+
+                await asyncio.sleep(interval)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.state = AgentState.ERROR
+            self._error = str(e)
+            await self.event_bus.emit(AgentEvent(
+                event_type=AgentEventType.AGENT_ERROR,
+                title=f"{style.capitalize()} Loop Error",
+                message=f"Unexpected error: {e}",
+                severity="error",
+                metadata={"error": str(e), "style": style},
+            ))
+            logger.exception(f"trading_agent_{style}_error", error=str(e))
+
+    async def _housekeeping_loop(self) -> None:
+        """Runs periodic checks that shouldn't be bound to any specific strategy loop."""
+        try:
+            while self.state in (AgentState.RUNNING, AgentState.PAUSED):
+                if self.state == AgentState.PAUSED:
+                    await asyncio.sleep(2)
+                    continue
+                
                 # Check existing positions for exit conditions
                 await self._check_exit_conditions()
 
-                # Update daily P&L
+                # Fetch and broadcast Macro Context Alt Data
+                try:
+                    self._macro_context = await self.alt_data.fetch_macro_context()
+                    from src.database.connection import get_session
+                    from src.database.operations import upsert_alternative_data
+                    async with get_session() as session:
+                         await upsert_alternative_data(session, self._macro_context)
+                    
+                    await self.event_bus.emit(AgentEvent(
+                        event_type=AgentEventType.MARKET_SCAN,
+                        title="Macro Environment Scan",
+                        message=f"Sentiment: {self._macro_context['news_sentiment']} | Breadth: {self._macro_context['market_breadth_ratio']}",
+                        severity="info",
+                        metadata={"macro": self._macro_context}
+                    ))
+                    await self.event_bus.publish("macro_update", self._macro_context)
+                except Exception as e:
+                    logger.warning("macro_context_fetch_failed", error=str(e))
+
+                # Update daily P&L and telemetry
                 portfolio = self.position_manager.get_portfolio_summary()
                 self.risk_manager.update_pnl(
                     float(portfolio.get("total_unrealized_pnl", 0.0)),
                     is_realized=False,
                 )
                 self._daily_pnl = portfolio.get("total_pnl", 0.0)
+                
+                try:
+                    from src.monitoring.prometheus import MetricsMiddleware
+                    MetricsMiddleware.update_pnl(self._daily_pnl)
+                    MetricsMiddleware.update_open_positions(portfolio.get("position_count", 0))
+                except Exception:
+                    pass
 
                 if self.risk_manager.check_circuit_breaker():
                     if not self._circuit_breaker_notified:
@@ -1056,10 +1151,10 @@ class TradingAgent:
     # Symbol Scan
     # ------------------------------------------------------------------
 
-    async def _scan_symbol(self, symbol: str) -> None:
-        """Run all strategies on a single symbol across execution timeframes."""
+    async def _scan_symbol_for_style(self, symbol: str, style: str, style_timeframes: List[str]) -> None:
+        """Run strategies for a specific style on a single symbol across relevant timeframes."""
         short_name = symbol.split(":")[-1].split("-")[0]
-        execution_timeframes = await self._rank_execution_timeframes(symbol, self.get_execution_timeframes())
+        execution_timeframes = await self._rank_execution_timeframes(symbol, style_timeframes)
         trades_before_symbol = self._total_trades
         symbol_market = self._symbol_market(symbol)
         timeframe_frames: Dict[str, pd.DataFrame] = {}
@@ -1116,11 +1211,25 @@ class TradingAgent:
 
             # Run strategies and namespace the symbol key with timeframe so
             # dedupe state doesn't suppress valid signals across resolutions.
-            results = self.executor.process_data(df, f"{symbol}|{timeframe}")
+            results = self.executor.process_data(
+                df, 
+                f"{symbol}|{timeframe}", 
+                regime_meta=regime_meta, 
+                macro_context=self._macro_context
+            )
 
             for strat_name in self.config.strategies:
                 if strat_name not in self.executor._strategies:
                     continue
+                
+                # Skip strategies not meant for this style
+                is_scalping = "scalp" in strat_name.lower() or "vwap" in strat_name.lower()
+                is_swing = "swing" in strat_name.lower() or "fractal" in strat_name.lower()
+                is_positional = "trend" in strat_name.lower() or "rotation" in strat_name.lower() or "golden" in strat_name.lower() or "options" in strat_name.lower()
+                
+                if style == "scalping" and not is_scalping: continue
+                if style == "swing" and not is_swing: continue
+                if style == "positional" and not is_positional: continue
 
                 await self.event_bus.emit(AgentEvent(
                     event_type=AgentEventType.STRATEGY_ANALYZING,
@@ -1370,6 +1479,53 @@ class TradingAgent:
             "confidence_pct": round(confidence_pct, 2),
             "signal": signal_type.value,
         }
+
+    async def _resolve_atm_options_for_underlyings(self, underlyings: List[str]) -> List[str]:
+        """Fetch the nearest-expiry ATM CE and PE symbols for a list of underlyings."""
+        option_symbols: List[str] = []
+        for underlying in underlyings:
+            if not underlying.startswith("NSE:"):
+                # Only NSE FNO currently supported for options in this agent
+                continue
+                
+            try:
+                # Use executor to offload sync HTTP request
+                chain = await asyncio.to_thread(
+                    self.options_service.get_canonical_chain,
+                    underlying=underlying,
+                    strike_count=4,  # Fetch a few strikes to find ATM
+                    include_expiries=1, # Only nearest expiry
+                )
+                
+                expiry_data = chain.get("data", {}).get("expiryData", [])
+                if not expiry_data:
+                    continue
+                    
+                nearest = expiry_data[0]
+                spot = nearest.get("spot", 0.0)
+                strikes = nearest.get("strikes", [])
+                
+                if spot <= 0 or not strikes:
+                    continue
+                
+                # Find closest strike
+                atm_row = min(strikes, key=lambda row: abs(row.get("strike", 0.0) - spot))
+                
+                ce_symbol = atm_row.get("ce", {}).get("symbol")
+                pe_symbol = atm_row.get("pe", {}).get("symbol")
+                
+                if ce_symbol and ce_symbol.startswith("NSE:"):
+                    option_symbols.append(ce_symbol)
+                if pe_symbol and pe_symbol.startswith("NSE:"):
+                    option_symbols.append(pe_symbol)
+                    
+                # Yield context slightly to not block thread
+                await asyncio.sleep(0.01)
+                
+            except Exception as e:
+                logger.warning("atm_options_fetch_failed", underlying=underlying, error=str(e))
+                
+        return option_symbols
 
     async def _attempt_bootstrap_exploration(
         self,
@@ -2081,14 +2237,17 @@ class TradingAgent:
 
         # Risk validation (after sizing so actual exposure is validated)
         effective_max_position_size_inr = effective_max_position_size * float(market_allocation["fx_to_inr"])
-        effective_concentration_pct_total = (
-            effective_max_position_size_inr / max(self.total_allocated_capital_inr(), 1.0)
-        )
+        # Use the per-market max_instrument_pct (e.g. 20–25%) as the
+        # concentration ceiling so that position-size is the real gate.
+        # The old formula divided position_size by total_capital, giving
+        # ~0.5% — far too tight for any trade to pass.
+        effective_concentration_pct_total = float(market_allocation.get("max_instrument_pct", 25.0)) / 100.0
         with self._temporary_risk_overrides(
             max_position_size=effective_max_position_size_inr,
             max_risk_per_trade_pct=effective_max_risk_per_trade_pct,
             max_open_positions=effective_max_open_positions,
             max_concentration_pct=effective_concentration_pct_total,
+            capital=float(market_allocation.get("allocated_capital_inr", self.total_allocated_capital_inr())),
         ):
             validation = self.risk_manager.validate_trade(
                 symbol=execution_symbol,
@@ -3269,6 +3428,7 @@ class TradingAgent:
         max_risk_per_trade_pct: float,
         max_open_positions: int,
         max_concentration_pct: float,
+        capital: Optional[float] = None,
     ):
         cfg = self.risk_manager.config
         snapshot = (
@@ -3276,11 +3436,14 @@ class TradingAgent:
             cfg.max_risk_per_trade_pct,
             cfg.max_open_positions,
             cfg.max_concentration_pct,
+            cfg.capital,
         )
         cfg.max_position_size = max(float(max_position_size), 1.0)
         cfg.max_risk_per_trade_pct = max(float(max_risk_per_trade_pct), 0.0001)
         cfg.max_open_positions = max(int(max_open_positions), 1)
         cfg.max_concentration_pct = min(max(float(max_concentration_pct), 0.01), 1.0)
+        if capital is not None:
+            cfg.capital = max(float(capital), 1.0)
         try:
             yield
         finally:
@@ -3289,6 +3452,7 @@ class TradingAgent:
                 cfg.max_risk_per_trade_pct,
                 cfg.max_open_positions,
                 cfg.max_concentration_pct,
+                cfg.capital,
             ) = snapshot
 
     async def _resolve_option_contract(

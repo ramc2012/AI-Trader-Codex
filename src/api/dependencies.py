@@ -60,7 +60,7 @@ _fyers_client: Optional[FyersClient] = None
 _instrument_registry: Optional[InstrumentRegistryService] = None
 _runtime_manager: Optional[RuntimeManager] = None
 _agent_event_bus: Optional[AgentEventBus] = None
-_trading_agent: Optional[TradingAgent] = None
+_trading_agents: dict[str, TradingAgent] = {}
 _telegram_notifier: Optional[TelegramNotifier] = None
 _tick_aggregator: Optional[RealTimeAggregator] = None
 _fractal_scan_notifier: Optional[FractalScanNotifier] = None
@@ -196,6 +196,35 @@ def get_fyers_client() -> FyersClient:
     return _fyers_client
 
 
+def get_broker_client(name: str | None = None) -> "BrokerBase":
+    """Get the active broker client by name. Defaults to settings.active_broker.
+
+    Supported brokers: 'fyers', 'upstox', 'fivepaisa'.
+    Returns the broker-specific client implementing BrokerBase.
+    """
+    from src.integrations.broker_base import BrokerBase
+
+    settings = get_settings()
+    broker_name = (name or settings.active_broker).lower().strip()
+
+    if broker_name == "fyers":
+        return get_fyers_client()
+    elif broker_name == "upstox":
+        from src.integrations.upstox_client import UpstoxClient
+        global _upstox_client
+        if "_upstox_client" not in globals() or _upstox_client is None:
+            _upstox_client = UpstoxClient()
+        return _upstox_client
+    elif broker_name in ("fivepaisa", "5paisa"):
+        from src.integrations.fivepaisa_client import FivePaisaClient
+        global _fivepaisa_client
+        if "_fivepaisa_client" not in globals() or _fivepaisa_client is None:
+            _fivepaisa_client = FivePaisaClient()
+        return _fivepaisa_client
+    else:
+        raise ValueError(f"Unknown broker: {broker_name}. Supported: fyers, upstox, fivepaisa")
+
+
 def get_instrument_registry() -> InstrumentRegistryService:
     """Get or create the singleton instrument registry service."""
     global _instrument_registry
@@ -228,15 +257,16 @@ def get_agent_event_bus() -> AgentEventBus:
     return _agent_event_bus
 
 
-def get_trading_agent(config: Optional[AgentConfig] = None) -> TradingAgent:
-    """Get or create the singleton TradingAgent.
+def get_trading_agent(style: str = "default", config: Optional[AgentConfig] = None) -> TradingAgent:
+    """Get or create the singleton TradingAgent for a specific style.
 
     On first call, the agent is created with the provided (or default) config.
     Subsequent calls return the existing instance. To replace the agent, call
-    reset_trading_agent() first.
+    reset_trading_agent(style) first.
     """
-    global _trading_agent
-    if _trading_agent is None:
+    global _trading_agents
+    agent = _trading_agents.get(style)
+    if agent is None:
         if config is None:
             settings = get_settings()
             config = AgentConfig(
@@ -270,8 +300,10 @@ def get_trading_agent(config: Optional[AgentConfig] = None) -> TradingAgent:
                 reinforcement_alpha=settings.agent_reinforcement_alpha,
                 reinforcement_size_boost_pct=settings.agent_reinforcement_size_boost_pct,
                 telegram_status_interval_minutes=settings.telegram_status_interval_minutes,
+                paper_mode=True,  # 🔒 Force Paper Trading globally
+                agent_style=style,
             )
-        _trading_agent = TradingAgent(
+        agent = TradingAgent(
             config=config,
             strategy_executor=get_strategy_executor(),
             order_manager=get_order_manager(),
@@ -280,13 +312,14 @@ def get_trading_agent(config: Optional[AgentConfig] = None) -> TradingAgent:
             event_bus=get_agent_event_bus(),
             fyers_client=get_fyers_client(),
         )
-    return _trading_agent
+        _trading_agents[style] = agent
+    return agent
 
 
-def reset_trading_agent() -> None:
+def reset_trading_agent(style: str = "default") -> None:
     """Reset the TradingAgent singleton (for reconfiguration)."""
-    global _trading_agent
-    _trading_agent = None
+    global _trading_agents
+    _trading_agents.pop(style, None)
 
 
 def get_ohlc_cache() -> OHLCCache:
@@ -351,7 +384,7 @@ def reset_managers() -> None:
     """Reset all manager singletons to None (for testing)."""
     global _order_manager, _position_manager, _strategy_executor
     global _risk_manager, _risk_calculator, _health_monitor, _alert_manager
-    global _fyers_client, _agent_event_bus, _trading_agent, _telegram_notifier, _fractal_scan_notifier
+    global _fyers_client, _agent_event_bus, _trading_agents, _telegram_notifier, _fractal_scan_notifier
 
     _order_manager = None
     _position_manager = None
@@ -364,6 +397,6 @@ def reset_managers() -> None:
     _instrument_registry = None
     _runtime_manager = None
     _agent_event_bus = None
-    _trading_agent = None
+    _trading_agents.clear()
     _telegram_notifier = None
     _fractal_scan_notifier = None

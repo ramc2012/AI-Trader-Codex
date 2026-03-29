@@ -1,7 +1,7 @@
 'use client';
 
-import { Suspense, useState } from 'react';
-import { Settings, Server, Database, Loader2, KeyRound, MessageSquare, Send, X } from 'lucide-react';
+import { Suspense, useState, useEffect } from 'react';
+import { Settings, Server, Database, Loader2, KeyRound, MessageSquare, Send, X, ArrowLeftRight } from 'lucide-react';
 import { AuthWizard } from '@/components/auth/auth-wizard';
 import {
   useMarketDataProviders,
@@ -26,6 +26,28 @@ function SettingsContent() {
   const [telegramInterval, setTelegramInterval] = useState(30);
   const [telegramEnabled, setTelegramEnabled] = useState(true);
   const [telegramDialogOpen, setTelegramDialogOpen] = useState(false);
+
+  // Broker selection state
+  const [brokerData, setBrokerData] = useState<any>(null);
+  const [brokerSwitching, setBrokerSwitching] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/v1/auth/broker').then(r => r.json()).then(setBrokerData).catch(() => {});
+  }, [brokerSwitching]);
+
+  const handleSwitchBroker = async (name: string) => {
+    setBrokerSwitching(true);
+    try {
+      await fetch('/api/v1/auth/broker', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ broker: name }),
+      });
+      const res = await fetch('/api/v1/auth/broker');
+      setBrokerData(await res.json());
+    } catch {}
+    setBrokerSwitching(false);
+  };
 
   const handleSaveProviders = () => {
     saveProviders.mutate({
@@ -74,6 +96,54 @@ function SettingsContent() {
         <p className="mt-1 text-sm text-slate-400">
           Manage your broker connection and system configuration
         </p>
+      </div>
+
+      {/* Broker Selection */}
+      <div className="rounded-xl border border-slate-800 bg-slate-900 p-6">
+        <div className="flex items-center gap-3 mb-4">
+          <ArrowLeftRight className="h-5 w-5 text-slate-400" />
+          <h3 className="text-lg font-semibold text-slate-100">
+            Broker Selection
+          </h3>
+        </div>
+        <p className="mb-4 text-sm text-slate-400">
+          Select your active broker. Configure API keys for each broker to enable trading.
+        </p>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          {(brokerData?.brokers ?? [
+            { name: 'fyers', display_name: 'Fyers', active: true, configured: false, authenticated: false },
+            { name: 'upstox', display_name: 'Upstox', active: false, configured: false, authenticated: false },
+            { name: 'fivepaisa', display_name: '5paisa', active: false, configured: false, authenticated: false },
+          ]).map((broker: any) => (
+            <button
+              key={broker.name}
+              onClick={() => handleSwitchBroker(broker.name)}
+              disabled={brokerSwitching || broker.active}
+              className={`rounded-lg border p-4 text-left transition-all ${
+                broker.active
+                  ? 'border-emerald-500/50 bg-emerald-500/10 ring-1 ring-emerald-500/30'
+                  : 'border-slate-700 bg-slate-800/50 hover:border-slate-600 hover:bg-slate-800'
+              } disabled:cursor-default`}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-sm font-semibold text-slate-100">{broker.display_name}</span>
+                {broker.active && (
+                  <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-bold uppercase text-emerald-400">
+                    Active
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2 text-xs">
+                <span className={broker.configured ? 'text-emerald-400' : 'text-slate-500'}>
+                  {broker.configured ? '● Configured' : '○ Not configured'}
+                </span>
+                <span className={broker.authenticated ? 'text-emerald-400' : 'text-slate-500'}>
+                  {broker.authenticated ? '● Auth\'d' : '○ Not auth\'d'}
+                </span>
+              </div>
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Fyers API Connection */}

@@ -15,6 +15,9 @@ import {
   Settings,
   CandlestickChart,
   BarChart3,
+  Zap,
+  Radar,
+  Landmark,
 } from 'lucide-react';
 import { useAuth } from '@/contexts/auth-context';
 import { getCurrentIST } from '@/lib/formatters';
@@ -34,6 +37,11 @@ const NAV_ITEMS = [
   { href: '/positions',  label: 'Positions',  icon: Briefcase },
   { href: '/portfolio',  label: 'Portfolio',  icon: BarChart3 },
   { href: '/strategies', label: 'Strategies', icon: Target },
+  { href: '/scalping',   label: 'Scalping',   icon: Zap },
+  { href: '/swing',      label: 'Swing',      icon: Activity },
+  { href: '/positional', label: 'Positional', icon: Landmark },
+  { href: '/fno-radar',  label: 'FNO Radar',  icon: Radar },
+  { href: '/options-watchlist', label: 'ATM Watchlist', icon: List },
   { href: '/risk',       label: 'Risk',       icon: Shield },
   { href: '/ai-agent',   label: 'AI Agent',   icon: Brain },
   { href: '/monitoring', label: 'Monitoring', icon: Activity },

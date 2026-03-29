@@ -51,31 +51,18 @@ class MLEnsembleStrategy(BaseStrategy):
             return
         self._load_attempted = True
 
-        loaded: list[DirectionPredictor] = []
-        for path in self.model_paths:
-            try:
-                if not Path(path).exists():
-                    continue
-                loaded.append(DirectionPredictor.load(path))
-            except Exception as exc:
-                logger.warning("ml_model_load_failed", path=path, error=str(exc))
-
-        self._models = loaded
-        if not self._models:
+        from src.ml.inference.engine import MLInferenceEngine
+        self._engine = MLInferenceEngine(self.model_paths)
+        self._engine.load_models()
+        
+        if self._engine.is_loaded and self._engine.models:
+            logger.info("ml_ensemble_loaded", models=len(self._engine.models))
+        else:
             logger.warning("ml_ensemble_no_models_loaded", paths=self.model_paths)
-            return
-
-        extractor = UnifiedFeatureExtractor(use_option_features=True)
-        self._signal_generator = SignalGenerator(
-            models=self._models,
-            feature_extractor=extractor,
-            confidence_threshold=self.confidence_threshold,
-        )
-        logger.info("ml_ensemble_loaded", models=len(self._models))
 
     def generate_signals(self, data: pd.DataFrame) -> list[Signal]:
         self._ensure_loaded()
-        if self._signal_generator is None or data.empty:
+        if not hasattr(self, '_engine') or not self._engine.is_loaded or data.empty:
             return []
 
         symbol = ""
@@ -83,12 +70,43 @@ class MLEnsembleStrategy(BaseStrategy):
             symbol = str(data["symbol"].iloc[-1])
 
         try:
-            signal = self._signal_generator.generate_signal(
-                data=data,
+            # Get prediction dictionary from the inference engine
+            pred_dict = self._engine.predict(data, symbol)
+            direction = pred_dict.get("predicted_direction", "neutral")
+            confidence = pred_dict.get("confidence", 0.0)
+            latency = pred_dict.get("latency_ms", 0.0)
+            
+            if direction == "neutral" or confidence < self.confidence_threshold:
+                return []
+                
+            signal_type = "BUY" if direction == "buy" else "SELL"
+            
+            # Formulate the signal
+            close_price = float(data["close"].iloc[-1])
+            is_buy = signal_type == "BUY"
+            
+            # Simple ML Target mapping based on ATR or fixed %
+            atr = float(data["atr"].iloc[-1]) if "atr" in data.columns else close_price * 0.005
+            target_distance = atr * 2.0
+            stop_distance = atr * 1.5
+            
+            target = close_price + target_distance if is_buy else close_price - target_distance
+            stop_loss = close_price - stop_distance if is_buy else close_price + stop_distance
+            
+            signal = Signal(
                 symbol=symbol,
-                confidence_threshold=self.confidence_threshold,
+                signal_type=signal_type,
+                price=close_price,
+                target=target,
+                stop_loss=stop_loss,
+                conviction=min(100, int(confidence * 100)),
+                metadata={
+                    "model_latency_ms": round(latency, 2),
+                    "confidence_score": round(confidence, 3),
+                    "ml_features": pred_dict.get("features", {})
+                }
             )
-            return [signal] if signal is not None else []
+            return [signal]
         except Exception as exc:
             logger.warning("ml_ensemble_signal_failed", error=str(exc))
             return []

@@ -146,7 +146,7 @@ class StrategyExecutor:
         self._alert_manager = am
 
     def process_data(
-        self, data: Any, symbol: str = ""
+        self, data: Any, symbol: str = "", regime_meta: Dict[str, Any] | None = None, macro_context: Dict[str, Any] | None = None
     ) -> List[Dict[str, Any]]:
         """Feed market data to all enabled strategies and collect signals.
 
@@ -156,6 +156,7 @@ class StrategyExecutor:
         Args:
             data: Market data (typically a pandas DataFrame).
             symbol: Symbol the data belongs to.
+            regime_meta: Optional regime context to adapt signal convictions.
 
         Returns:
             List of result dicts, each containing strategy name, signal,
@@ -186,6 +187,11 @@ class StrategyExecutor:
                         state.last_signal_time = datetime.now()
 
                 for signal in new_signals:
+                    if regime_meta:
+                        self._apply_regime_weighting(signal, name, regime_meta)
+                    if macro_context:
+                        self._apply_macro_weighting(signal, name, macro_context)
+                        
                     result: Dict[str, Any] = {
                         "strategy": name,
                         "signal": signal,
@@ -202,6 +208,70 @@ class StrategyExecutor:
                 )
 
         return results
+
+    def _apply_macro_weighting(self, signal: Any, strategy_name: str, macro: Dict[str, Any]) -> None:
+        """Dynamically scale signal conviction based on macro sentiment and institutional flow."""
+        if not hasattr(signal, "conviction") or signal.conviction is None:
+            return
+            
+        sentiment = macro.get("sentiment_score", 0.0)
+        fii_flow = macro.get("fii_net_crores", 0.0)
+        dii_flow = macro.get("dii_net_crores", 0.0)
+        net_flow = fii_flow + dii_flow
+        
+        multiplier = 1.0
+        
+        # If sentiment is very bullish and institutional flows are positive
+        if sentiment > 0.4 and net_flow > 500:
+            multiplier = 1.25 if signal.signal_type == "BUY" else 0.75
+        # If sentiment is very bearish and institutional flows are negative
+        elif sentiment < -0.4 and net_flow < -500:
+            multiplier = 1.25 if signal.signal_type == "SELL" else 0.75
+            
+        new_conviction = int(signal.conviction * multiplier)
+        signal.conviction = max(1, min(100, new_conviction))
+        
+        if hasattr(signal, "metadata") and isinstance(signal.metadata, dict):
+            signal.metadata["macro_multiplier"] = round(multiplier, 2)
+            signal.metadata["sentiment_score"] = sentiment
+            signal.metadata["net_inst_flow"] = net_flow
+
+    def _apply_regime_weighting(self, signal: Any, strategy_name: str, regime: Dict[str, Any]) -> None:
+        """Dynamically scale signal conviction based on market regime."""
+        if not hasattr(signal, "conviction") or signal.conviction is None:
+            return
+            
+        regime_label = str(regime.get("regime", "neutral")).lower()
+        strat_lower = strategy_name.lower()
+        multiplier = 1.0
+
+        # Bull Regime: boost long trends/swings, reduce mean-reversion shorts
+        if regime_label == "bull":
+            if "trend" in strat_lower or "macd" in strat_lower or "ml_ensemble" in strat_lower:
+                multiplier = 1.2 if signal.signal_type == "BUY" else 0.8
+            elif "rsi" in strat_lower or "reversal" in strat_lower:
+                multiplier = 0.8 if signal.signal_type == "SELL" else 1.1
+
+        # Bear Regime: boost short trends/swings
+        elif regime_label == "bear":
+            if "trend" in strat_lower or "macd" in strat_lower or "ml_ensemble" in strat_lower:
+                multiplier = 1.2 if signal.signal_type == "SELL" else 0.8
+            elif "rsi" in strat_lower or "reversal" in strat_lower:
+                multiplier = 0.8 if signal.signal_type == "BUY" else 1.1
+
+        # Volatile/Chop Regime: Boost scalpers & Mean-reversion
+        elif regime_label in ["volatile", "chop", "sideways"]:
+            if "scalp" in strat_lower or "vwap" in strat_lower or "reversal" in strat_lower:
+                multiplier = 1.3
+            elif "trend" in strat_lower:
+                multiplier = 0.7  # Trends fail in chop
+
+        new_conviction = int(signal.conviction * multiplier)
+        signal.conviction = max(1, min(100, new_conviction))
+        
+        if hasattr(signal, "metadata") and isinstance(signal.metadata, dict):
+            signal.metadata["regime_multiplier"] = round(multiplier, 2)
+            signal.metadata["regime_applied"] = regime_label
 
     def _filter_new_signals(
         self,

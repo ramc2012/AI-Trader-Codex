@@ -68,11 +68,23 @@ def _sync_risk_manager_config(body: AgentConfigRequest) -> None:
         crypto_cap_inr * (float(body.crypto_max_instrument_pct) / 100.0),
         1.0,
     )
+    # Reset stale position value accumulators from prior sessions.
+    # Only currently-open positions (tracked by PositionManager) matter.
+    risk_manager._position_values.clear()
     risk_manager.config.capital = total_capital_inr
     risk_manager.config.max_daily_loss_pct = max(float(body.max_daily_loss_pct), 0.0) / 100.0
     risk_manager.config.max_daily_loss = total_capital_inr * risk_manager.config.max_daily_loss_pct
     risk_manager.config.max_position_size = max_position_size_inr
-    risk_manager.config.max_concentration_pct = max_position_size_inr / max(total_capital_inr, 1.0)
+    # Use the highest per-market max_instrument_pct as the base concentration
+    # limit.  Previously this was computed as position_size / total_capital
+    # which yielded ~0.09%, blocking every single trade.
+    max_instrument_pct = max(
+        float(body.india_max_instrument_pct),
+        float(body.us_max_instrument_pct),
+        float(body.crypto_max_instrument_pct),
+        5.0,
+    )
+    risk_manager.config.max_concentration_pct = max_instrument_pct / 100.0
 
 
 def _json_safe(value: Any) -> Any:
@@ -841,7 +853,7 @@ async def _build_strategy_inspection(
 
 async def _close_all_positions_for_kill_switch(reason: str) -> Dict[str, Any]:
     """Flatten all open positions and cancel open orders after kill-switch activation."""
-    agent = get_trading_agent()
+    agent = get_trading_agent("default")
     position_manager = get_position_manager()
     order_manager = get_order_manager()
     risk_manager = get_risk_manager()
@@ -887,14 +899,14 @@ async def _close_all_positions_for_kill_switch(reason: str) -> Dict[str, Any]:
 
 
 @router.post("/start")
-async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
+async def start_agent(body: AgentConfigRequest, style: str = "default") -> Dict[str, Any]:
     """Start the AI trading agent with the given configuration."""
     risk_manager = get_risk_manager()
     if risk_manager.emergency_stop:
         return {
             "success": False,
             "message": "Kill switch is active. Clear it before restarting the agent.",
-            "state": get_trading_agent().state.value,
+            "state": get_trading_agent(style).state.value,
             "emergency_stop": True,
         }
 
@@ -947,14 +959,14 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
         )
 
     # Resolve existing singleton first, then replace if configuration differs.
-    agent = get_trading_agent()
+    agent = get_trading_agent(style)
     if agent.state == AgentState.RUNNING:
         return {"success": False, "message": "Agent is already running. Stop it first."}
 
     if agent.config != config or agent.state in (AgentState.STOPPED, AgentState.ERROR):
-        reset_trading_agent()
+        reset_trading_agent(style)
         _sync_risk_manager_config(body)
-        agent = get_trading_agent(config)
+        agent = get_trading_agent(style, config)
     else:
         _sync_risk_manager_config(body)
 
@@ -968,9 +980,9 @@ async def start_agent(body: AgentConfigRequest) -> Dict[str, Any]:
 
 
 @router.post("/stop")
-async def stop_agent() -> Dict[str, Any]:
+async def stop_agent(style: str = "default") -> Dict[str, Any]:
     """Stop the AI trading agent gracefully."""
-    agent = get_trading_agent()
+    agent = get_trading_agent(style)
     if agent.state not in (AgentState.RUNNING, AgentState.PAUSED):
         return {"success": False, "message": f"Agent is not running (state: {agent.state.value})"}
 
@@ -984,9 +996,9 @@ async def stop_agent() -> Dict[str, Any]:
 
 
 @router.post("/pause")
-async def pause_agent() -> Dict[str, Any]:
+async def pause_agent(style: str = "default") -> Dict[str, Any]:
     """Activate kill switch, flatten portfolio, and block further trading."""
-    agent = get_trading_agent()
+    agent = get_trading_agent(style)
     risk_manager = get_risk_manager()
     risk_manager.trigger_emergency_stop("manual_kill_switch")
 
@@ -1020,14 +1032,14 @@ async def pause_agent() -> Dict[str, Any]:
 
 
 @router.post("/resume")
-async def resume_agent() -> Dict[str, Any]:
+async def resume_agent(style: str = "default") -> Dict[str, Any]:
     """Clear the kill switch. Starting remains a separate explicit action."""
     risk_manager = get_risk_manager()
     if not risk_manager.emergency_stop:
         return {
             "success": True,
             "message": "Kill switch is already cleared.",
-            "state": get_trading_agent().state.value,
+            "state": get_trading_agent(style).state.value,
             "emergency_stop": False,
         }
 
@@ -1038,7 +1050,7 @@ async def resume_agent() -> Dict[str, Any]:
         message="Trading remains stopped until you start the agent again.",
         severity="success",
     ))
-    agent = get_trading_agent()
+    agent = get_trading_agent(style)
     return {
         "success": True,
         "message": "Kill switch cleared. Use Start to resume trading.",
@@ -1048,16 +1060,16 @@ async def resume_agent() -> Dict[str, Any]:
 
 
 @router.get("/status", response_model=AgentStatusResponse)
-async def get_agent_status() -> Dict[str, Any]:
+async def get_agent_status(style: str = "default") -> Dict[str, Any]:
     """Get current agent status and metrics."""
-    agent = get_trading_agent()
+    agent = get_trading_agent(style)
     return agent.get_status()
 
 
 @router.get("/readiness")
-async def get_agent_readiness() -> Dict[str, Any]:
+async def get_agent_readiness(style: str = "default") -> Dict[str, Any]:
     """Get market readiness breakdown used by the agent loop."""
-    agent = get_trading_agent()
+    agent = get_trading_agent(style)
     status = agent.get_status()
     return {
         "state": status.get("state"),
@@ -1082,9 +1094,9 @@ async def list_available_strategies() -> Dict[str, Any]:
 
 
 @router.get("/strategy-controls")
-async def get_strategy_controls() -> Dict[str, Any]:
+async def get_strategy_controls(style: str = "default") -> Dict[str, Any]:
     """Get enabled/disabled runtime state for each strategy."""
-    agent = get_trading_agent()
+    agent = get_trading_agent(style)
     return {"controls": agent.get_strategy_controls()}
 
 
@@ -1817,3 +1829,59 @@ async def notify_fractal_scan_telegram() -> Dict[str, Any]:
         "delivered_messages": delivered,
         "date": payload.get("date"),
     }
+
+
+from fastapi import WebSocket, WebSocketDisconnect
+import json
+
+@router.websocket("/ws/stream")
+async def agent_ws_stream(websocket: WebSocket, style: str = "all"):
+    """
+    Stream live agent events via WebSocket.
+    Optional query parameter ?style=scalping/swing/positional to filter events.
+    """
+    await websocket.accept()
+    bus = get_agent_event_bus()
+    queue = bus.subscribe()
+    
+    # Send the initial status to hydrate the client immediately upon connection
+    agent = get_trading_agent()
+    try:
+        initial_status = agent.get_status()
+        await websocket.send_json({
+            "type": "initial_status",
+            "data": _json_safe(initial_status)
+        })
+        
+        while True:
+            event = await queue.get()
+            payload = event.to_ws_payload()
+            
+            # Simple topic filtering
+            if style == "all":
+                await websocket.send_json(payload)
+                continue
+                
+            metadata = payload.get("metadata", {})
+            event_style = metadata.get("trading_style")
+            
+            # Additional heuristic fallbacks if trading_style isn't explicitly set yet
+            if not event_style:
+                strategy = str(metadata.get("strategy", "")).lower()
+                if "scalp" in strategy or "vwap" in strategy:
+                    event_style = "scalping"
+                elif "swing" in strategy or "fractal" in strategy or "divergence" in strategy:
+                    event_style = "swing"
+                elif "trend" in strategy or "sector" in strategy or "ema" in strategy:
+                    event_style = "positional"
+
+            if event_style == style or payload["event_type"] in ("agent_started", "agent_stopped", "agent_error", "agent_paused", "circuit_breaker"):
+                await websocket.send_json(payload)
+                
+    except WebSocketDisconnect:
+        logger.info(f"client_disconnected_ws", style=style)
+    except Exception as e:
+        logger.error(f"ws_stream_error", error=str(e), style=style)
+    finally:
+        bus.unsubscribe(queue)
+

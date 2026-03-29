@@ -672,3 +672,49 @@ async def get_fno_symbols(session: AsyncSession) -> list[str]:
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+# =============================================================================
+# AlternativeData Operations
+# =============================================================================
+
+
+async def upsert_alternative_data(
+    session: AsyncSession,
+    data: dict[str, Any],
+) -> None:
+    """Upsert alternative data (sentiment, breadth, flows)."""
+    if not data:
+        return
+
+    from src.database.models import AlternativeData
+    stmt = pg_insert(AlternativeData).values(**data)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["timestamp"],
+        set_={
+            "fii_net_crores": stmt.excluded.fii_net_crores,
+            "dii_net_crores": stmt.excluded.dii_net_crores,
+            "market_breadth_ratio": stmt.excluded.market_breadth_ratio,
+            "news_sentiment_score": stmt.excluded.news_sentiment_score,
+            "news_sentiment_label": stmt.excluded.news_sentiment_label,
+        },
+    )
+    await session.execute(stmt)
+    logger.debug("alternative_data_upserted", timestamp=data.get("timestamp"))
+
+
+async def get_latest_alternative_data(
+    session: AsyncSession,
+) -> dict[str, Any] | None:
+    """Fetch the most recent alternative data snapshot."""
+    from src.database.models import AlternativeData
+    stmt = (
+        select(AlternativeData)
+        .order_by(AlternativeData.timestamp.desc())
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    row = result.scalar_one_or_none()
+    if row:
+        return row.to_dict()
+    return None

@@ -27,7 +27,6 @@ TELEGRAM_EVENT_FILTER: Set[AgentEventType] = {
     AgentEventType.AGENT_RESUMED,
     AgentEventType.AGENT_ERROR,
     AgentEventType.ORDER_PLACED,
-    AgentEventType.ORDER_REJECTED,
     AgentEventType.POSITION_OPENED,
     AgentEventType.POSITION_CLOSED,
     AgentEventType.DAILY_SUMMARY,

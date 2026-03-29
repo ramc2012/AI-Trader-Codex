@@ -756,3 +756,78 @@ async def get_token_status(
             needs_full_reauth=True,
             has_saved_pin=False,
         )
+
+
+# ── Broker Selection ──────────────────────────────────────────────────────────
+
+@router.get("/auth/broker")
+async def get_active_broker() -> Dict[str, Any]:
+    """Return active broker name and status for all supported brokers."""
+    settings = get_settings()
+    active = str(settings.active_broker).lower().strip()
+
+    brokers = []
+    for broker_name in ("fyers", "upstox", "fivepaisa"):
+        status: Dict[str, Any] = {
+            "name": broker_name,
+            "display_name": {"fyers": "Fyers", "upstox": "Upstox", "fivepaisa": "5paisa"}[broker_name],
+            "active": broker_name == active,
+            "configured": False,
+            "authenticated": False,
+        }
+        try:
+            if broker_name == "fyers":
+                status["configured"] = bool(settings.fyers_app_id and settings.fyers_secret_key)
+                if status["configured"]:
+                    client = get_fyers_client()
+                    status["authenticated"] = client.is_authenticated
+            elif broker_name == "upstox":
+                status["configured"] = bool(getattr(settings, "upstox_api_key", ""))
+                if status["configured"]:
+                    try:
+                        from src.integrations.upstox_client import UpstoxClient
+                        uc = UpstoxClient()
+                        status["authenticated"] = uc.is_authenticated
+                    except Exception:
+                        pass
+            elif broker_name == "fivepaisa":
+                status["configured"] = bool(getattr(settings, "fivepaisa_user_key", ""))
+                if status["configured"]:
+                    try:
+                        from src.integrations.fivepaisa_client import FivePaisaClient
+                        fc = FivePaisaClient()
+                        status["authenticated"] = fc.is_authenticated
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        brokers.append(status)
+
+    return {
+        "active_broker": active,
+        "brokers": brokers,
+    }
+
+
+@router.post("/auth/broker")
+async def switch_broker(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Switch the active broker. Requires restart for full effect."""
+    broker_name = str(body.get("broker", "")).lower().strip()
+
+    if broker_name not in ("fyers", "upstox", "fivepaisa"):
+        raise HTTPException(status_code=400, detail=f"Unknown broker: {broker_name}")
+
+    updates = {"ACTIVE_BROKER": broker_name}
+    success = _get_env_manager().update_env(updates, create_backup=True)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update broker setting.")
+
+    get_settings.cache_clear()
+    logger.info("broker_switched", broker=broker_name)
+
+    return {
+        "success": True,
+        "active_broker": broker_name,
+        "message": f"Active broker set to {broker_name}. Restart agent for full effect.",
+    }
+

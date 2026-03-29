@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from src.api.dependencies import (
     get_agent_event_bus,
     get_alert_manager,
+    get_order_manager,
     get_position_manager,
     get_risk_manager,
     get_runtime_manager,
@@ -24,7 +25,13 @@ from src.api.dependencies import (
     get_state_change_bus,
     get_strategy_executor,
 )
-from src.api.routes.trading import _build_currency_aware_portfolio
+from src.api.routes.trading import (
+    _build_currency_aware_portfolio,
+    _build_trade_pairs,
+    _market_is_open,
+    _order_to_response,
+    _position_exit_metrics,
+)
 from src.config.constants import INDEX_INSTRUMENTS
 from src.config.market_hours import IST
 from src.config.settings import get_settings
@@ -100,6 +107,17 @@ tick_manager = ConnectionManager()
 options_manager = ConnectionManager()
 charts_manager = ConnectionManager()
 agent_manager = ConnectionManager()
+positions_manager = ConnectionManager()
+orders_manager = ConnectionManager()
+trades_manager = ConnectionManager()
+
+
+# =========================================================================
+# Payload Builders
+# =========================================================================
+
+
+# Payload builders are defined at the bottom.
 
 
 # =========================================================================
@@ -170,6 +188,68 @@ async def positions_ws(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "heartbeat"})
     except WebSocketDisconnect:
         pass
+    finally:
+        bus.unsubscribe(queue)
+
+
+@router.websocket("/ws/orders")
+async def orders_ws(websocket: WebSocket) -> None:
+    """Stream all orders on state changes."""
+    bus = get_state_change_bus()
+    queue = bus.subscribe()
+    await orders_manager.connect(websocket)
+    logger.info("websocket_connected", type="orders", client=websocket.client.host if websocket.client else "unknown")
+    try:
+        # Initial push
+        payload = _build_orders_payload()
+        await orders_manager.send_json(websocket, payload)
+
+        while True:
+            try:
+                topic = await asyncio.wait_for(queue.get(), timeout=5.0)
+                if topic == "orders":
+                    payload = _build_orders_payload()
+                    await orders_manager.send_json(websocket, payload)
+            except asyncio.TimeoutError:
+                # Heartbeat
+                await orders_manager.send_json(websocket, {"type": "heartbeat"})
+    except WebSocketDisconnect:
+        orders_manager.disconnect(websocket)
+        logger.info("websocket_disconnected", type="orders")
+    except Exception as e:
+        logger.error("websocket_error", type="orders", error=str(e))
+        orders_manager.disconnect(websocket)
+    finally:
+        bus.unsubscribe(queue)
+
+
+@router.websocket("/ws/trades")
+async def trades_ws(websocket: WebSocket) -> None:
+    """Stream matched trade pairs on order activity."""
+    bus = get_state_change_bus()
+    queue = bus.subscribe()
+    await trades_manager.connect(websocket)
+    logger.info("websocket_connected", type="trades", client=websocket.client.host if websocket.client else "unknown")
+    try:
+        # Initial push
+        payload = _build_trades_payload()
+        await trades_manager.send_json(websocket, payload)
+
+        while True:
+            try:
+                topic = await asyncio.wait_for(queue.get(), timeout=5.0)
+                if topic == "orders":  # Both use orders trigger
+                    payload = _build_trades_payload()
+                    await trades_manager.send_json(websocket, payload)
+            except asyncio.TimeoutError:
+                # Heartbeat
+                await trades_manager.send_json(websocket, {"type": "heartbeat"})
+    except WebSocketDisconnect:
+        trades_manager.disconnect(websocket)
+        logger.info("websocket_disconnected", type="trades")
+    except Exception as e:
+        logger.error("websocket_error", type="trades", error=str(e))
+        trades_manager.disconnect(websocket)
     finally:
         bus.unsubscribe(queue)
 
@@ -499,3 +579,100 @@ def _build_dashboard_payload() -> Dict[str, Any]:
         },
         "ws_connections": dashboard_manager.active_connections,
     }
+def _build_positions_payload() -> Dict[str, Any]:
+    """Build the positions WebSocket payload from current state."""
+    try:
+        pm = get_position_manager()
+        se = get_strategy_executor()
+        settings = get_settings()
+        usd_inr_rate = float(settings.usd_inr_reference_rate)
+        now = datetime.now(tz=IST)
+        
+        positions = pm.get_all_positions()
+        out_positions = []
+        
+        for position in positions:
+            currency, currency_symbol, fx_to_inr = _parse_currency_info(position.symbol, usd_inr_rate)
+            market = _classify_market_info(position.symbol)
+            # In a real app we'd get the plan from the agent, but for now we'll try to find it
+            # if we can't we'll just send empty metrics. 
+            # Actually, let's just use empty metrics if we can't easily get the plan here
+            # to avoid circular dependencies with the agent.
+            exit_metrics = {
+                "stop_loss": None, "target": None, "time_exit_at": None,
+                "time_left_seconds": None, "distance_to_stop_pct": None,
+                "distance_to_target_pct": None, "progress_to_target_pct": None
+            }
+            
+            out_positions.append({
+                "symbol": position.symbol,
+                "market": market,
+                "market_open": _market_is_open(market, now),
+                "quantity": position.quantity,
+                "side": position.side.value,
+                "avg_price": position.avg_price,
+                "current_price": position.current_price,
+                "entry_time": position.entry_time.isoformat() if position.entry_time else None,
+                "strategy_tag": position.strategy_tag,
+                "order_ids": list(position.order_ids),
+                "unrealized_pnl": position.unrealized_pnl,
+                "unrealized_pnl_pct": position.unrealized_pnl_pct,
+                "market_value": position.market_value,
+                "is_profitable": position.is_profitable,
+                "currency": currency,
+                "currency_symbol": currency_symbol,
+                "fx_to_inr": fx_to_inr,
+                "unrealized_pnl_inr": position.unrealized_pnl * fx_to_inr,
+                "market_value_inr": position.market_value * fx_to_inr,
+                **exit_metrics
+            })
+            
+        return {
+            "type": "positions_update",
+            "timestamp": now.isoformat(),
+            "positions": out_positions
+        }
+    except Exception as e:
+        logger.error("error_building_positions_payload", error=str(e))
+        return {
+            "type": "positions_update",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "positions": []
+        }
+
+def _parse_currency_info(symbol: str, usd_inr_rate: float):
+    from src.utils.market_symbols import parse_currency_context
+    return parse_currency_context(symbol, usd_inr_rate)
+
+def _build_orders_payload() -> Dict[str, Any]:
+    """Build the orders WebSocket payload."""
+    try:
+        om = get_order_manager()
+        orders = om.get_all_orders()
+        return {
+            "type": "orders_update",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "orders": [_order_to_response(o).dict() for o in orders]
+        }
+    except Exception as e:
+        logger.error("error_building_orders_payload", error=str(e))
+        return {"type": "orders_update", "orders": []}
+
+def _build_trades_payload() -> Dict[str, Any]:
+    """Build the trades ( FIFO matched pairs) WebSocket payload."""
+    try:
+        om = get_order_manager()
+        settings = get_settings()
+        usd_inr_rate = float(settings.usd_inr_reference_rate)
+        pairs = _build_trade_pairs(
+            orders=om.get_all_orders(),
+            usd_inr_rate=usd_inr_rate,
+        )
+        return {
+            "type": "trades_update",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "trades": [p.dict() for p in pairs]
+        }
+    except Exception as e:
+        logger.error("error_building_trades_payload", error=str(e))
+        return {"type": "trades_update", "trades": []}

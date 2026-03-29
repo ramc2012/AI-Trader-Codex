@@ -13,11 +13,12 @@ import {
 } from 'lucide-react';
 
 import { Skeleton } from '@/components/ui/skeleton';
-import { useOrderPairs } from '@/hooks/use-orders';
 import { usePortfolio } from '@/hooks/use-portfolio';
 import { usePositions } from '@/hooks/use-positions';
 import { usePositionsWS } from '@/hooks/use-positions-ws';
+import { useOrdersWS } from '@/hooks/use-orders-ws';
 import { useDashboardWS } from '@/hooks/use-dashboard-ws';
+import { useOrderPairs } from '@/hooks/use-orders';
 import { formatCurrency, formatDateTime, formatNumber, formatPercent } from '@/lib/formatters';
 import { cn } from '@/lib/utils';
 import type { PortfolioSummary, Position, TradePair } from '@/types/api';
@@ -427,6 +428,7 @@ export default function PositionsPage() {
   const [selectedPosition, setSelectedPosition] = useState<Position | null>(null);
   const { isConnected: isDashboardConnected } = useDashboardWS();
   const { isConnected: isPositionsConnected } = usePositionsWS();
+  const { isConnected: isOrdersConnected } = useOrdersWS();
 
   const {
     data: positions,
@@ -437,12 +439,16 @@ export default function PositionsPage() {
   } = usePositions(!isPositionsConnected);
 
   const { data: portfolio, isLoading: portfolioLoading } = usePortfolio(!isDashboardConnected);
-  const { data: orderPairs, isLoading: historyLoading, error: historyError } = useOrderPairs();
+  const { data: orderPairs, isLoading: historyLoading, error: historyError } = useOrderPairs(!isOrdersConnected);
 
   const sortedPositions = useMemo(() => sortPositions(positions ?? []), [positions]);
   const marketTotals = useMemo(() => buildMarketTotals(portfolio), [portfolio]);
   const historyRows = useMemo(
-    () => [...(orderPairs ?? [])].sort((left, right) => tradeActivityTime(right) - tradeActivityTime(left)),
+    () => [...(orderPairs ?? [])].sort((a, b) => {
+        const timeA = a.exit_time || a.entry_time || '';
+        const timeB = b.exit_time || b.entry_time || '';
+        return new Date(timeB).getTime() - new Date(timeA).getTime();
+    }),
     [orderPairs]
   );
   const historyStats = useMemo(() => buildTradeStats(historyRows), [historyRows]);

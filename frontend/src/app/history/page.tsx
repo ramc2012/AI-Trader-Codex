@@ -16,6 +16,8 @@ import {
 import { useOrderHistory, useTradeHistory, useTradingSummary } from '@/hooks/use-history';
 import { useOrderPairs } from '@/hooks/use-orders';
 import { useDashboardWS } from '@/hooks/use-dashboard-ws';
+import { useOrdersWS } from '@/hooks/use-orders-ws';
+import { useTradesWS } from '@/hooks/use-trades-ws';
 import { formatINR, formatNumber, formatDateTime, formatCurrency } from '@/lib/formatters';
 import { cn } from '@/lib/utils';
 
@@ -125,7 +127,8 @@ function SummaryCards({ isConnected }: { isConnected: boolean }) {
 // ─── Orders table ─────────────────────────────────────────────────────────────
 
 function OrdersTable({ isConnected }: { isConnected: boolean }) {
-  const { data, isLoading, isError, refetch, isFetching } = useOrderHistory(!isConnected);
+  const { isConnected: ordersConnected } = useOrdersWS();
+  const { data, isLoading, isError, refetch, isFetching } = useOrderHistory(!ordersConnected);
   const [sideFilter, setSideFilter] = useState<'all' | 'BUY' | 'SELL'>('all');
   const [statusFilter, setStatusFilter] = useState<string>('all');
 
@@ -409,7 +412,8 @@ function TradesTable({ isConnected }: { isConnected: boolean }) {
 }
 
 function PairedTradesTable({ isConnected }: { isConnected: boolean }) {
-  const { data: pairs, isLoading, isError, refetch, isFetching } = useOrderPairs(!isConnected);
+  const { isConnected: tradesConnected } = useTradesWS();
+  const { data: pairs, isLoading, isError, refetch, isFetching } = useOrderPairs(!tradesConnected);
 
   if (isLoading) {
     return <div className="h-64 animate-pulse rounded-xl border border-slate-800 bg-slate-900/60" />;
@@ -507,7 +511,11 @@ type Tab = 'orders' | 'trades' | 'paired';
 
 export default function HistoryPage() {
   const [tab, setTab] = useState<Tab>('orders');
-  const { isConnected } = useDashboardWS();
+  const { isConnected: isDashboardConnected } = useDashboardWS();
+  const { isConnected: isOrdersConnected } = useOrdersWS();
+  const { isConnected: isTradesConnected } = useTradesWS();
+  
+  const isConnected = isDashboardConnected || isOrdersConnected || isTradesConnected;
 
   return (
     <div className="space-y-6">

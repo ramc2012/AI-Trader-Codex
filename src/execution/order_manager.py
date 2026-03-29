@@ -19,6 +19,7 @@ from src.config.settings import get_settings
 from src.config.market_hours import IST
 from src.utils.exceptions import OrderError
 from src.utils.logger import get_logger
+from src.utils.pubsub import get_state_change_bus
 
 logger = get_logger(__name__)
 
@@ -223,9 +224,14 @@ class OrderManager:
             )
 
         if self.paper_mode:
-            return self._paper_place(order)
-
-        return self._live_place(order)
+            res = self._paper_place(order)
+        else:
+            res = self._live_place(order)
+            
+        if res.success:
+            get_state_change_bus().notify("orders")
+            get_state_change_bus().notify("portfolio")
+        return res
 
     # =========================================================================
     # Order Cancellation
@@ -258,9 +264,14 @@ class OrderManager:
             )
 
         if self.paper_mode:
-            return self._paper_cancel(order_id)
-
-        return self._live_cancel(order_id)
+            res = self._paper_cancel(order_id)
+        else:
+            res = self._live_cancel(order_id)
+            
+        if res.success:
+            get_state_change_bus().notify("orders")
+            get_state_change_bus().notify("portfolio")
+        return res
 
     # =========================================================================
     # Order Modification
@@ -551,6 +562,9 @@ class OrderManager:
         )
         self._persist_state()
 
+        get_state_change_bus().notify("orders")
+        get_state_change_bus().notify("portfolio")
+        
         return OrderResult(
             success=True,
             order_id=order_id,

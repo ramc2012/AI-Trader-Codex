@@ -113,6 +113,7 @@ async def dashboard_ws(websocket: WebSocket) -> None:
     bus = get_state_change_bus()
     queue = bus.subscribe()
     await dashboard_manager.connect(websocket)
+    logger.info("websocket_connected", type="dashboard", client=websocket.client.host if websocket.client else "unknown")
     try:
         # Initial push
         payload = _build_dashboard_payload()
@@ -132,7 +133,9 @@ async def dashboard_ws(websocket: WebSocket) -> None:
                 await dashboard_manager.send_json(websocket, payload)
     except WebSocketDisconnect:
         dashboard_manager.disconnect(websocket)
-    except Exception:
+        logger.info("websocket_disconnected", type="dashboard")
+    except Exception as e:
+        logger.error("websocket_error", type="dashboard", error=str(e))
         dashboard_manager.disconnect(websocket)
     finally:
         bus.unsubscribe(queue)
@@ -384,7 +387,15 @@ async def agent_ws(websocket: WebSocket) -> None:
     event_bus = get_agent_event_bus()
     queue = event_bus.subscribe()
     await agent_manager.connect(websocket)
+    logger.info("websocket_connected", type="agent", client=websocket.client.host if websocket.client else "unknown")
     try:
+        # Initial push (no specific initial state, just heartbeat to confirm)
+        await agent_manager.send_json(websocket, {
+            "type": "heartbeat",
+            "timestamp": datetime.now(tz=IST).isoformat(),
+            "message": "Agent event stream connected"
+        })
+
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=5.0)
@@ -398,7 +409,9 @@ async def agent_ws(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         event_bus.unsubscribe(queue)
         agent_manager.disconnect(websocket)
-    except Exception:
+        logger.info("websocket_disconnected", type="agent")
+    except Exception as e:
+        logger.error("websocket_error", type="agent", error=str(e))
         event_bus.unsubscribe(queue)
         agent_manager.disconnect(websocket)
 

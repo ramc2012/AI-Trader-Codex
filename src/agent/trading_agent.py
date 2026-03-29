@@ -128,7 +128,7 @@ class AgentConfig:
     timeframe: str = "5"
     execution_timeframes: List[str] = field(default_factory=lambda: ["3", "5", "15"])
     reference_timeframes: List[str] = field(default_factory=lambda: ["60", "D"])
-    liberal_bootstrap_enabled: bool = True
+    liberal_bootstrap_enabled: bool = False
     bootstrap_cycles: int = 300
     bootstrap_size_multiplier: float = 2.0
     bootstrap_max_concentration_pct: float = 100.0
@@ -1108,6 +1108,8 @@ class TradingAgent:
                     await asyncio.sleep(self.config.scan_interval_seconds)
                     continue
                 self._circuit_breaker_notified = False
+                active_symbols, sessions = self._get_active_symbols_and_sessions()
+
 
                 # Emit thinking summary
                 short_name = lambda s: s.split(":")[-1].split("-")[0]

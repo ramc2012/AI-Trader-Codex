@@ -157,7 +157,7 @@ class Settings(BaseSettings):
     agent_trade_us_when_open: bool = True
     agent_trade_us_options: bool = True
     agent_trade_crypto_24x7: bool = True
-    agent_liberal_bootstrap_enabled: bool = True
+    agent_liberal_bootstrap_enabled: bool = False
     agent_bootstrap_cycles: int = Field(default=300, ge=1, le=5000)
     agent_bootstrap_size_multiplier: float = Field(default=2.0, ge=1.0, le=5.0)
     agent_bootstrap_max_concentration_pct: float = Field(default=100.0, ge=30.0, le=100.0)

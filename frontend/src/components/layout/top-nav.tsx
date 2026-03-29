@@ -31,6 +31,7 @@ const CHART_PREFIXES = ['/analytics', '/market', '/market-profile', '/order-flow
 
 const NAV_ITEMS = [
   { href: '/',           label: 'Dashboard',  icon: LayoutDashboard, exact: true },
+  { href: '/options-watchlist', label: 'ATM Watchlist', icon: List },
   { href: '/watchlist',  label: 'Watchlist',  icon: List },
   // 'charts' is rendered separately as a direct link
   { href: '/indices/nifty/options', label: 'Options', icon: TrendingUp, matchPrefix: '/indices' },
@@ -41,7 +42,6 @@ const NAV_ITEMS = [
   { href: '/swing',      label: 'Swing',      icon: Activity },
   { href: '/positional', label: 'Positional', icon: Landmark },
   { href: '/fno-radar',  label: 'FNO Radar',  icon: Radar },
-  { href: '/options-watchlist', label: 'ATM Watchlist', icon: List },
   { href: '/risk',       label: 'Risk',       icon: Shield },
   { href: '/ai-agent',   label: 'AI Agent',   icon: Brain },
   { href: '/monitoring', label: 'Monitoring', icon: Activity },

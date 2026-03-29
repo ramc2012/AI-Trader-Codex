@@ -139,7 +139,7 @@ services:
       args:
         API_HOST: backend
         NEXT_PUBLIC_API_URL: /api/v1
-        NEXT_PUBLIC_WS_URL: ws://localhost:${APP_PORT:-8000}/api/v1
+        NEXT_PUBLIC_WS_URL: ""
         NEXT_PUBLIC_APP_NAME_BASE: ${NEXT_PUBLIC_APP_NAME_BASE:-NiftyTraderGravity}
         NEXT_PUBLIC_APP_INSTANCE_LABEL: ${NEXT_PUBLIC_APP_INSTANCE_LABEL:-LOCAL}
     container_name: NiftyTraderGravity-frontend

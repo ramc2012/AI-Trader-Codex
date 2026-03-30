@@ -64,7 +64,7 @@ export function useWebSocket({
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const connectRef = useRef<() => void>(() => {});
   const [isConnected, setIsConnected] = useState(false);
-  const [lastMessage, setLastMessage] = useState<unknown>(null);
+  const lastMessageRef = useRef<unknown>(null);
 
   const connect = useCallback(() => {
     if (!enabled) return;
@@ -80,10 +80,10 @@ export function useWebSocket({
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          setLastMessage(data);
+          lastMessageRef.current = data;
           onMessage?.(data);
         } catch {
-          setLastMessage(event.data);
+          lastMessageRef.current = event.data;
           onMessage?.(event.data);
         }
       };
@@ -133,5 +133,5 @@ export function useWebSocket({
     };
   }, [connect]);
 
-  return { isConnected, lastMessage, send, reconnect };
+  return { isConnected, lastMessage: lastMessageRef.current, send, reconnect };
 }

@@ -142,5 +142,5 @@ def generate_app_id_hash(app_id: str, secret_key: str) -> str:
     Returns:
         Hexadecimal SHA-256 hash of concatenated app_id and secret_key
     """
-    combined = f"{app_id}{secret_key}"
+    combined = f"{app_id}:{secret_key}"
     return hashlib.sha256(combined.encode()).hexdigest()

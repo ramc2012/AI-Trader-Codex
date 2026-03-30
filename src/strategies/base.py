@@ -204,6 +204,9 @@ class BaseStrategy(ABC):
     name: str = "BaseStrategy"
     trading_style: TradingStyle = TradingStyle.SHORT_TERM
 
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = config or {}
+
     @abstractmethod
     def generate_signals(self, data: pd.DataFrame) -> list[Signal]:
         """Generate trading signals from market data.

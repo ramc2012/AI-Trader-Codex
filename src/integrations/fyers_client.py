@@ -191,7 +191,21 @@ class FyersClient(BrokerBase):
 
     @property
     def is_authenticated(self) -> bool:
-        """Check if we have an access token and can reach Fyers."""
+        """Check if we have a locally valid access token.
+
+        This is a fast, non-blocking check. It does NOT verify connectivity
+        with Fyers servers. Use verify_connection() for a deep heartbeat.
+        """
+        if not self._access_token:
+            return False
+        return not self._is_access_token_expired()
+
+    def verify_connection(self) -> bool:
+        """Deep check: verify if the current token can reach Fyers servers.
+
+        This performs a synchronous network request. Avoid calling this
+        frequently in the main agent loop.
+        """
         if not self._access_token or not self._fyers:
             return False
         try:

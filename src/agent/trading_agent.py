@@ -113,6 +113,7 @@ class AgentConfig:
             "Supertrend_Breakout",
             "MP_OrderFlow_Breakout",
             "Fractal_Profile_Breakout",
+            "Options_Momentum_Buy",
         ]
     )
     scan_interval_seconds: int = 30

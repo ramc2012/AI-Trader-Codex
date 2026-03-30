@@ -76,8 +76,13 @@ export function useIndicesWS(enabled = true): UseIndicesWSReturn {
   const [prices, setPrices] = useState<Record<string, LivePrice>>({});
   const [lastTickAt, setLastTickAt] = useState<number | null>(null);
   const [tickCount, setTickCount] = useState(0);
-  // Keep a ref to the latest prices so we can merge without stale closures
+
+  // Refs for tracking latest data without triggering re-renders
   const pricesRef = useRef<Record<string, LivePrice>>({});
+  const tickCountRef = useRef(0);
+  const lastTickAtRef = useRef<number | null>(null);
+  const hasPendingUpdates = useRef(false);
+
   // Debounce isConnected so brief 1-3s reconnects don't flash "Reconnecting"
   const [stableConnected, setStableConnected] = useState(false);
   const disconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -110,9 +115,23 @@ export function useIndicesWS(enabled = true): UseIndicesWSReturn {
     };
 
     pricesRef.current = { ...pricesRef.current, [name]: next };
-    setPrices((prev) => ({ ...prev, [name]: next }));
-    setLastTickAt(Date.now());
-    setTickCount((prev) => prev + 1);
+    tickCountRef.current += 1;
+    lastTickAtRef.current = Date.now();
+    hasPendingUpdates.current = true;
+  }, []);
+
+  useEffect(() => {
+    // Flush accumulated events to React state every 250ms (~4 FPS)
+    // Prevents massive UI lag when the broker emits 20-50 ticks per second
+    const interval = setInterval(() => {
+      if (hasPendingUpdates.current) {
+        setPrices({ ...pricesRef.current });
+        setLastTickAt(lastTickAtRef.current);
+        setTickCount(tickCountRef.current);
+        hasPendingUpdates.current = false;
+      }
+    }, 250);
+    return () => clearInterval(interval);
   }, []);
 
   const { isConnected } = useWebSocket({

@@ -280,6 +280,7 @@ def get_trading_agent(style: str = "default", config: Optional[AgentConfig] = No
                 trade_us_when_open=settings.agent_trade_us_when_open,
                 trade_us_options=settings.agent_trade_us_options,
                 trade_crypto_24x7=settings.agent_trade_crypto_24x7,
+                strategies=[s.strip() for s in settings.agent_strategies.split(",") if s.strip()],
                 scan_interval_seconds=settings.agent_scan_interval,
                 timeframe=settings.agent_default_timeframe,
                 execution_timeframes=[

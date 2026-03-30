@@ -169,6 +169,7 @@ class Settings(BaseSettings):
     agent_reinforcement_enabled: bool = True
     agent_reinforcement_alpha: float = Field(default=0.2, ge=0.01, le=1.0)
     agent_reinforcement_size_boost_pct: float = Field(default=60.0, ge=0.0, le=300.0)
+    agent_strategies: str = "EMA_Crossover,RSI_Reversal,Supertrend_Breakout,MP_OrderFlow_Breakout,Fractal_Profile_Breakout,Options_Momentum_Buy"
 
     @property
     def data_path(self) -> Path:

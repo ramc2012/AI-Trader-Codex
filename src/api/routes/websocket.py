@@ -164,30 +164,28 @@ async def positions_ws(websocket: WebSocket) -> None:
     """Stream live position updates."""
     bus = get_state_change_bus()
     queue = bus.subscribe()
-    pm = get_position_manager()
-    await websocket.accept()
+    await positions_manager.connect(websocket)
+    logger.info("websocket_connected", type="positions", client=websocket.client.host if websocket.client else "unknown")
     try:
         # Initial push
-        await websocket.send_json({
-            "type": "positions_update",
-            "timestamp": datetime.now(tz=IST).isoformat(),
-            "positions": [p.__dict__ for p in pm.get_all_positions()],
-        })
+        payload = _build_positions_payload()
+        await positions_manager.send_json(websocket, payload)
 
         while True:
             try:
-                topic = await asyncio.wait_for(queue.get(), timeout=10.0)
+                topic = await asyncio.wait_for(queue.get(), timeout=5.0)
                 if topic == "positions":
-                    await websocket.send_json({
-                        "type": "positions_update",
-                        "timestamp": datetime.now(tz=IST).isoformat(),
-                        "positions": [p.__dict__ for p in pm.get_all_positions()],
-                    })
+                    payload = _build_positions_payload()
+                    await positions_manager.send_json(websocket, payload)
             except asyncio.TimeoutError:
                 # Heartbeat
-                await websocket.send_json({"type": "heartbeat"})
+                await positions_manager.send_json(websocket, {"type": "heartbeat"})
     except WebSocketDisconnect:
-        pass
+        positions_manager.disconnect(websocket)
+        logger.info("websocket_disconnected", type="positions")
+    except Exception as e:
+        logger.error("websocket_error", type="positions", error=str(e))
+        positions_manager.disconnect(websocket)
     finally:
         bus.unsubscribe(queue)
 

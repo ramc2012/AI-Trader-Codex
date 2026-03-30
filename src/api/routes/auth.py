@@ -92,14 +92,19 @@ async def auth_status(
     try:
         refreshed = await asyncio.to_thread(client.try_auto_refresh_with_saved_pin, False)
         profile = None
-        authenticated = False
-        try:
-            profile_resp = await asyncio.to_thread(client.get_profile)
-            authenticated = profile_resp.get("s") == "ok"
-            if authenticated:
-                profile = profile_resp
-        except Exception:
-            authenticated = False
+        authenticated = client.is_authenticated
+
+        if authenticated:
+            try:
+                # Optionally try to get profile, but don't fail authentication if it times out
+                profile_resp = await asyncio.wait_for(
+                    asyncio.to_thread(client.get_profile),
+                    timeout=2.0
+                )
+                if profile_resp.get("s") == "ok":
+                    profile = profile_resp
+            except Exception:
+                pass  # Still authenticated even if profile fetch fails or times out
 
         if authenticated:
             if refreshed:

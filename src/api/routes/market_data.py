@@ -794,80 +794,103 @@ async def _fetch_crypto_ohlc_binance(symbol: str, timeframe: str, limit: int) ->
     pair = _normalize_crypto_pair(symbol)
     if not pair:
         return []
+        
+    # Try both .com and .us endpoints (GCloud US regions often block .com)
+    domains = ["api.binance.com", "api.binance.us"]
     target = min(max(int(limit), 50), 5000)
     interval = _binance_interval(timeframe)
     interval_ms = _timeframe_millis(timeframe)
-    rows: list[CandleResponse] = []
     timeout = httpx.Timeout(8.0, connect=4.0)
-    async with httpx.AsyncClient(timeout=timeout) as http:
-        end_time: int | None = None
-        requests = 0
-        while len(rows) < target and requests < 8:
-            remaining = target - len(rows)
-            batch_limit = min(max(remaining, 50), 1000)
-            params: Dict[str, Any] = {
-                "symbol": pair,
-                "interval": interval,
-                "limit": batch_limit,
-            }
-            if end_time is not None:
-                params["endTime"] = end_time
+    
+    for domain in domains:
+        rows: list[CandleResponse] = []
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as http:
+                end_time: int | None = None
+                requests = 0
+                while len(rows) < target and requests < 8:
+                    batch_limit = min(max(target - len(rows), 50), 1000)
+                    params: Dict[str, Any] = {
+                        "symbol": pair,
+                        "interval": interval,
+                        "limit": batch_limit,
+                    }
+                    if end_time is not None:
+                        params["endTime"] = end_time
 
-            res = await http.get("https://api.binance.com/api/v3/klines", params=params)
-            if res.status_code >= 400:
-                return rows[-target:]
-            payload = res.json()
-            if not isinstance(payload, list) or not payload:
-                break
+                    res = await http.get(f"https://{domain}/api/v3/klines", params=params)
+                    if res.status_code == 451: # Unavailable For Legal Reasons (e.g. Binance.com in US)
+                        logger.warning("binance_blocked_legal", domain=domain, symbol=symbol)
+                        break
+                    if res.status_code >= 400:
+                        break
+                        
+                    payload = res.json()
+                    if not isinstance(payload, list) or not payload:
+                        break
 
-            batch_rows: list[CandleResponse] = []
-            for row in payload:
-                if not isinstance(row, list) or len(row) < 6:
-                    continue
-                batch_rows.append(
-                    CandleResponse(
-                        timestamp=datetime.fromtimestamp(int(row[0]) / 1000.0, tz=timezone.utc).astimezone(IST),
-                        open=float(row[1]),
-                        high=float(row[2]),
-                        low=float(row[3]),
-                        close=float(row[4]),
-                        volume=int(float(row[5])),
-                    )
-                )
-            if not batch_rows:
-                break
+                    batch_rows: list[CandleResponse] = []
+                    for row in payload:
+                        if not isinstance(row, list) or len(row) < 6:
+                            continue
+                        batch_rows.append(
+                            CandleResponse(
+                                timestamp=datetime.fromtimestamp(int(row[0]) / 1000.0, tz=timezone.utc).astimezone(IST),
+                                open=float(row[1]),
+                                high=float(row[2]),
+                                low=float(row[3]),
+                                close=float(row[4]),
+                                volume=int(float(row[5])),
+                            )
+                        )
+                    if not batch_rows:
+                        break
 
-            batch_keys = {int(batch.timestamp.timestamp()) for batch in batch_rows}
-            rows = [
-                *batch_rows,
-                *[
-                    item for item in rows
-                    if int(item.timestamp.timestamp()) not in batch_keys
-                ],
-            ]
+                    batch_keys = {int(batch.timestamp.timestamp()) for batch in batch_rows}
+                    rows = [
+                        *batch_rows,
+                        *[item for item in rows if int(item.timestamp.timestamp()) not in batch_keys],
+                    ]
 
-            earliest_open_ms = int(payload[0][0])
-            end_time = earliest_open_ms - max(interval_ms, 1)
-            requests += 1
+                    earliest_open_ms = int(payload[0][0])
+                    end_time = earliest_open_ms - max(interval_ms, 1)
+                    requests += 1
 
-            if len(payload) < batch_limit:
-                break
+                    if len(payload) < batch_limit:
+                        break
+            
+            if rows:
+                return sorted(rows, key=lambda c: c.timestamp)[-target:]
+                
+        except Exception as e:
+            logger.debug("binance_fetch_error", domain=domain, error=str(e))
+            continue
+            
+    return []
 
-    rows = sorted(rows, key=lambda candle: candle.timestamp)
-    return rows[-target:]
+async def _fetch_crypto_ohlc_yahoo(symbol: str, timeframe: str, limit: int) -> list[CandleResponse]:
+    """Fallback to Yahoo Finance for crypto data (uses BTC-USD format)."""
+    pair = _normalize_crypto_pair(symbol)
+    if not pair:
+        return []
+    
+    # Map symbols like BTCUSDT to BTC-USD for Yahoo
+    base = pair.replace("USDT", "").replace("USDC", "").replace("TUSD", "")
+    yahoo_ticker = f"{base}-USD"
+    
+    try:
+        return await _fetch_us_ohlc_yahoo(yahoo_ticker, timeframe, limit)
+    except Exception as e:
+        logger.warning("yahoo_crypto_fallback_failed", symbol=symbol, ticker=yahoo_ticker, error=str(e))
+        return []
 
 
 async def _fetch_crypto_ohlc(symbol: str, timeframe: str, limit: int) -> list[CandleResponse]:
-    settings = get_settings()
-    if str(settings.finnhub_api_key or "").strip():
-        candles = await _fetch_crypto_ohlc_finnhub(symbol, timeframe, limit)
-        if candles:
-            return candles[-limit:]
-    if str(settings.alphavantage_api_key or "").strip():
-        candles = await _fetch_crypto_ohlc_alphavantage(symbol, timeframe, limit)
-        if candles:
-            return candles[-limit:]
-    return await _fetch_crypto_ohlc_binance(symbol, timeframe, limit)
+    candles = await _fetch_crypto_ohlc_binance(symbol, timeframe, limit)
+    if candles:
+        return candles[-limit:]
+    
+    return await _fetch_crypto_ohlc_yahoo(symbol, timeframe, limit)
 
 
 def _build_crypto_quote_from_candles(

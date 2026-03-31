@@ -58,7 +58,7 @@ class ATMMetadata:
     ce_symbol: str
     pe_symbol: str
     strike: float
-    spot: float = 0.0
+    spot: float
     expiry: str
     last_updated: datetime
     market: str = "NSE"

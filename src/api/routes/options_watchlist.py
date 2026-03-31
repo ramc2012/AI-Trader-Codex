@@ -27,9 +27,9 @@ class ATMOptionMetric(BaseModel):
     vtt: int = 0  # volume
     oi: int = 0
     oi_change: int = 0
-    macd: float = 0.0
-    macd_prev: float = 0.0
-    rsi: float = 0.0
+    macd: Optional[float] = None
+    macd_prev: Optional[float] = None
+    rsi: Optional[float] = None
 
 class ATMWatchlistResponse(BaseModel):
     timestamp: str

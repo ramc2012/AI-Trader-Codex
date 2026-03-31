@@ -66,9 +66,9 @@ export default function OptionsWatchlistPage() {
         ...item,
         ltp: liveTick?.ltp ?? item.ltp ?? 0,
         oi: liveTick?.oi ?? item.oi ?? 0,
-        macd: item.macd ?? 0,
-        macd_prev: item.macd_prev ?? 0,
-        rsi: item.rsi ?? 0,
+        macd: item.macd,
+        macd_prev: item.macd_prev,
+        rsi: item.rsi,
         spot: item.spot ?? 0,
       };
     });
@@ -153,19 +153,23 @@ export default function OptionsWatchlistPage() {
           {item.oi ? formatNumber(item.oi) : '—'}
         </td>
         <td className="py-4 px-4 text-center">
-          <div className="flex items-center justify-center gap-1">
-            <Activity className={cn("h-3 w-3", (item.macd ?? 0) >= 0 ? "text-emerald-500" : "text-rose-500")} />
-            <span className="text-[10px] font-mono text-slate-500">
-              {item.macd?.toFixed(2) || '0.00'}
-            </span>
-          </div>
+          {item.macd != null ? (
+            <div className="flex items-center justify-center gap-1">
+              <Activity className={cn("h-3 w-3", item.macd >= 0 ? "text-emerald-500" : "text-rose-500")} />
+              <span className="text-[10px] font-mono text-slate-500">
+                {item.macd.toFixed(2)}
+              </span>
+            </div>
+          ) : (
+            <span className="text-[10px] font-mono text-slate-600">—</span>
+          )}
         </td>
         <td className="py-4 px-4 text-center">
            <span className={cn(
              "text-xs font-mono",
-             (item.rsi ?? 0) > 70 ? "text-rose-400" : (item.rsi ?? 0) < 30 ? "text-emerald-400" : "text-slate-400"
+             item.rsi != null ? (item.rsi > 70 ? "text-rose-400" : item.rsi < 30 ? "text-emerald-400" : "text-slate-400") : "text-slate-600"
            )}>
-             {item.rsi?.toFixed(0) || '—'}
+             {item.rsi != null ? item.rsi.toFixed(0) : '—'}
            </span>
         </td>
         <td className="py-4 pr-6 text-right text-[10px] font-mono text-slate-600">

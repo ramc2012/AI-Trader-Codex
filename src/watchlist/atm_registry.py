@@ -8,9 +8,9 @@ sequential broker API calls.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.config.fno_constants import ALL_FNO, get_instrument
 from src.config.market_hours import IST
@@ -31,16 +31,16 @@ def _calc_ema(v: List[float], p: int) -> List[float]:
         out.append(ema)
     return out
 
-def _calc_macd(c: List[float]) -> tuple[float, float]:
+def _calc_macd(c: List[float]) -> Tuple[Optional[float], Optional[float]]:
     if len(c) < 27:
-        return 0.0, 0.0
+        return None, None
     e12 = _calc_ema(c, 12)
     e26 = _calc_ema(c, 26)
     return e12[-1] - e26[-1], e12[-2] - e26[-2]
 
-def _calc_rsi(c: List[float], p: int = 14) -> float:
+def _calc_rsi(c: List[float], p: int = 14) -> Optional[float]:
     if len(c) < p + 1:
-        return 50.0
+        return None
     g, l = 0.0, 0.0
     for i in range(len(c) - p, len(c)):
         d = c[i] - c[i - 1]
@@ -68,12 +68,12 @@ class ATMMetadata:
     pe_oi: int = 0
     ce_volume: int = 0
     pe_volume: int = 0
-    ce_macd: float = 0.0
-    ce_macd_prev: float = 0.0
-    pe_macd: float = 0.0
-    pe_macd_prev: float = 0.0
-    ce_rsi: float = 0.0
-    pe_rsi: float = 0.0
+    ce_macd: Optional[float] = None
+    ce_macd_prev: Optional[float] = None
+    pe_macd: Optional[float] = None
+    pe_macd_prev: Optional[float] = None
+    ce_rsi: Optional[float] = None
+    pe_rsi: Optional[float] = None
 
 class ATMRegistryService:
     """Singleton service to keep 209 FNO ATM strikes resolved in memory."""
@@ -208,8 +208,8 @@ class ATMRegistryService:
             ce_symbol = ce_entry.get("symbol")
             pe_symbol = pe_entry.get("symbol")
             
-            ce_macd, ce_macd_prev, ce_rsi = 0.0, 0.0, 0.0
-            pe_macd, pe_macd_prev, pe_rsi = 0.0, 0.0, 0.0
+            ce_macd, ce_macd_prev, ce_rsi = None, None, None
+            pe_macd, pe_macd_prev, pe_rsi = None, None, None
             
             ce_ltp_fallback = float(ce_entry.get("ltp") or 0.0)
             pe_ltp_fallback = float(pe_entry.get("ltp") or 0.0)

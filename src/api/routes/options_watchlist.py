@@ -20,6 +20,7 @@ class ATMOptionMetric(BaseModel):
     underlying: str
     option_type: str  # CE | PE
     strike: float
+    spot: float = 0.0
     expiry: str
     market: str
     ltp: float = 0.0
@@ -60,6 +61,7 @@ async def get_atm_watchlist(
             underlying=meta.underlying,
             option_type="CE",
             strike=meta.strike,
+            spot=meta.spot,
             expiry=meta.expiry,
             market=meta.market,
             ltp=meta.ce_ltp,
@@ -75,6 +77,7 @@ async def get_atm_watchlist(
             underlying=meta.underlying,
             option_type="PE",
             strike=meta.strike,
+            spot=meta.spot,
             expiry=meta.expiry,
             market=meta.market,
             ltp=meta.pe_ltp,

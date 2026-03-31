@@ -329,57 +329,74 @@ async def _fetch_us_quotes() -> list[dict[str, Any]]:
 
 
 async def _fetch_us_option_summary(symbol: str) -> dict[str, Any]:
-    """Fetch ATM call/put snapshot for a US underlying from Yahoo Finance options API."""
-    import httpx
-    url = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}"
-    timeout = httpx.Timeout(10.0, connect=4.0)
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
+    """Fetch ATM call/put snapshot for a US underlying from yfinance API."""
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as http:
-            resp = await http.get(url)
-            if resp.status_code != 200:
-                return {"symbol": symbol}
-            result = resp.json().get("optionChain", {}).get("result", [])
-            if not result:
-                return {"symbol": symbol}
-            result = result[0]
-            
-            quote = result.get("quote", {})
-            spot = quote.get("regularMarketPrice") or quote.get("preMarketPrice") or 0.0
-            if spot <= 0:
-                return {"symbol": symbol}
+        import yfinance as yf
+        import asyncio
+        import pandas as pd
+        import math
+        
+        def _fetch():
+            ticker = yf.Ticker(symbol)
+            expiries = ticker.options
+            if not expiries:
+                return None
+            near_exp = expiries[0]
+            chain = ticker.option_chain(near_exp)
+            spot = getattr(ticker.fast_info, 'last_price', 0.0)
+            if not spot:
+                spot = ticker.info.get("regularMarketPrice") or 0.0
+            return spot, near_exp, chain.calls, chain.puts
 
-            options = result.get("options", [{}])[0]
-            calls = options.get("calls", [])
-            puts = options.get("puts", [])
+        data = await asyncio.to_thread(_fetch)
+        if not data:
+            return {"symbol": symbol}
+        
+        spot, expiry_str, calls, puts = data
+        if spot <= 0 or calls.empty or puts.empty:
+            return {"symbol": symbol, "spot": spot}
             
-            if not calls or not puts:
-                return {"symbol": symbol, "spot": spot}
-                
-            atm_call = min(calls, key=lambda x: abs(x.get("strike", 0) - spot))
-            atm_put = min(puts, key=lambda x: abs(x.get("strike", 0) - spot))
+        calls_list = calls.to_dict('records')
+        puts_list = puts.to_dict('records')
+        calls_by_strike = {c['strike']: c for c in calls_list}
+        puts_by_strike = {p['strike']: p for p in puts_list}
+        
+        common_strikes = set(calls_by_strike.keys()).intersection(set(puts_by_strike.keys()))
+        if not common_strikes:
+            return {"symbol": symbol, "spot": spot}
             
-            expiry_ts = options.get("expirationDate") or result.get("expirationDates", [0])[0]
-            from datetime import datetime, timezone
-            expiry = datetime.fromtimestamp(expiry_ts, tz=timezone.utc).strftime("%Y-%m-%d") if expiry_ts else ""
+        tolerance = 0.03
+        valid_strikes = [s for s in common_strikes if abs(s - spot) / spot <= tolerance]
+        if not valid_strikes:
+            valid_strikes = list(common_strikes)
+            
+        def _combo_oi(s):
+            coi = calls_by_strike.get(s, {}).get('openInterest', 0)
+            poi = puts_by_strike.get(s, {}).get('openInterest', 0)
+            if math.isnan(coi): coi = 0
+            if math.isnan(poi): poi = 0
+            return coi + poi
+            
+        atm_strike = max(valid_strikes, key=_combo_oi)
+        atm_call = calls_by_strike.get(atm_strike, {})
+        atm_put = puts_by_strike.get(atm_strike, {})
 
-            return {
-                "symbol": symbol,
-                "spot": spot,
-                "expiry": expiry,
-                "atm_strike": atm_call.get("strike", 0.0),
-                "call_last": float(atm_call.get("lastPrice", 0.0)),
-                "call_bid": float(atm_call.get("bid", 0.0)),
-                "call_ask": float(atm_call.get("ask", 0.0)),
-                "call_iv": float(atm_call.get("impliedVolatility", 0.0)),
-                "call_oi": int(atm_call.get("openInterest", 0)),
-                "put_last": float(atm_put.get("lastPrice", 0.0)),
-                "put_bid": float(atm_put.get("bid", 0.0)),
-                "put_ask": float(atm_put.get("ask", 0.0)),
-                "put_iv": float(atm_put.get("impliedVolatility", 0.0)),
-                "put_oi": int(atm_put.get("openInterest", 0)),
-            }
+        return {
+            "symbol": symbol,
+            "spot": spot,
+            "expiry": expiry_str,
+            "atm_strike": atm_strike,
+            "call_last": float(atm_call.get("lastPrice", 0.0)),
+            "call_bid": float(atm_call.get("bid", 0.0)) if not pd.isna(atm_call.get("bid")) else 0.0,
+            "call_ask": float(atm_call.get("ask", 0.0)) if not pd.isna(atm_call.get("ask")) else 0.0,
+            "call_iv": float(atm_call.get("impliedVolatility", 0.0)) if not pd.isna(atm_call.get("impliedVolatility")) else 0.0,
+            "call_oi": int(atm_call.get("openInterest", 0)) if not pd.isna(atm_call.get("openInterest")) else 0,
+            "put_last": float(atm_put.get("lastPrice", 0.0)),
+            "put_bid": float(atm_put.get("bid", 0.0)) if not pd.isna(atm_put.get("bid")) else 0.0,
+            "put_ask": float(atm_put.get("ask", 0.0)) if not pd.isna(atm_put.get("ask")) else 0.0,
+            "put_iv": float(atm_put.get("impliedVolatility", 0.0)) if not pd.isna(atm_put.get("impliedVolatility")) else 0.0,
+            "put_oi": int(atm_put.get("openInterest", 0)) if not pd.isna(atm_put.get("openInterest")) else 0,
+        }
     except Exception as e:
         from src.utils.logger import get_logger
         get_logger(__name__).error("us_option_summary_failed", symbol=symbol, error=str(e))

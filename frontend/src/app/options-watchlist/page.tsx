@@ -21,6 +21,7 @@ interface ATMOptionMetric {
   underlying: string;
   option_type: 'CE' | 'PE';
   strike: number;
+  spot?: number;
   expiry: string;
   market: string;
   ltp?: number;
@@ -68,6 +69,7 @@ export default function OptionsWatchlistPage() {
         macd: item.macd ?? 0,
         macd_prev: item.macd_prev ?? 0,
         rsi: item.rsi ?? 0,
+        spot: item.spot ?? 0,
       };
     });
   }, [data, ticks]);
@@ -132,6 +134,9 @@ export default function OptionsWatchlistPage() {
             {item.option_type}
           </span>
         </td>
+        <td className="py-4 px-4 text-right font-mono text-slate-400">
+          {item.spot ? formatCurrency(item.spot, item.market === 'NSE' ? 'INR' : 'USD') : '—'}
+        </td>
         <td className="py-4 px-4 text-right font-mono text-slate-300">
           {formatNumber(item.strike)}
         </td>
@@ -174,11 +179,12 @@ export default function OptionsWatchlistPage() {
     <thead>
       <tr className="border-b border-slate-800 text-[11px] uppercase tracking-[0.2em] text-slate-500 px-4">
         <th className="py-4 pl-6 w-[15%]">Underlying</th>
-        <th className="py-4 px-4 text-center w-[8%]">Type</th>
+        <th className="py-4 px-4 text-center w-[6%]">Type</th>
+        <th className="py-4 px-4 text-right w-[10%]">Spot</th>
         <th className="py-4 px-4 text-right w-[10%]">Strike</th>
-        <th className="py-4 px-4 w-[12%]">Expiry</th>
-        <th className="py-4 px-4 text-right w-[12%]">LTP</th>
-        <th className="py-4 px-4 text-right w-[10%]">OI</th>
+        <th className="py-4 px-4 w-[11%]">Expiry</th>
+        <th className="py-4 px-4 text-right w-[11%]">LTP</th>
+        <th className="py-4 px-4 text-right w-[8%]">OI</th>
         <th className="py-4 px-4 text-center w-[10%]">MACD</th>
         <th className="py-4 px-4 text-center w-[10%]">RSI</th>
         <th className="py-4 pr-6 text-right w-[13%]">Contract</th>

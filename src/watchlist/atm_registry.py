@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from src.config.fno_constants import EQUITY_FNO
+from src.config.fno_constants import ALL_FNO, get_instrument
 from src.config.market_hours import IST
 from src.integrations.fyers_client import FyersClient
 from src.watchlist.options_data_service import OptionsDataService
@@ -58,6 +58,7 @@ class ATMMetadata:
     ce_symbol: str
     pe_symbol: str
     strike: float
+    spot: float = 0.0
     expiry: str
     last_updated: datetime
     market: str = "NSE"
@@ -121,8 +122,8 @@ class ATMRegistryService:
         async with self._lock:
             start_time = datetime.now(tz=IST)
             
-            # 1. NSE FNO
-            nse_underlyings = list(EQUITY_FNO.keys())
+            # 1. NSE FNO (Equities + Indices)
+            nse_underlyings = list(ALL_FNO.keys())
             batch_size = 5
             for i in range(0, len(nse_underlyings), batch_size):
                 batch = nse_underlyings[i : i + batch_size]
@@ -153,11 +154,23 @@ class ATMRegistryService:
     async def _resolve_one(self, sym: str):
         """Resolve ATM for a single NSE underlying and update cache."""
         try:
-            underlying_sym = f"NSE:{sym}-EQ"
+            inst = get_instrument(sym)
+            if inst and inst.instrument_type == "INDEX":
+                if sym == "NIFTY":
+                    underlying_sym = "NSE:NIFTY50-INDEX"
+                elif sym == "BANKNIFTY":
+                    underlying_sym = "NSE:NIFTYBANK-INDEX"
+                elif sym == "SENSEX" or sym == "BANKEX":
+                    underlying_sym = f"BSE:{sym}-INDEX"
+                else:
+                    underlying_sym = f"NSE:{sym}-INDEX"
+            else:
+                underlying_sym = f"NSE:{sym}-EQ"
+                
             chain_data = await asyncio.to_thread(
                 self._options_service.get_canonical_chain, 
                 underlying_sym, 
-                strike_count=2, 
+                strike_count=20, 
                 include_expiries=1
             )
             
@@ -172,7 +185,21 @@ class ATMRegistryService:
             if not strikes or spot <= 0:
                 return
                 
-            atm_row = min(strikes, key=lambda x: abs(x["strike"] - spot))
+            is_index = inst and inst.instrument_type == "INDEX"
+            tolerance = 0.01 if is_index else 0.03
+            
+            # Find bounds
+            valid_strikes = [s for s in strikes if abs(s["strike"] - spot) / spot <= tolerance]
+            if not valid_strikes:
+                valid_strikes = strikes
+            
+            # Find max combo OI
+            def _combo_oi(s):
+                coi = int(s.get("ce", {}).get("oi", 0))
+                poi = int(s.get("pe", {}).get("oi", 0))
+                return coi + poi
+                
+            atm_row = max(valid_strikes, key=_combo_oi)
             atm_strike = atm_row["strike"]
             expiry = near_expiry.get("expiry", "N/A")
             
@@ -235,6 +262,7 @@ class ATMRegistryService:
                     expiry=expiry,
                     last_updated=datetime.now(tz=IST),
                     market="NSE",
+                    spot=spot,
                     ce_ltp=ce_ltp_fallback,
                     pe_ltp=pe_ltp_fallback,
                     ce_oi=int(ce_entry.get("oi") or 0),
@@ -252,70 +280,72 @@ class ATMRegistryService:
             logger.debug("atm_resolution_failed_nse", symbol=sym, error=str(e))
 
     async def _resolve_us_one(self, sym: str):
-        """Resolve monthly ATM for a US ticker using Yahoo Finance."""
+        """Resolve ATM for a US symbol using yfinance."""
         try:
-            import httpx
-            from datetime import timezone
+            import yfinance as yf
+            import pandas as pd
             
-            url = f"https://query2.finance.yahoo.com/v7/finance/options/{sym}"
-            timeout = 10.0
-            headers = {"User-Agent": "Mozilla/5.0"}
-            
-            async with httpx.AsyncClient(timeout=timeout) as http:
-                resp = await http.get(url, headers=headers)
-                if resp.status_code != 200:
-                    return
-                result = resp.json().get("optionChain", {}).get("result", [])[0]
-            
-            # Identify Monthly Expiry (Third Friday)
-            expiry_dates = result.get("expirationDates", [])
-            now = datetime.now(tz=timezone.utc)
-            target_expiry = None
-            
-            def is_monthly(ts: int) -> bool:
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-                first = dt.replace(day=1)
-                f_fri = first + timedelta(days=((4 - first.weekday() + 7) % 7))
-                t_fri = f_fri + timedelta(weeks=2)
-                return dt == t_fri
+            def _fetch_yf():
+                ticker = yf.Ticker(sym)
+                expiries = ticker.options
+                if not expiries:
+                    return None
+                near_exp = expiries[0]
+                chain = ticker.option_chain(near_exp)
+                # yfinance ticker.info might be slow or empty reliably. 
+                # Alternatively, we can use fast_info:
+                spot = getattr(ticker.fast_info, 'last_price', 0.0)
+                if not spot:
+                    spot = ticker.info.get("regularMarketPrice") or 0.0
+                return spot, near_exp, chain.calls, chain.puts
 
-            for exp in expiry_dates:
-                if is_monthly(exp) and exp >= int(now.timestamp()):
-                    target_expiry = exp
-                    break
+            data = await asyncio.to_thread(_fetch_yf)
+            if not data: return
+            spot, expiry_str, calls, puts = data
+            if spot <= 0 or calls.empty or puts.empty: return
             
-            # Fetch specific chain if necessary
-            if target_expiry:
-                async with httpx.AsyncClient(timeout=timeout) as http:
-                    resp = await http.get(f"{url}?date={target_expiry}", headers=headers)
-                    result = resp.json().get("optionChain", {}).get("result", [])[0]
-
-            quote = result.get("quote", {})
-            spot = quote.get("regularMarketPrice") or quote.get("preMarketPrice") or 0.0
-            if spot <= 0: return
-
-            options = result.get("options", [{}])[0]
-            calls = options.get("calls", [])
-            puts = options.get("puts", [])
+            calls_list = calls.to_dict('records')
+            puts_list = puts.to_dict('records')
+            calls_by_strike = {c['strike']: c for c in calls_list}
+            puts_by_strike = {p['strike']: p for p in puts_list}
+            common_strikes = set(calls_by_strike.keys()).intersection(set(puts_by_strike.keys()))
             
-            if not calls or not puts: return
+            if not common_strikes: return
             
-            atm_call = min(calls, key=lambda x: abs(x.get("strike", 0) - spot))
-            atm_put = min(puts, key=lambda x: abs(x.get("strike", 0) - spot))
+            tolerance = 0.03
+            valid_strikes = [s for s in common_strikes if abs(s - spot) / spot <= tolerance]
+            if not valid_strikes:
+                valid_strikes = list(common_strikes)
+                
+            def _combo_oi(s):
+                # Ensure we handle NaN if openInterest is missing from Yahoo API
+                import math
+                coi = calls_by_strike.get(s, {}).get('openInterest', 0)
+                poi = puts_by_strike.get(s, {}).get('openInterest', 0)
+                if math.isnan(coi): coi = 0
+                if math.isnan(poi): poi = 0
+                return coi + poi
+                
+            atm_strike = max(valid_strikes, key=_combo_oi)
+            atm_call = calls_by_strike.get(atm_strike, {})
+            atm_put = puts_by_strike.get(atm_strike, {})
             
+            # Expiry usually comes in 'YYYY-MM-DD'
             self._cache[f"US:{sym}"] = ATMMetadata(
                 underlying=sym,
                 ce_symbol=atm_call.get("contractSymbol", ""),
                 pe_symbol=atm_put.get("contractSymbol", ""),
-                strike=atm_call.get("strike", 0.0),
-                expiry=datetime.fromtimestamp(target_expiry or expiry_dates[0], tz=timezone.utc).date().isoformat(),
+                strike=atm_strike,
+                spot=spot,
+                expiry=expiry_str,
                 last_updated=datetime.now(tz=IST),
                 market="US",
                 ce_ltp=float(atm_call.get("lastPrice") or 0.0),
                 pe_ltp=float(atm_put.get("lastPrice") or 0.0),
-                ce_oi=int(atm_call.get("openInterest") or 0),
-                pe_oi=int(atm_put.get("openInterest") or 0)
+                ce_oi=int(atm_call.get("openInterest") or 0) if not pd.isna(atm_call.get("openInterest")) else 0,
+                pe_oi=int(atm_put.get("openInterest") or 0) if not pd.isna(atm_put.get("openInterest")) else 0
             )
+
         except Exception as e:
             logger.debug("atm_resolution_failed_us", symbol=sym, error=str(e))
 
@@ -342,9 +372,10 @@ class ATMRegistryService:
                 ce_symbol=f"CRYPTO:{pair}-CE-ATM",
                 pe_symbol=f"CRYPTO:{pair}-PE-ATM",
                 strike=spot,
+                spot=spot,
                 expiry=last_friday.date().isoformat(),
                 last_updated=datetime.now(tz=IST),
-                market="CRYPTO"
+                market="CRYPTO",
             )
         except Exception as e:
             logger.debug("atm_resolution_failed_crypto", symbol=pair, error=str(e))

@@ -8,10 +8,11 @@ export function usePortfolio(enabled = true) {
   return useQuery<PortfolioSummary>({
     queryKey: ['portfolio'],
     queryFn: () => apiFetch<PortfolioSummary>('/portfolio'),
-    refetchInterval: enabled ? 3000 : false,
+    refetchInterval: enabled ? 30000 : false,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
-    staleTime: 1500,
+    staleTime: 5000,
+    enabled,
   });
 }
 

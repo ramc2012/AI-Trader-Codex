@@ -49,9 +49,14 @@ class OptionsMomentumBuy(BaseStrategy):
         if len(data) < self.min_bars_required:
             return []
 
+        # Validate inputs — ensure we have necessary columns
+        required = ["close", "timestamp"]
+        if not all(col in data.columns for col in required):
+            return []
+
         df = data.copy()
         
-        # Calculate MACD
+        # Calculate MACD with standard positional settings
         macd_df = ta.macd(
             df["close"],
             fast=self.macd_fast,
@@ -61,9 +66,13 @@ class OptionsMomentumBuy(BaseStrategy):
         if macd_df is None or macd_df.empty:
             return []
             
-        macd_line = macd_df[f"MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}"]
+        macd_col = f"MACD_{self.macd_fast}_{self.macd_slow}_{self.macd_signal}"
+        if macd_col not in macd_df.columns:
+            return []
+            
+        macd_line = macd_df[macd_col]
         
-        # Calculate RSI
+        # Calculate RSI for overbought filter
         rsi = ta.rsi(df["close"], length=self.rsi_period)
         if rsi is None or rsi.empty:
             return []
@@ -73,42 +82,53 @@ class OptionsMomentumBuy(BaseStrategy):
 
         signals: List[Signal] = []
         
-        for i in range(1, len(df)):
-            current_macd = df["macd"].iloc[i]
-            prev_macd = df["macd"].iloc[i - 1]
-            current_rsi = df["rsi"].iloc[i]
+        # Only look at the latest completed candle for positional trades to avoid whipsaws
+        i = len(df) - 1
+        current_macd = df["macd"].iloc[i]
+        prev_macd = df["macd"].iloc[i - 1]
+        current_rsi = df["rsi"].iloc[i]
+        
+        # Entry: MACD crosses above zero line
+        crossover_zero = prev_macd <= 0 < current_macd
+        
+        # Market-specific adjustments
+        is_crypto = "CRYPTO" in symbol.upper()
+        # Crypto momentum can be more aggressive
+        rsi_limit = self.rsi_overbought if not is_crypto else 85
+        
+        is_entry = crossover_zero and current_rsi < rsi_limit
+        
+        if is_entry:
+            price = float(df["close"].iloc[i])
+            stop_loss = price * (1.0 - self.initial_sl_pct)
+            target = price * (1.0 + self.target_pct)
             
-            # Entry: MACD crosses above zero line
-            crossover_zero = prev_macd <= 0 and current_macd > 0
+            timestamp = df["timestamp"].iloc[i]
             
-            # Re-entry: If already above zero, and momentum kicks in
-            # (We keep it strictly to crossing 0 as requested, but can be relaxed)
-            is_entry = crossover_zero and current_rsi < self.rsi_overbought
-            
-            if is_entry:
-                price = float(df["close"].iloc[i])
-                stop_loss = price * (1.0 - self.initial_sl_pct)
-                target = price * (1.0 + self.target_pct)
-                
-                timestamp = df["timestamp"].iloc[i] if "timestamp" in df.columns else datetime.now()
-                
-                signals.append(
-                    Signal(
-                        timestamp=timestamp,
-                        symbol=symbol,
-                        signal_type=SignalType.BUY,
-                        strength=SignalStrength.STRONG,
-                        price=price,
-                        stop_loss=round(stop_loss, 2),
-                        target=round(target, 2),
-                        strategy_name=self.__class__.__name__,
-                        metadata={
-                            "macd_value": round(current_macd, 4),
-                            "rsi_value": round(current_rsi, 2),
-                            "trailing_sl_pct": self.trailing_sl_pct,
-                            "exit_rule": f"RSI > {self.rsi_overbought}",
-                        },
-                    )
+            # Identify intended market for logging/metadata
+            market = "NSE"
+            if "US:" in symbol.upper(): market = "US"
+            elif is_crypto: market = "CRYPTO"
+
+            signals.append(
+                Signal(
+                    timestamp=timestamp,
+                    symbol=symbol,
+                    signal_type=SignalType.BUY,
+                    strength=SignalStrength.STRONG,
+                    price=price,
+                    stop_loss=round(stop_loss, 2),
+                    target=round(target, 2),
+                    strategy_name=self.__class__.__name__,
+                    metadata={
+                        "market_context": market,
+                        "macd_value": round(current_macd, 4),
+                        "rsi_value": round(current_rsi, 2),
+                        "expiry_preference": "monthly",
+                        "trailing_sl_pct": self.trailing_sl_pct,
+                        "exit_rule": f"RSI > {rsi_limit}",
+                    },
                 )
+            )
 
         return signals

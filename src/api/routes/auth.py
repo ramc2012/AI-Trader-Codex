@@ -90,7 +90,18 @@ async def auth_status(
         )
 
     try:
-        refreshed = await asyncio.to_thread(client.try_auto_refresh_with_saved_pin, False)
+        # Check for auto-refresh, but timeout quickly to avoid UI hang
+        refreshed = False
+        try:
+            refreshed = await asyncio.wait_for(
+                asyncio.to_thread(client.try_auto_refresh_with_saved_pin, False),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            logger.info("auth_status_refresh_timeout", message="Auto-refresh taking too long, returning current state")
+        except Exception as e:
+            logger.warning("auth_status_refresh_error", error=str(e))
+
         profile = None
         authenticated = client.is_authenticated
 
@@ -106,9 +117,9 @@ async def auth_status(
             except Exception:
                 pass  # Still authenticated even if profile fetch fails or times out
 
-        if authenticated:
-            if refreshed:
-                asyncio.create_task(get_runtime_manager().restart_if_authenticated())
+        if authenticated and refreshed:
+            asyncio.create_task(get_runtime_manager().restart_if_authenticated())
+
         return AuthStatusResponse(
             authenticated=authenticated,
             profile=profile,

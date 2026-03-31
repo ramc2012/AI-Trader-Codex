@@ -24,8 +24,8 @@ class AltDataCollector:
             "fii_net_crores": 0.0,
             "dii_net_crores": 0.0,
             "market_breadth_ratio": 1.0,
-            "news_sentiment": "neutral",
-            "sentiment_score": 0.0,
+            "news_sentiment_label": "neutral",
+            "news_sentiment_score": 0.0,
         }
 
     async def fetch_macro_context(self) -> dict[str, Any]:
@@ -58,9 +58,9 @@ class AltDataCollector:
             "fii_net_crores": round(fii, 2),
             "dii_net_crores": round(dii, 2),
             "market_breadth_ratio": round(breadth, 2),
-            "news_sentiment": sentiment_label,
-            "sentiment_score": round(sent_score, 3),
-            "timestamp": datetime.utcnow().isoformat()
+            "news_sentiment_label": sentiment_label,
+            "news_sentiment_score": round(sent_score, 3),
+            "timestamp": datetime.utcnow()
         }
         
         self.last_fetch_time = datetime.now()
@@ -69,7 +69,7 @@ class AltDataCollector:
             "macro_context_updated", 
             breadth=self._cache["market_breadth_ratio"],
             fii_net=self._cache["fii_net_crores"],
-            sentiment=self._cache["news_sentiment"]
+            sentiment=self._cache["news_sentiment_label"]
         )
         
         return self._cache

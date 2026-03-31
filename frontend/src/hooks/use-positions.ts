@@ -8,11 +8,11 @@ export function usePositions(enabled = true) {
   return useQuery<Position[]>({
     queryKey: ['positions'],
     queryFn: () => apiFetch<Position[]>('/positions'),
-    refetchInterval: enabled ? 2500 : false,
+    refetchInterval: enabled ? 30000 : false, // 30s fallback polling
     refetchIntervalInBackground: false,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: true,
     refetchOnReconnect: true,
-    staleTime: 1500,
+    staleTime: 5000,
     enabled,
   });
 }

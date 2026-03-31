@@ -156,8 +156,8 @@ export function useWatchlistSymbols() {
   return useQuery<WatchlistSymbol[]>({
     queryKey: ['watchlist-symbols'],
     queryFn: () => apiFetch<WatchlistSymbol[]>('/watchlist/symbols'),
-    refetchInterval: 1000,
-    staleTime: 500,
+    refetchInterval: 60000,
+    staleTime: 30000,
     gcTime: 5 * 60_000,
     refetchOnWindowFocus: false,
   });
@@ -214,14 +214,14 @@ export function useWatchlistSummary() {
   return useQuery<WatchlistSummary>({
     queryKey: ['watchlist-summary'],
     queryFn: () => apiFetch<WatchlistSummary>('/watchlist/summary'),
-    refetchInterval: 15000,
-    staleTime: 10000,
+    refetchInterval: 30000, // Increased from 15s to 30s
+    staleTime: 20000,
     gcTime: 60_000,
     retry: 1,
     retryDelay: 2_000,
     refetchOnWindowFocus: true,
     refetchOnReconnect: true,
-    refetchIntervalInBackground: true,
+    refetchIntervalInBackground: false, // Don't poll in background
   });
 }
 
@@ -230,12 +230,12 @@ export function useGlobalContinuousWatchlist(enabled = true) {
     queryKey: ['watchlist-global-continuous'],
     queryFn: () => apiFetch<GlobalContinuousWatchlist>('/watchlist/global/continuous'),
     enabled,
-    refetchInterval: 2000,
-    staleTime: 1000,
+    refetchInterval: 60000, // Increased from 2s to 60s (Global data is less urgent)
+    staleTime: 30000,
     gcTime: 5 * 60_000,
     refetchOnWindowFocus: false,
     retry: 2,
-    retryDelay: 2_000,
+    retryDelay: 5_000,
   });
 }
 

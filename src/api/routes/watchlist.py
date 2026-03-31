@@ -329,61 +329,61 @@ async def _fetch_us_quotes() -> list[dict[str, Any]]:
 
 
 async def _fetch_us_option_summary(symbol: str) -> dict[str, Any]:
-    """Fetch ATM call/put snapshot for a US underlying from Nasdaq options API."""
-    url = f"https://api.nasdaq.com/api/quote/{symbol}/option-chain"
+    """Fetch ATM call/put snapshot for a US underlying from Yahoo Finance options API."""
+    import httpx
+    url = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}"
     timeout = httpx.Timeout(10.0, connect=4.0)
-    async with httpx.AsyncClient(timeout=timeout, headers=_nasdaq_headers()) as http:
-        payload: dict[str, Any] = {}
-        for assetclass in (_US_ASSET_CLASS.get(symbol, "stocks"), "stocks", "etf"):
-            res = await http.get(url, params={"assetclass": assetclass})
-            if res.status_code >= 400:
-                continue
-            raw = res.json()
-            if isinstance(raw, dict):
-                payload = raw
-                data = payload.get("data", {})
-                if isinstance(data, dict) and data:
-                    break
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as http:
+            resp = await http.get(url)
+            if resp.status_code != 200:
+                return {"symbol": symbol}
+            result = resp.json().get("optionChain", {}).get("result", [])
+            if not result:
+                return {"symbol": symbol}
+            result = result[0]
+            
+            quote = result.get("quote", {})
+            spot = quote.get("regularMarketPrice") or quote.get("preMarketPrice") or 0.0
+            if spot <= 0:
+                return {"symbol": symbol}
 
-    data = payload.get("data", {}) if isinstance(payload, dict) else {}
-    if not data:
+            options = result.get("options", [{}])[0]
+            calls = options.get("calls", [])
+            puts = options.get("puts", [])
+            
+            if not calls or not puts:
+                return {"symbol": symbol, "spot": spot}
+                
+            atm_call = min(calls, key=lambda x: abs(x.get("strike", 0) - spot))
+            atm_put = min(puts, key=lambda x: abs(x.get("strike", 0) - spot))
+            
+            expiry_ts = options.get("expirationDate") or result.get("expirationDates", [0])[0]
+            from datetime import datetime, timezone
+            expiry = datetime.fromtimestamp(expiry_ts, tz=timezone.utc).strftime("%Y-%m-%d") if expiry_ts else ""
+
+            return {
+                "symbol": symbol,
+                "spot": spot,
+                "expiry": expiry,
+                "atm_strike": atm_call.get("strike", 0.0),
+                "call_last": float(atm_call.get("lastPrice", 0.0)),
+                "call_bid": float(atm_call.get("bid", 0.0)),
+                "call_ask": float(atm_call.get("ask", 0.0)),
+                "call_iv": float(atm_call.get("impliedVolatility", 0.0)),
+                "call_oi": int(atm_call.get("openInterest", 0)),
+                "put_last": float(atm_put.get("lastPrice", 0.0)),
+                "put_bid": float(atm_put.get("bid", 0.0)),
+                "put_ask": float(atm_put.get("ask", 0.0)),
+                "put_iv": float(atm_put.get("impliedVolatility", 0.0)),
+                "put_oi": int(atm_put.get("openInterest", 0)),
+            }
+    except Exception as e:
+        from src.utils.logger import get_logger
+        get_logger(__name__).error("us_option_summary_failed", symbol=symbol, error=str(e))
         return {"symbol": symbol}
-
-    spot = _parse_last_trade_price(str(data.get("lastTrade") or ""))
-    rows = data.get("table", {}).get("rows", []) or []
-    option_rows = [
-        row for row in rows
-        if row and row.get("strike") not in (None, "", "--")
-    ]
-    if not option_rows:
-        return {
-            "symbol": symbol,
-            "spot": spot,
-        }
-
-    strikes = sorted({_parse_num(row.get("strike")) for row in option_rows if _parse_num(row.get("strike")) > 0})
-    atm_strike = min(strikes, key=lambda k: abs(k - spot)) if strikes else 0.0
-
-    target_rows = [r for r in option_rows if abs(_parse_num(r.get("strike")) - atm_strike) < 1e-9]
-    row = target_rows[0] if target_rows else min(option_rows, key=lambda r: abs(_parse_num(r.get("strike")) - atm_strike))
-    expiry = row.get("expiryDate") or row.get("expirygroup")
-
-    return {
-        "symbol": symbol,
-        "spot": spot,
-        "expiry": expiry,
-        "atm_strike": atm_strike,
-        "call_last": _parse_num(row.get("c_Last")),
-        "call_bid": _parse_num(row.get("c_Bid")),
-        "call_ask": _parse_num(row.get("c_Ask")),
-        "call_iv": 0.0,
-        "call_oi": _i(_parse_num(row.get("c_Openinterest"))),
-        "put_last": _parse_num(row.get("p_Last")),
-        "put_bid": _parse_num(row.get("p_Bid")),
-        "put_ask": _parse_num(row.get("p_Ask")),
-        "put_iv": 0.0,
-        "put_oi": _i(_parse_num(row.get("p_Openinterest"))),
-    }
 
 
 async def _fetch_crypto_top10() -> list[dict[str, Any]]:

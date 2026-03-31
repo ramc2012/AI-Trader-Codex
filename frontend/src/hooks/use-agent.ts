@@ -15,7 +15,7 @@ export function useAgentStatus(enabled = true) {
   return useQuery({
     queryKey: ['agent-status'],
     queryFn: () => apiFetch<AgentStatus>('/agent/status'),
-    refetchInterval: enabled ? 2000 : false,
+    refetchInterval: enabled ? 30000 : false,
     enabled,
   });
 }

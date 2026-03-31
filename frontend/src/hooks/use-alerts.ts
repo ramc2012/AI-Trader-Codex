@@ -8,7 +8,9 @@ export function useAlerts(enabled = true) {
   return useQuery<Alert[]>({
     queryKey: ['alerts'],
     queryFn: () => apiFetch<Alert[]>('/alerts'),
-    refetchInterval: enabled ? 5000 : false,
+    refetchInterval: enabled ? 30000 : false, // 30s fallback
+    refetchIntervalInBackground: false,
+    staleTime: 5000,
     enabled,
   });
 }

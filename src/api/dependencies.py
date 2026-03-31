@@ -24,6 +24,7 @@ from src.risk.risk_calculator import RiskCalculator
 from src.risk.risk_manager import RiskConfig, RiskManager
 from src.config.settings import get_settings
 from src.watchlist.instrument_registry_service import InstrumentRegistryService
+from src.watchlist.atm_registry import ATMRegistryService
 from src.utils.pubsub import StateChangeBus, get_state_change_bus as _get_bus
 
 
@@ -65,6 +66,7 @@ _trading_agents: dict[str, TradingAgent] = {}
 _telegram_notifier: Optional[TelegramNotifier] = None
 _tick_aggregator: Optional[RealTimeAggregator] = None
 _fractal_scan_notifier: Optional[FractalScanNotifier] = None
+_atm_registry: Optional[ATMRegistryService] = None
 
 
 def get_order_manager() -> OrderManager:
@@ -377,9 +379,19 @@ def reset_fyers_client() -> None:
     global _fyers_client
     global _instrument_registry
     global _runtime_manager
+    global _atm_registry
     _fyers_client = None
     _instrument_registry = None
     _runtime_manager = None
+    _atm_registry = None
+
+
+def get_atm_registry() -> ATMRegistryService:
+    """Get or create the singleton ATMRegistryService."""
+    global _atm_registry
+    if _atm_registry is None:
+        _atm_registry = ATMRegistryService(client=get_fyers_client())
+    return _atm_registry
 
 
 def get_state_change_bus() -> StateChangeBus:
@@ -391,7 +403,7 @@ def reset_managers() -> None:
     """Reset all manager singletons to None (for testing)."""
     global _order_manager, _position_manager, _strategy_executor
     global _risk_manager, _risk_calculator, _health_monitor, _alert_manager
-    global _fyers_client, _agent_event_bus, _trading_agents, _telegram_notifier, _fractal_scan_notifier
+    global _fyers_client, _agent_event_bus, _trading_agents, _telegram_notifier, _fractal_scan_notifier, _atm_registry
 
     _order_manager = None
     _position_manager = None
@@ -407,3 +419,4 @@ def reset_managers() -> None:
     _trading_agents.clear()
     _telegram_notifier = None
     _fractal_scan_notifier = None
+    _atm_registry = None

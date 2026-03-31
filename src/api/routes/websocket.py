@@ -38,6 +38,7 @@ from src.config.settings import get_settings
 from src.database.connection import get_session
 from src.database.models import IndexOHLC, OptionChain, OptionOHLC
 from src.utils.logger import get_logger
+from src.utils.market_symbols import parse_currency_context, classify_market
 
 logger = get_logger(__name__)
 
@@ -591,7 +592,7 @@ def _build_positions_payload() -> Dict[str, Any]:
         
         for position in positions:
             currency, currency_symbol, fx_to_inr = _parse_currency_info(position.symbol, usd_inr_rate)
-            market = _classify_market_info(position.symbol)
+            market = classify_market(position.symbol)
             # In a real app we'd get the plan from the agent, but for now we'll try to find it
             # if we can't we'll just send empty metrics. 
             # Actually, let's just use empty metrics if we can't easily get the plan here
@@ -650,7 +651,7 @@ def _build_orders_payload() -> Dict[str, Any]:
         return {
             "type": "orders_update",
             "timestamp": datetime.now(tz=IST).isoformat(),
-            "orders": [_order_to_response(o).dict() for o in orders]
+            "orders": [_order_to_response(o).model_dump(mode="json") for o in orders]
         }
     except Exception as e:
         logger.error("error_building_orders_payload", error=str(e))
@@ -669,7 +670,7 @@ def _build_trades_payload() -> Dict[str, Any]:
         return {
             "type": "trades_update",
             "timestamp": datetime.now(tz=IST).isoformat(),
-            "trades": [p.dict() for p in pairs]
+            "trades": [p.model_dump(mode="json") for p in pairs]
         }
     except Exception as e:
         logger.error("error_building_trades_payload", error=str(e))

@@ -290,31 +290,47 @@ function ChartDrawer({ name, symbol, ltp, changePct, agentEvents, onClose }: Dra
 
 // ── Table row — each row fetches its own full OHLC quote ──────────────────────
 
+import type { MarketData } from '@/hooks/use-watchlist';
+
 interface IndexRowProps {
   name: string;
   isSelected: boolean;
   onClick: () => void;
-  futLtp: number;
-  futOI: number;
+  spotData?: MarketData;
+  futuresData?: MarketData;
   wsLtp?: number;
   wsChange?: number;
   wsChangePct?: number;
+  isSummaryLoading?: boolean;
 }
 
-function IndexRow({ name, isSelected, onClick, futLtp, futOI, wsLtp, wsChange, wsChangePct }: IndexRowProps) {
+function IndexRow({
+  name,
+  isSelected,
+  onClick,
+  spotData,
+  futuresData,
+  wsLtp,
+  wsChange,
+  wsChangePct,
+  isSummaryLoading,
+}: IndexRowProps) {
   const meta = META[name];
 
-  // Individual quote endpoint — has open/high/low/close/volume
-  const { data: q, isFetching } = useIndexQuote(meta.symbol);
+  // Prefer WS for LTP/change (real-time), fall back to REST summary
+  const ltp       = wsLtp       ?? spotData?.ltp       ?? 0;
+  const change    = wsChange    ?? spotData?.change     ?? 0;
+  const changePct = wsChangePct ?? spotData?.change_pct ?? 0;
 
-  // Prefer WS for LTP/change (real-time), fall back to REST
-  const ltp       = wsLtp       ?? q?.ltp       ?? 0;
-  const change    = wsChange    ?? q?.change     ?? 0;
-  const changePct = wsChangePct ?? q?.change_pct ?? 0;
-  const open      = q?.open     ?? 0;
-  const high      = q?.high     ?? 0;
-  const low       = q?.low      ?? 0;
-  const volume    = q?.volume   ?? 0;
+  // Static OHLC from summary
+  const open      = spotData?.open     ?? 0;
+  const high      = spotData?.high     ?? 0;
+  const low       = spotData?.low      ?? 0;
+  const volume    = spotData?.volume   ?? 0;
+
+  const futLtp    = futuresData?.ltp   ?? 0;
+  const futOI     = futuresData?.oi    ?? 0;
+
   const isUp      = changePct >= 0;
   const premium   = futLtp > 0 && ltp > 0 ? futLtp - ltp : 0;
 
@@ -367,7 +383,7 @@ function IndexRow({ name, isSelected, onClick, futLtp, futOI, wsLtp, wsChange, w
       {/* Open */}
       <td className="px-3 py-3 text-right">
         <span className="font-mono text-xs text-slate-400">
-          {open > 0 ? formatINR(open) : isFetching ? <RefreshCw className="inline h-3 w-3 animate-spin opacity-40" /> : '—'}
+          {open > 0 ? formatINR(open) : isSummaryLoading ? <RefreshCw className="inline h-3 w-3 animate-spin opacity-40" /> : '—'}
         </span>
       </td>
 
@@ -701,11 +717,14 @@ export default function WatchlistPage() {
   }, []);
   const closeDrawer   = useCallback(() => setSelectedName(null), []);
 
-  // Futures data keyed by index name
-  const futData = useMemo(() => {
-    const out: Record<string, { ltp: number; oi: number }> = {};
+  // Baseline data from summary (spot + futures)
+  const baselineData = useMemo(() => {
+    const out: Record<string, { spot?: MarketData; futures?: MarketData }> = {};
     for (const idx of summary?.indices ?? []) {
-      out[idx.name] = { ltp: idx.futures?.ltp ?? 0, oi: idx.futures?.oi ?? 0 };
+      out[idx.name] = {
+        spot: idx.spot,
+        futures: idx.futures,
+      };
     }
     return out;
   }, [summary]);
@@ -792,19 +811,20 @@ export default function WatchlistPage() {
                     </tr>
                   ))
                   : INDICES_ORDER.map((name) => {
-                    const fut = futData[name] ?? { ltp: 0, oi: 0 };
-                    const w   = ws[name];
+                    const baseline = baselineData[name];
+                    const w        = ws[name];
                     return (
                       <IndexRow
                         key={name}
                         name={name}
                         isSelected={selectedName === name}
                         onClick={() => handleSelect(name)}
-                        futLtp={fut.ltp}
-                        futOI={fut.oi}
+                        spotData={baseline?.spot}
+                        futuresData={baseline?.futures}
                         wsLtp={w?.ltp}
                         wsChange={w?.change}
                         wsChangePct={w?.change_pct}
+                        isSummaryLoading={isLoading}
                       />
                     );
                   })}

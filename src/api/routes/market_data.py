@@ -167,6 +167,8 @@ def _alpha_crypto_value(row: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+
+
 def _us_session_is_open(now: datetime | None = None) -> bool:
     current = (now or datetime.now(tz=IST)).astimezone(US_EASTERN)
     if current.weekday() >= 5:
@@ -795,8 +797,8 @@ async def _fetch_crypto_ohlc_binance(symbol: str, timeframe: str, limit: int) ->
     if not pair:
         return []
         
-    # Try both .com and .us endpoints (GCloud US regions often block .com)
-    domains = ["api.binance.com", "api.binance.us"]
+    # Try both .us and .com endpoints (GCloud US regions often block .com)
+    domains = ["api.binance.us", "api.binance.com"]
     target = min(max(int(limit), 50), 5000)
     interval = _binance_interval(timeframe)
     interval_ms = _timeframe_millis(timeframe)

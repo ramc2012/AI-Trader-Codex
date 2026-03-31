@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -94,14 +95,14 @@ class FyersClient(BrokerBase):
 
         self._access_token: str | None = None
         self._fyers: FyersModel | None = None
-        self._refresh_token: str | None = None
-        self._access_token_expires_at: str | None = None
         self._refresh_token_expires_at: str | None = None
         self._last_auto_refresh_attempt: datetime | None = None
+        self._refresh_lock = threading.Lock()
 
         # Rate limiting state
         self._last_request_time: float = 0.0
         self._min_interval: float = 1.0 / self._rate_limit
+        self._rate_limit_lock = threading.Lock()
 
         # Try loading an existing token
         self._load_token()
@@ -198,7 +199,11 @@ class FyersClient(BrokerBase):
         """
         if not self._access_token:
             return False
-        return not self._is_access_token_expired()
+        
+        expired = self._is_access_token_expired()
+        if expired:
+            logger.debug("is_authenticated_check_failed_expired")
+        return not expired
 
     def verify_connection(self) -> bool:
         """Deep check: verify if the current token can reach Fyers servers.
@@ -310,10 +315,11 @@ class FyersClient(BrokerBase):
 
     def _wait_for_rate_limit(self) -> None:
         """Block until we can make another request within the rate limit."""
-        elapsed = time.monotonic() - self._last_request_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        self._last_request_time = time.monotonic()
+        with self._rate_limit_lock:
+            elapsed = time.monotonic() - self._last_request_time
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            self._last_request_time = time.monotonic()
 
     async def _async_wait_for_rate_limit(self) -> None:
         """Async version of rate limit wait."""
@@ -731,14 +737,20 @@ class FyersClient(BrokerBase):
             logger.warning("saved_pin_missing_or_unreadable")
             return False
 
-        self._last_auto_refresh_attempt = now
+        if not self._refresh_lock.acquire(blocking=False):
+            logger.debug("token_refresh_already_in_progress")
+            return False
+
         try:
+            self._last_auto_refresh_attempt = now
             self.refresh_access_token(pin)
             logger.info("token_auto_refreshed_with_saved_pin")
             return True
         except AuthenticationError as exc:
             logger.warning("token_auto_refresh_failed", error=str(exc))
             return False
+        finally:
+            self._refresh_lock.release()
 
     def auto_refresh_if_needed(self, pin: str | None = None) -> bool:
         """Automatically refresh token if expired or expiring soon.

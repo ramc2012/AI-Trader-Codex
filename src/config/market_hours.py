@@ -31,12 +31,32 @@ DATA_FEED_END = time(15, 35)
 TRADING_DAYS = {0, 1, 2, 3, 4}  # Mon-Fri
 
 
+_NSE_HOLIDAYS_2026 = {
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 3, 2),    # Holi
+    date(2026, 3, 20),   # Eid-ul-Fitr (subject to moon)
+    date(2026, 3, 30),   # Ram Navami
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 5, 27),   # Bakrid
+    date(2026, 10, 2),   # Mahatma Gandhi Jayanti
+    date(2026, 10, 20),  # Dussehra
+    date(2026, 11, 9),   # Diwali-Laxmi Pujan (Muhurat Trading only)
+    date(2026, 11, 10),  # Diwali-Balipratipada
+    date(2026, 11, 23),  # Gurunanak Jayanti
+    date(2026, 12, 25),  # Christmas
+}
+
+# Add current day 2026-03-31 as explicitly confirmed by the user
+_NSE_HOLIDAYS_2026.add(date(2026, 3, 31))
+
 def _load_holiday_overrides() -> set[date]:
     """Load holiday overrides from env var `MARKET_HOLIDAYS` (YYYY-MM-DD,comma-separated)."""
     raw = os.getenv("MARKET_HOLIDAYS", "").strip()
+    holidays: set[date] = set(_NSE_HOLIDAYS_2026)
     if not raw:
-        return set()
-    holidays: set[date] = set()
+        return holidays
     for token in raw.split(","):
         value = token.strip()
         if not value:

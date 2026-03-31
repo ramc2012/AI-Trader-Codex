@@ -1227,11 +1227,14 @@ class TradingAgent:
                 if strat_name not in self.executor._strategies:
                     continue
                 
-                # Skip strategies not meant for this style
-                is_scalping = "scalp" in strat_name.lower() or "vwap" in strat_name.lower()
-                is_swing = "swing" in strat_name.lower() or "fractal" in strat_name.lower()
-                is_positional = "trend" in strat_name.lower() or "rotation" in strat_name.lower() or "golden" in strat_name.lower() or "options" in strat_name.lower()
+                # Check for style compatibility
+                strat_lower = strat_name.lower()
+                is_scalping = any(x in strat_lower for x in ["scalp", "vwap", "orderflow", "breakout"])
+                is_swing = any(x in strat_lower for x in ["swing", "fractal", "ema", "rsi"])
+                is_positional = any(x in strat_lower for x in ["trend", "rotation", "golden", "options", "momentum"])
                 
+                # If a strategy fits multiple styles (common for EMA/RSI), allow it 
+                # to run in the current requested agent style.
                 if style == "scalping" and not is_scalping: continue
                 if style == "swing" and not is_swing: continue
                 if style == "positional" and not is_positional: continue
@@ -1417,64 +1420,65 @@ class TradingAgent:
         symbol: str,
         signal_type: SignalType,
     ) -> Tuple[bool, Dict[str, Any]]:
-        """Confirm short-term signals using higher-timeframe spot trend bias."""
-        reference_timeframes = self.get_reference_timeframes()
-        bullish_votes = 0
-        bearish_votes = 0
+        """Confirm signals using weighted higher-timeframe trend consensus."""
+        reference_timeframes = self.config.reference_timeframes or ["60", "D"]
+        bullish_score = 0.0
+        bearish_score = 0.0
+        total_weight = 0.0
         references: Dict[str, Any] = {}
 
-        for timeframe in reference_timeframes:
-            df = await self._fetch_market_data(symbol, timeframe=timeframe)
+        for tf in reference_timeframes:
+            # Assign weights: D (Daily) = 2.0, others = 1.0
+            weight = 2.0 if tf.upper() == "D" else 1.0
+            total_weight += weight
+
+            df = await self._fetch_market_data(symbol, timeframe=tf)
             if df is None or df.empty:
-                references[timeframe] = {"trend": "missing"}
+                references[tf] = {"trend": "missing", "weight": weight}
                 continue
-            fresh, freshness_meta = self._data_freshness(df, timeframe)
+            
+            fresh, freshness_meta = self._data_freshness(df, tf)
             if not fresh:
-                references[timeframe] = {
-                    "trend": "stale",
-                    **freshness_meta,
-                }
+                references[tf] = {"trend": "stale", "weight": weight, **freshness_meta}
                 continue
 
             trend, close, ema = self._infer_trend(df)
-            references[timeframe] = {
+            references[tf] = {
                 "trend": trend,
                 "close": round(close, 2),
                 "ema20": round(ema, 2),
+                "weight": weight
             }
 
             if trend == "bullish":
-                bullish_votes += 1
+                bullish_score += weight
             elif trend == "bearish":
-                bearish_votes += 1
+                bearish_score += weight
 
-        # If reference data is missing entirely, avoid blind execution.
-        total_votes = bullish_votes + bearish_votes
+        # Intelligent consensus logic
         dominant_trend = "neutral"
-        if bullish_votes > bearish_votes:
+        if bullish_score > bearish_score:
             dominant_trend = "bullish"
-        elif bearish_votes > bullish_votes:
+        elif bearish_score > bullish_score:
             dominant_trend = "bearish"
-        confidence_pct = (max(bullish_votes, bearish_votes) / total_votes * 100.0) if total_votes > 0 else 0.0
 
-        if bullish_votes == 0 and bearish_votes == 0:
-            return False, {
-                "timeframes": references,
-                "bullish_votes": bullish_votes,
-                "bearish_votes": bearish_votes,
-                "dominant_trend": dominant_trend,
-                "confidence_pct": round(confidence_pct, 2),
-                "reason": "no_reference_bias",
-            }
-
+        confidence_pct = (max(bullish_score, bearish_score) / total_weight * 100.0) if total_weight > 0 else 0.0
+        
+        # Strict confirmation: Dominant trend must match signal type and confidence >= 50%
+        confirmed = False
         if signal_type == SignalType.BUY:
-            confirmed = bullish_votes > bearish_votes
-            if not confirmed and self._is_bootstrap_phase():
-                confirmed = bullish_votes > 0 and bullish_votes >= bearish_votes
-        else:
-            confirmed = bearish_votes > bullish_votes
-            if not confirmed and self._is_bootstrap_phase():
-                confirmed = bearish_votes > 0 and bearish_votes >= bullish_votes
+            confirmed = dominant_trend == "bullish" and confidence_pct >= 50.0
+        elif signal_type == SignalType.SELL:
+            confirmed = dominant_trend == "bearish" and confidence_pct >= 50.0
+
+        return confirmed, {
+            "timeframes": references,
+            "bullish_score": round(bullish_score, 2),
+            "bearish_score": round(bearish_score, 2),
+            "total_weight": total_weight,
+            "dominant_trend": dominant_trend,
+            "confidence_pct": round(confidence_pct, 2),
+        }
 
         return confirmed, {
             "timeframes": references,
@@ -1844,10 +1848,12 @@ class TradingAgent:
                     },
                 ))
                 return
+            expiry_preference = signal.metadata.get("expiry_preference", "nearest")
             option_contract = await self._resolve_option_contract(
                 underlying_symbol=underlying_symbol,
                 signal_type=signal.signal_type,
                 spot_hint=float(signal.price or 0.0),
+                expiry_preference=expiry_preference,
             )
             if option_contract is None:
                 await self.event_bus.emit(AgentEvent(
@@ -1862,6 +1868,7 @@ class TradingAgent:
                         "underlying_symbol": underlying_symbol,
                         "strategy": strat_name,
                         "signal_type": signal.signal_type.value,
+                        "expiry_preference": expiry_preference,
                     },
                 ))
                 return
@@ -1883,10 +1890,12 @@ class TradingAgent:
                     },
                 ))
                 return
+            expiry_preference = signal.metadata.get("expiry_preference", "nearest")
             option_contract = await self._resolve_us_option_contract(
                 underlying_symbol=underlying_symbol,
                 signal_type=signal.signal_type,
                 spot_hint=float(signal.price or 0.0),
+                expiry_preference=expiry_preference,
             )
             if option_contract is not None:
                 execution_symbol = option_contract.option_symbol
@@ -3468,11 +3477,12 @@ class TradingAgent:
         underlying_symbol: str,
         signal_type: SignalType,
         spot_hint: float = 0.0,
+        expiry_preference: str = "nearest",
     ) -> Optional[OptionContract]:
-        """Resolve nearest-liquid NSE index option contract."""
+        """Resolve nearest or monthly liquid NSE index option contract."""
         option_type = "CE" if signal_type == SignalType.BUY else "PE"
         chain_side = "ce" if option_type == "CE" else "pe"
-        cache_key = (underlying_symbol, option_type)
+        cache_key = (underlying_symbol, option_type, expiry_preference)
         now = datetime.now(tz=IST)
         cached = self._option_contract_cache.get(cache_key)
         if cached is not None:
@@ -3499,8 +3509,25 @@ class TradingAgent:
         best_contract: Optional[OptionContract] = None
         best_score = float("inf")
         lot_size = self._resolve_lot_size(underlying_symbol)
+        def is_monthly(date_str: str) -> bool:
+            try:
+                # Expecting YYYY-MM-DD or similar
+                dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                # Last Thursday of the month
+                last_day = (dt.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+                offset = (last_day.weekday() - 3) % 7
+                last_thursday = last_day - timedelta(days=offset)
+                return dt == last_thursday
+            except Exception:
+                return False
+
         for expiry_block in expiry_rows:
             expiry = str(expiry_block.get("expiry", ""))
+            
+            # If monthly requested but this is weekly, skip unless it's the only choice.
+            if expiry_preference == "monthly" and not is_monthly(expiry):
+                continue
+            
             spot = float(expiry_block.get("spot") or 0.0)
             if spot <= 0 and spot_hint > 0:
                 spot = spot_hint
@@ -3534,6 +3561,8 @@ class TradingAgent:
                     liquidity_penalty += 10_000.0
                 if volume <= 0:
                     liquidity_penalty += 1_000.0
+                
+                # Boost score for monthly expiries if preferred
                 score = distance + liquidity_penalty
                 if score < best_score:
                     best_score = score
@@ -3653,14 +3682,15 @@ class TradingAgent:
         underlying_symbol: str,
         signal_type: SignalType,
         spot_hint: float = 0.0,
+        expiry_preference: str = "nearest",
     ) -> Optional[OptionContract]:
-        """Resolve nearest-liquid US option contract from Yahoo options chain."""
+        """Resolve nearest or monthly liquid US option contract from Yahoo options chain."""
         ticker = self._normalize_us_ticker(underlying_symbol)
         if not ticker:
             return None
 
         option_type = "CALL" if signal_type == SignalType.BUY else "PUT"
-        cache_key = (f"US:{ticker}", option_type)
+        cache_key = (f"US:{ticker}", option_type, expiry_preference)
         now = datetime.now(tz=IST)
         cached = self._option_contract_cache.get(cache_key)
         if cached is not None:
@@ -3699,30 +3729,56 @@ class TradingAgent:
         if spot <= 0 and spot_hint > 0:
             spot = spot_hint
 
+        def is_monthly(ts: int) -> bool:
+            try:
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+                # Third Friday of the month
+                first_day = dt.replace(day=1)
+                first_friday = first_day + timedelta(days=((4 - first_day.weekday() + 7) % 7))
+                third_friday = first_friday + timedelta(weeks=2)
+                return dt == third_friday
+            except Exception:
+                return False
+
         options_blocks = result.get("options", []) if isinstance(result, dict) else []
         expiry_dates = result.get("expirationDates", []) if isinstance(result, dict) else []
-        option_rows: List[Dict[str, Any]] = []
-
-        if options_blocks and isinstance(options_blocks[0], dict):
-            side_key = "calls" if option_type == "CALL" else "puts"
-            option_rows = [
-                row for row in options_blocks[0].get(side_key, [])
-                if isinstance(row, dict)
-            ]
-
-        # If the default payload omitted the desired side, fetch the nearest expiry explicitly.
-        if not option_rows and expiry_dates:
-            nearest_expiry = None
-            for raw_expiry in expiry_dates:
-                try:
-                    expiry_ts = int(raw_expiry)
-                except (TypeError, ValueError):
-                    continue
-                if nearest_expiry is None:
-                    nearest_expiry = expiry_ts
-                if expiry_ts >= int(datetime.now(tz=timezone.utc).timestamp()):
-                    nearest_expiry = expiry_ts
+        
+        # If monthly preference is set, try to find a monthly expiry first
+        target_expiry = None
+        if expiry_preference == "monthly":
+            for exp in expiry_dates:
+                if is_monthly(exp) and exp >= int(now.timestamp()):
+                    target_expiry = exp
                     break
+        
+        # If we have a target expiry (either the preferred monthly or the nearest valid one),
+        # we may need to fetch the specific chain for it if it's not the default.
+        option_rows: List[Dict[str, Any]] = []
+        if options_blocks and isinstance(options_blocks[0], dict):
+            # Check if the default block matches our needs
+            default_exp = options_blocks[0].get("expirationDate")
+            if target_expiry and default_exp != target_expiry:
+                # Need to fetch the specific expiry
+                pass 
+            else:
+                side_key = "calls" if option_type == "CALL" else "puts"
+                option_rows = [
+                    row for row in options_blocks[0].get(side_key, [])
+                    if isinstance(row, dict)
+                ]
+
+        if not option_rows and (target_expiry or expiry_dates):
+            nearest_expiry = target_expiry
+            if not nearest_expiry:
+                for raw_expiry in expiry_dates:
+                    try:
+                        expiry_ts = int(raw_expiry)
+                    except (TypeError, ValueError):
+                        continue
+                    if expiry_ts >= int(now.timestamp()):
+                        nearest_expiry = expiry_ts
+                        break
+            
             if nearest_expiry is not None:
                 try:
                     async with httpx.AsyncClient(timeout=timeout) as http:

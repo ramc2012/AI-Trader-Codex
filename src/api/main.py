@@ -17,6 +17,7 @@ from src.api.dependencies import (
     get_telegram_notifier,
     get_tick_aggregator,
     get_trading_agent,
+    get_atm_registry,
 )
 from src.api.routes.backtest import router as backtest_router
 from src.api.routes.market_data import router as market_data_router
@@ -185,6 +186,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         asyncio.create_task(notifier.start())
     fractal_scan_notifier = get_fractal_scan_notifier()
     asyncio.create_task(fractal_scan_notifier.start())
+    atm_registry = get_atm_registry()
+    asyncio.create_task(atm_registry.start_background_sync())
 
     settings = get_settings()
     if settings.agent_auto_start:
@@ -227,6 +230,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         pass
 
     await runtime_manager.stop()
+    await atm_registry.stop()
     await dispose_engine()
     logger.info("app_stopped")
 

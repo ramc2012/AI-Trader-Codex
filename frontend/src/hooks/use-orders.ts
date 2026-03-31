@@ -8,7 +8,9 @@ export function useOrders(enabled = true) {
   return useQuery<Order[]>({
     queryKey: ['orders'],
     queryFn: () => apiFetch<Order[]>('/orders'),
-    refetchInterval: enabled ? 5000 : false,
+    refetchInterval: enabled ? 30000 : false, // 30s fallback
+    refetchIntervalInBackground: false,
+    staleTime: 5000,
     enabled,
   });
 }

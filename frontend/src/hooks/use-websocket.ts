@@ -40,9 +40,11 @@ function resolveWsUrl(path: string): string {
   return `${wsBase}${path}`;
 }
 
+export type WebSocketMessage = Record<string, any>;
+
 interface UseWebSocketOptions {
   path: string;
-  onMessage?: (data: unknown) => void;
+  onMessage?: (data: WebSocketMessage) => void;
   reconnectInterval?: number;
   enabled?: boolean;
 }

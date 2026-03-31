@@ -97,6 +97,14 @@ class ATMRegistryService:
             return [v for v in self._cache.values() if v.market.upper() == market.upper()]
         return list(self._cache.values())
 
+    def get_by_underlying(self, cache_key: str) -> Optional[ATMMetadata]:
+        """Look up a single underlying from the warm cache.
+
+        Keys follow the pattern 'NSE:RELIANCE', 'US:AAPL', 'CRYPTO:BTCUSDT'.
+        Returns None if the key is absent or the cache is cold.
+        """
+        return self._cache.get(cache_key)
+
     async def start_background_sync(self):
         """Start the periodic background sync loop."""
         if self._is_running:

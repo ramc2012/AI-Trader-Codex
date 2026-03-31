@@ -315,6 +315,7 @@ def get_trading_agent(style: str = "default", config: Optional[AgentConfig] = No
             risk_manager=get_risk_manager(),
             event_bus=get_agent_event_bus(),
             fyers_client=get_fyers_client(),
+            atm_registry=get_atm_registry(),
         )
         _trading_agents[style] = agent
     return agent

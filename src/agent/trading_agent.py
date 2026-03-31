@@ -58,6 +58,7 @@ from src.utils.market_symbols import parse_currency_context
 from src.utils.us_market_data import parse_nasdaq_chart_timestamp, parse_nasdaq_historical_date
 from src.watchlist.options_analytics import BlackScholes
 from src.watchlist.options_data_service import OptionsDataService
+from src.watchlist.atm_registry import ATMRegistryService
 
 logger = get_logger(__name__)
 _YAHOO_HEADERS = {
@@ -193,6 +194,7 @@ class TradingAgent:
         risk_manager: RiskManager,
         event_bus: AgentEventBus,
         fyers_client: FyersClient,
+        atm_registry: Optional[ATMRegistryService] = None,
     ) -> None:
         self.config = config
         self.executor = strategy_executor
@@ -201,6 +203,7 @@ class TradingAgent:
         self.risk_manager = risk_manager
         self.event_bus = event_bus
         self.fyers_client = fyers_client
+        self.atm_registry = atm_registry
         self.position_sizer = PositionSizer(capital=config.capital)
         self.options_service = OptionsDataService(fyers_client)
         from src.data.alt_data_collector import AltDataCollector
@@ -1490,51 +1493,95 @@ class TradingAgent:
         }
 
     async def _resolve_atm_options_for_underlyings(self, underlyings: List[str]) -> List[str]:
-        """Fetch the nearest-expiry ATM CE and PE symbols for a list of underlyings."""
+        """Fetch the nearest-expiry ATM CE and PE symbols for a list of underlyings.
+
+        Uses the warmed ATM registry cache when available, falling back to a
+        live chain fetch only when the cache misses.
+        """
         option_symbols: List[str] = []
         for underlying in underlyings:
             if not underlying.startswith("NSE:"):
-                # Only NSE FNO currently supported for options in this agent
                 continue
-                
+
+            # Derive the short name used as the ATM cache key (e.g. 'RELIANCE')
+            short = underlying.split(":")[-1].split("-")[0]
+            cache_key = f"NSE:{short}"
+
+            # --- Cache path (fast, OI-weighted) ---
+            if self.atm_registry is not None:
+                meta = self.atm_registry.get_by_underlying(cache_key)
+                if meta is not None:
+                    if meta.ce_symbol:
+                        option_symbols.append(meta.ce_symbol)
+                    if meta.pe_symbol:
+                        option_symbols.append(meta.pe_symbol)
+                    continue
+
+            # --- Fallback: live chain fetch ---
             try:
-                # Use executor to offload sync HTTP request
                 chain = await asyncio.to_thread(
                     self.options_service.get_canonical_chain,
                     underlying=underlying,
-                    strike_count=4,  # Fetch a few strikes to find ATM
-                    include_expiries=1, # Only nearest expiry
+                    strike_count=10,
+                    include_expiries=1,
                 )
-                
                 expiry_data = chain.get("data", {}).get("expiryData", [])
                 if not expiry_data:
                     continue
-                    
                 nearest = expiry_data[0]
-                spot = nearest.get("spot", 0.0)
+                spot = float(nearest.get("spot") or 0.0)
                 strikes = nearest.get("strikes", [])
-                
                 if spot <= 0 or not strikes:
                     continue
-                
-                # Find closest strike
-                atm_row = min(strikes, key=lambda row: abs(row.get("strike", 0.0) - spot))
-                
+
+                atm_row = self._pick_round_strike(strikes, spot)
                 ce_symbol = atm_row.get("ce", {}).get("symbol")
                 pe_symbol = atm_row.get("pe", {}).get("symbol")
-                
                 if ce_symbol and ce_symbol.startswith("NSE:"):
                     option_symbols.append(ce_symbol)
                 if pe_symbol and pe_symbol.startswith("NSE:"):
                     option_symbols.append(pe_symbol)
-                    
-                # Yield context slightly to not block thread
                 await asyncio.sleep(0.01)
-                
             except Exception as e:
                 logger.warning("atm_options_fetch_failed", underlying=underlying, error=str(e))
-                
+
         return option_symbols
+
+    @staticmethod
+    def _pick_round_strike(strikes: List[Dict[str, Any]], spot: float) -> Dict[str, Any]:
+        """From a list of strike rows, pick the nearest round-number strike.
+
+        Round-number hierarchy: prefer multiples of 100, then 50, then 10, then
+        5, then any.  Within the same rounding tier we pick the one closest to
+        spot.
+        """
+        if not strikes:
+            return {}
+
+        def _roundness(strike: float) -> int:
+            """Higher = rounder (100 > 50 > 10 > 5 > 1)."""
+            s = int(strike)
+            if s % 100 == 0:
+                return 5
+            if s % 50 == 0:
+                return 4
+            if s % 10 == 0:
+                return 3
+            if s % 5 == 0:
+                return 2
+            return 1
+
+        # Pre-filter: only consider strikes within 3% of spot (same logic as ATM registry)
+        tolerance = spot * 0.03
+        valid = [r for r in strikes if abs(float(r.get("strike", 0)) - spot) <= tolerance]
+        if not valid:
+            valid = strikes  # fallback to all
+
+        # Sort by roundness (desc), then distance (asc)
+        return min(
+            valid,
+            key=lambda r: (-_roundness(float(r.get("strike", 0))), abs(float(r.get("strike", 0)) - spot)),
+        )
 
     async def _attempt_bootstrap_exploration(
         self,
@@ -3479,7 +3526,13 @@ class TradingAgent:
         spot_hint: float = 0.0,
         expiry_preference: str = "nearest",
     ) -> Optional[OptionContract]:
-        """Resolve nearest or monthly liquid NSE index option contract."""
+        """Resolve nearest or monthly liquid NSE option contract.
+
+        For 'nearest' expiry (the common case) the agent first checks the
+        ATMRegistryService cache which already has OI-weighted, round-strike
+        resolved contracts.  Only when the cache misses or the caller asks
+        for 'monthly' do we fall through to a live chain fetch.
+        """
         option_type = "CE" if signal_type == SignalType.BUY else "PE"
         chain_side = "ce" if option_type == "CE" else "pe"
         cache_key = (underlying_symbol, option_type, expiry_preference)
@@ -3490,6 +3543,35 @@ class TradingAgent:
             if now - cached_at <= self._option_contract_cache_ttl:
                 return contract
 
+        # ---- ATM Registry fast path (nearest expiry only) ----
+        if expiry_preference == "nearest" and self.atm_registry is not None:
+            short = underlying_symbol.split(":")[-1].split("-")[0]
+            meta = self.atm_registry.get_by_underlying(f"NSE:{short}")
+            if meta is not None:
+                sym = meta.ce_symbol if option_type == "CE" else meta.pe_symbol
+                ltp = meta.ce_ltp if option_type == "CE" else meta.pe_ltp
+                if sym and ltp > 0:
+                    lot_size = self._resolve_lot_size(underlying_symbol)
+                    contract = OptionContract(
+                        underlying_symbol=underlying_symbol,
+                        option_symbol=sym,
+                        option_type=option_type,
+                        strike=meta.strike,
+                        expiry=meta.expiry,
+                        ltp=ltp,
+                        lot_size=lot_size,
+                    )
+                    self._option_contract_cache[cache_key] = (now, contract)
+                    logger.info(
+                        "option_contract_resolved_from_cache",
+                        underlying=underlying_symbol,
+                        symbol=sym,
+                        strike=meta.strike,
+                        ltp=ltp,
+                    )
+                    return contract
+
+        # ---- Fallback: live chain fetch ----
         try:
             chain = await asyncio.to_thread(
                 self.options_service.get_canonical_chain,
@@ -3532,7 +3614,15 @@ class TradingAgent:
             if spot <= 0 and spot_hint > 0:
                 spot = spot_hint
 
-            for strike_row in expiry_block.get("strikes", []):
+            # Use round-strike picker when spot is available
+            all_strikes = expiry_block.get("strikes", [])
+            if spot > 0 and all_strikes:
+                round_row = self._pick_round_strike(all_strikes, spot)
+                round_strike = float(round_row.get("strike", 0))
+            else:
+                round_strike = 0.0
+
+            for strike_row in all_strikes:
                 strike = float(strike_row.get("strike") or 0.0)
                 if strike <= 0:
                     continue
@@ -3561,9 +3651,11 @@ class TradingAgent:
                     liquidity_penalty += 10_000.0
                 if volume <= 0:
                     liquidity_penalty += 1_000.0
-                
-                # Boost score for monthly expiries if preferred
-                score = distance + liquidity_penalty
+
+                # Prefer round strikes: give the identified round strike a
+                # big bonus (reduce its score) so it wins ties.
+                round_bonus = 5_000.0 if (round_strike > 0 and strike != round_strike) else 0.0
+                score = distance + liquidity_penalty + round_bonus
                 if score < best_score:
                     best_score = score
                     best_contract = OptionContract(
@@ -3684,7 +3776,11 @@ class TradingAgent:
         spot_hint: float = 0.0,
         expiry_preference: str = "nearest",
     ) -> Optional[OptionContract]:
-        """Resolve nearest or monthly liquid US option contract from Yahoo options chain."""
+        """Resolve nearest or monthly liquid US option contract.
+
+        Uses the ATM registry cache for 'nearest' expiry when available.
+        Falls back to yfinance / Nasdaq scraping otherwise.
+        """
         ticker = self._normalize_us_ticker(underlying_symbol)
         if not ticker:
             return None
@@ -3697,6 +3793,32 @@ class TradingAgent:
             cached_at, contract = cached
             if now - cached_at <= self._option_contract_cache_ttl:
                 return contract
+
+        # ---- ATM Registry fast path (nearest expiry only) ----
+        if expiry_preference == "nearest" and self.atm_registry is not None:
+            meta = self.atm_registry.get_by_underlying(f"US:{ticker}")
+            if meta is not None:
+                sym = meta.ce_symbol if option_type == "CALL" else meta.pe_symbol
+                ltp = meta.ce_ltp if option_type == "CALL" else meta.pe_ltp
+                if sym and ltp > 0:
+                    contract = OptionContract(
+                        underlying_symbol=underlying_symbol,
+                        option_symbol=f"US:{sym}" if not sym.startswith("US:") else sym,
+                        option_type=option_type,
+                        strike=meta.strike,
+                        expiry=meta.expiry,
+                        ltp=ltp,
+                        lot_size=100,
+                    )
+                    self._option_contract_cache[cache_key] = (now, contract)
+                    logger.info(
+                        "us_option_contract_resolved_from_cache",
+                        underlying=ticker,
+                        symbol=sym,
+                        strike=meta.strike,
+                        ltp=ltp,
+                    )
+                    return contract
 
         timeout = httpx.Timeout(8.0, connect=4.0)
         endpoint = f"https://query2.finance.yahoo.com/v7/finance/options/{ticker}"

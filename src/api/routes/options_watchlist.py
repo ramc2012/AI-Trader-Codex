@@ -1,7 +1,7 @@
 """API route for ATM Options Watchlist — monitors nearest-expiry ATM CE/PE for all FNO stocks."""
 
 from datetime import datetime
-from typing import Any, List
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel

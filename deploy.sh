@@ -10,8 +10,10 @@ set -e
 INSTANCE_NAME="nifty-trader-node"
 MACHINE_TYPE="n2-standard-2" # 2 vCPU, 8GB RAM (High Availability Tier)
 ZONE="us-central1-a"
+REGION="us-central1"
 IMAGE_FAMILY="debian-11"
 IMAGE_PROJECT="debian-cloud"
+STATIC_IP_NAME="nifty-trader-static-ip"
 
 echo "============================================================"
 echo "🚀 NiftyTraderGravity GCP Deployment Orchestrator"
@@ -41,6 +43,12 @@ echo "This will create a new Compute Engine VM ($INSTANCE_NAME) and deploy the D
 
 echo "⏳ Provisioning Compute Engine VM ($INSTANCE_NAME)..."
 
+# Ensure a static IP is reserved
+gcloud compute addresses describe $STATIC_IP_NAME --region=$REGION > /dev/null 2>&1 || \
+    gcloud compute addresses create $STATIC_IP_NAME --region=$REGION --description="Static IP for NiftyTraderGravity compliance"
+STATIC_IP=$(gcloud compute addresses describe $STATIC_IP_NAME --region=$REGION --format='get(address)')
+echo "✅ Static IP: $STATIC_IP"
+
 # Create the instance (ignore error if exists)
 gcloud compute instances create $INSTANCE_NAME \
     --project=$CURRENT_PROJECT \
@@ -50,7 +58,8 @@ gcloud compute instances create $INSTANCE_NAME \
     --image-project=$IMAGE_PROJECT \
     --tags=http-server,https-server,nifty-trader \
     --boot-disk-size=50GB \
-    --boot-disk-type=pd-ssd || echo "⚠️ Instance $INSTANCE_NAME already exists, skipping creation."
+    --boot-disk-type=pd-ssd \
+    --address=$STATIC_IP || echo "⚠️ Instance $INSTANCE_NAME already exists, skipping creation."
 
 echo "✅ VM Provisioned successfully."
 
@@ -105,8 +114,8 @@ gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command="
     sudo docker compose up -d
 "
 
-# Get Public IP
-PUBLIC_IP=$(gcloud compute instances describe $INSTANCE_NAME --zone=$ZONE --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+# Get Static IP (reliable)
+PUBLIC_IP=$(gcloud compute addresses describe $STATIC_IP_NAME --region=$REGION --format='get(address)')
 
 echo "============================================================"
 echo "🎉 DEPLOYMENT COMPLETE!"

@@ -31,12 +31,12 @@ def _calc_ema(v: List[float], p: int) -> List[float]:
         out.append(ema)
     return out
 
-def _calc_macd(c: List[float]) -> float:
-    if len(c) < 26:
-        return 0.0
+def _calc_macd(c: List[float]) -> tuple[float, float]:
+    if len(c) < 27:
+        return 0.0, 0.0
     e12 = _calc_ema(c, 12)
     e26 = _calc_ema(c, 26)
-    return e12[-1] - e26[-1]
+    return e12[-1] - e26[-1], e12[-2] - e26[-2]
 
 def _calc_rsi(c: List[float], p: int = 14) -> float:
     if len(c) < p + 1:
@@ -68,7 +68,9 @@ class ATMMetadata:
     ce_volume: int = 0
     pe_volume: int = 0
     ce_macd: float = 0.0
+    ce_macd_prev: float = 0.0
     pe_macd: float = 0.0
+    pe_macd_prev: float = 0.0
     ce_rsi: float = 0.0
     pe_rsi: float = 0.0
 
@@ -179,8 +181,8 @@ class ATMRegistryService:
             ce_symbol = ce_entry.get("symbol")
             pe_symbol = pe_entry.get("symbol")
             
-            ce_macd, ce_rsi = 0.0, 0.0
-            pe_macd, pe_rsi = 0.0, 0.0
+            ce_macd, ce_macd_prev, ce_rsi = 0.0, 0.0, 0.0
+            pe_macd, pe_macd_prev, pe_rsi = 0.0, 0.0, 0.0
             
             ce_ltp_fallback = float(ce_entry.get("ltp") or 0.0)
             pe_ltp_fallback = float(pe_entry.get("ltp") or 0.0)
@@ -200,7 +202,7 @@ class ATMRegistryService:
                     )
                     ce_closes = [c[4] for c in ce_hist.get("candles", [])]
                     if ce_closes:
-                        ce_macd = _calc_macd(ce_closes)
+                        ce_macd, ce_macd_prev = _calc_macd(ce_closes)
                         ce_rsi = _calc_rsi(ce_closes)
                         if ce_ltp_fallback <= 0:
                             ce_ltp_fallback = float(ce_closes[-1])
@@ -218,7 +220,7 @@ class ATMRegistryService:
                     )
                     pe_closes = [c[4] for c in pe_hist.get("candles", [])]
                     if pe_closes:
-                        pe_macd = _calc_macd(pe_closes)
+                        pe_macd, pe_macd_prev = _calc_macd(pe_closes)
                         pe_rsi = _calc_rsi(pe_closes)
                         if pe_ltp_fallback <= 0:
                             pe_ltp_fallback = float(pe_closes[-1])
@@ -240,7 +242,9 @@ class ATMRegistryService:
                     ce_volume=int(ce_entry.get("volume") or 0),
                     pe_volume=int(pe_entry.get("volume") or 0),
                     ce_macd=ce_macd,
+                    ce_macd_prev=ce_macd_prev,
                     pe_macd=pe_macd,
+                    pe_macd_prev=pe_macd_prev,
                     ce_rsi=ce_rsi,
                     pe_rsi=pe_rsi
                 )

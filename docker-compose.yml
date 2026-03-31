@@ -111,10 +111,10 @@ services:
       AGENT_TRADE_CRYPTO_24X7: ${AGENT_TRADE_CRYPTO_24X7:-true}
       TELEGRAM_STATUS_INTERVAL_MINUTES: ${TELEGRAM_STATUS_INTERVAL_MINUTES:-30}
       USD_INR_REFERENCE_RATE: ${USD_INR_REFERENCE_RATE:-83.0}
-      # Note: Fyers credentials are read from mounted .env file, not from environment
+      DATA_DIR: /app/data
+      # Note: Fyers credentials and tokens are persisted in the ./data directory.
     volumes:
-      - ./.env:/app/.env
-      - ./.fyers_token.json:/app/.fyers_token.json
+      - ./data:/app/data
     depends_on:
       timescaledb:
         condition: service_healthy

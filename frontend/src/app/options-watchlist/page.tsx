@@ -6,12 +6,9 @@ import {
   List, 
   Search, 
   TrendingUp, 
-  TrendingDown, 
   Activity, 
   RefreshCw,
-  ArrowUpRight,
-  ArrowDownRight,
-  Filter
+  Radar
 } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -29,6 +26,7 @@ interface ATMOptionMetric {
   ltp?: number;
   oi?: number;
   macd?: number;
+  macd_prev?: number;
   rsi?: number;
 }
 
@@ -44,6 +42,7 @@ export default function OptionsWatchlistPage() {
   const [search, setSearch] = useState('');
   const [market, setMarket] = useState<'NSE' | 'US' | 'CRYPTO'>('NSE');
   const [typeFilter, setTypeFilter] = useState<'ALL' | 'CE' | 'PE'>('ALL');
+  const [viewMode, setViewMode] = useState<'WATCHLIST' | 'SCANNER'>('WATCHLIST');
 
   // 1. Fetch the ATM structure (symbols/strikes) for the selected market
   const { data, isLoading, refetch, isFetching } = useQuery<ATMWatchlistResponse>({
@@ -67,6 +66,7 @@ export default function OptionsWatchlistPage() {
         ltp: liveTick?.ltp ?? item.ltp ?? 0,
         oi: liveTick?.oi ?? item.oi ?? 0,
         macd: item.macd ?? 0,
+        macd_prev: item.macd_prev ?? 0,
         rsi: item.rsi ?? 0,
       };
     });
@@ -80,7 +80,111 @@ export default function OptionsWatchlistPage() {
     });
   }, [mergedResults, search, typeFilter]);
 
+  // Scanner Categorization
+  const scannerGroups = useMemo(() => {
+    const aboveZero = filteredResults.filter(item => (item.macd ?? 0) > 0);
+    const crossingUp = filteredResults.filter(item => (item.macd ?? 0) > 0 && (item.macd_prev ?? 0) <= 0);
+    const belowZeroIncreasing = filteredResults.filter(item => (item.macd ?? 0) < 0 && (item.macd ?? 0) > (item.macd_prev ?? 0));
+    
+    return {
+      aboveZero,
+      crossingUp,
+      belowZeroIncreasing
+    };
+  }, [filteredResults]);
+
   const isMarketInactive = data && !data.is_market_open;
+
+  const renderTableRows = (items: typeof filteredResults, emptyMessage: string) => {
+    if (isLoading && items.length === 0) {
+      return Array.from({ length: 5 }).map((_, i) => (
+        <tr key={i} className="border-b border-slate-800/50">
+          <td colSpan={9} className="p-4">
+            <Skeleton className="h-6 w-full rounded-lg" />
+          </td>
+        </tr>
+      ));
+    }
+    if (items.length === 0) {
+      return (
+        <tr>
+          <td colSpan={9} className="py-12 text-center text-slate-500">
+            {search ? 'No matching instruments found' : emptyMessage}
+          </td>
+        </tr>
+      );
+    }
+    return items.map((item, idx) => (
+      <tr 
+        key={`${item.symbol}-${idx}`}
+        className="group border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors"
+      >
+        <td className="py-4 pl-6">
+          <div className="font-bold text-slate-100">{item.underlying}</div>
+        </td>
+        <td className="py-4 px-4 text-center">
+          <span className={cn(
+            "rounded-full px-2 py-0.5 text-[10px] font-bold uppercase",
+            item.option_type === 'CE' 
+              ? "bg-emerald-500/10 text-emerald-400" 
+              : "bg-rose-500/10 text-rose-400"
+          )}>
+            {item.option_type}
+          </span>
+        </td>
+        <td className="py-4 px-4 text-right font-mono text-slate-300">
+          {formatNumber(item.strike)}
+        </td>
+        <td className="py-4 px-4 text-xs text-slate-500">
+          {item.expiry}
+        </td>
+        <td className={cn(
+          "py-4 px-4 text-right font-mono font-bold transition-colors duration-500",
+          item.ltp === 0 ? "text-slate-700" : (item.market === 'US' ? "text-blue-300" : item.market === 'CRYPTO' ? "text-amber-300" : "text-emerald-300")
+        )}>
+          {item.ltp ? formatCurrency(item.ltp, item.market === 'NSE' ? 'INR' : 'USD') : '—'}
+        </td>
+        <td className="py-4 px-4 text-right font-mono text-slate-400">
+          {item.oi ? formatNumber(item.oi) : '—'}
+        </td>
+        <td className="py-4 px-4 text-center">
+          <div className="flex items-center justify-center gap-1">
+            <Activity className={cn("h-3 w-3", (item.macd ?? 0) >= 0 ? "text-emerald-500" : "text-rose-500")} />
+            <span className="text-[10px] font-mono text-slate-500">
+              {item.macd?.toFixed(2) || '0.00'}
+            </span>
+          </div>
+        </td>
+        <td className="py-4 px-4 text-center">
+           <span className={cn(
+             "text-xs font-mono",
+             (item.rsi ?? 0) > 70 ? "text-rose-400" : (item.rsi ?? 0) < 30 ? "text-emerald-400" : "text-slate-400"
+           )}>
+             {item.rsi?.toFixed(0) || '—'}
+           </span>
+        </td>
+        <td className="py-4 pr-6 text-right text-[10px] font-mono text-slate-600">
+          {item.symbol}
+        </td>
+      </tr>
+    ));
+  };
+
+  const TableHeader = () => (
+    <thead>
+      <tr className="border-b border-slate-800 text-[11px] uppercase tracking-[0.2em] text-slate-500 px-4">
+        <th className="py-4 pl-6 w-[15%]">Underlying</th>
+        <th className="py-4 px-4 text-center w-[8%]">Type</th>
+        <th className="py-4 px-4 text-right w-[10%]">Strike</th>
+        <th className="py-4 px-4 w-[12%]">Expiry</th>
+        <th className="py-4 px-4 text-right w-[12%]">LTP</th>
+        <th className="py-4 px-4 text-right w-[10%]">OI</th>
+        <th className="py-4 px-4 text-center w-[10%]">MACD</th>
+        <th className="py-4 px-4 text-center w-[10%]">RSI</th>
+        <th className="py-4 pr-6 text-right w-[13%]">Contract</th>
+      </tr>
+    </thead>
+  );
 
   return (
     <div className="space-y-6">
@@ -108,7 +212,7 @@ export default function OptionsWatchlistPage() {
         <div className="space-y-1">
           <h1 className="text-2xl font-bold text-slate-100 flex items-center gap-2">
             <List className="h-6 w-6 text-emerald-400" />
-            ATM Options Watchlist
+            ATM Options
           </h1>
           <div className="flex items-center gap-3">
             <p className="text-sm text-slate-500">
@@ -141,6 +245,35 @@ export default function OptionsWatchlistPage() {
 
       <div className="flex flex-wrap items-center gap-4 bg-slate-900/40 p-4 rounded-2xl border border-slate-800">
         <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-950/50 border border-slate-700">
+          <button
+            onClick={() => setViewMode('WATCHLIST')}
+            className={cn(
+              "px-5 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-2",
+              viewMode === 'WATCHLIST'
+                ? "bg-slate-700 text-slate-100 shadow-sm"
+                : "text-slate-500 hover:text-slate-300"
+            )}
+          >
+            <List className="h-4 w-4" />
+            Watchlist
+          </button>
+          <button
+            onClick={() => setViewMode('SCANNER')}
+            className={cn(
+              "px-5 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-2",
+              viewMode === 'SCANNER'
+                ? "bg-emerald-500/20 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]"
+                : "text-slate-500 hover:text-slate-300"
+            )}
+          >
+            <Radar className="h-4 w-4" />
+            MACD Scanner
+          </button>
+        </div>
+
+        <div className="h-8 w-px bg-slate-800 hidden md:block mx-2" />
+
+        <div className="flex items-center gap-1 p-1 rounded-xl bg-slate-950/50 border border-slate-700">
           {(['NSE', 'US', 'CRYPTO'] as const).map(m => (
             <button
               key={m}
@@ -148,9 +281,7 @@ export default function OptionsWatchlistPage() {
               className={cn(
                 "px-5 py-2 rounded-lg text-xs font-bold transition-all flex items-center gap-2",
                 market === m 
-                  ? m === 'NSE' ? "bg-emerald-500/20 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]"
-                    : m === 'US' ? "bg-blue-500/20 text-blue-400 shadow-[0_0_15px_rgba(59,130,246,0.2)]"
-                    : "bg-amber-500/20 text-amber-400 shadow-[0_0_15px_rgba(245,158,11,0.2)]"
+                  ? m === 'NSE' ? "text-emerald-400" : m === 'US' ? "text-blue-400" : "text-amber-400"
                   : "text-slate-500 hover:text-slate-300"
               )}
             >
@@ -197,97 +328,89 @@ export default function OptionsWatchlistPage() {
         </div>
       </div>
 
-      <div className="rounded-[28px] border border-slate-800 bg-slate-900/40 p-1 overflow-hidden backdrop-blur-sm">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-sm">
-            <thead>
-              <tr className="border-b border-slate-800 text-[11px] uppercase tracking-[0.2em] text-slate-500 px-4">
-                <th className="py-4 pl-6">Underlying</th>
-                <th className="py-4 px-4 text-center">Type</th>
-                <th className="py-4 px-4 text-right">Strike</th>
-                <th className="py-4 px-4">Expiry</th>
-                <th className="py-4 px-4 text-right">LTP</th>
-                <th className="py-4 px-4 text-right">OI</th>
-                <th className="py-4 px-4 text-center">MACD</th>
-                <th className="py-4 px-4 text-center">RSI</th>
-                <th className="py-4 pr-6 text-right">Contract</th>
-              </tr>
-            </thead>
-            <tbody>
-              {isLoading && filteredResults.length === 0 ? (
-                Array.from({ length: 12 }).map((_, i) => (
-                  <tr key={i} className="border-b border-slate-800/50">
-                    <td colSpan={9} className="p-4">
-                      <Skeleton className="h-6 w-full rounded-lg" />
-                    </td>
-                  </tr>
-                ))
-              ) : filteredResults.length === 0 ? (
-                <tr>
-                  <td colSpan={9} className="py-20 text-center text-slate-500">
-                    {search ? 'No matching instruments found' : 'Resolving ATM strikes... Please wait.'}
-                  </td>
-                </tr>
-              ) : (
-                filteredResults.map((item, idx) => (
-                  <tr 
-                    key={`${item.symbol}-${idx}`}
-                    className="group border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors"
-                  >
-                    <td className="py-4 pl-6">
-                      <div className="font-bold text-slate-100">{item.underlying}</div>
-                    </td>
-                    <td className="py-4 px-4 text-center">
-                      <span className={cn(
-                        "rounded-full px-2 py-0.5 text-[10px] font-bold uppercase",
-                        item.option_type === 'CE' 
-                          ? "bg-emerald-500/10 text-emerald-400" 
-                          : "bg-rose-500/10 text-rose-400"
-                      )}>
-                        {item.option_type}
-                      </span>
-                    </td>
-                    <td className="py-4 px-4 text-right font-mono text-slate-300">
-                      {formatNumber(item.strike)}
-                    </td>
-                    <td className="py-4 px-4 text-xs text-slate-500">
-                      {item.expiry}
-                    </td>
-                    <td className={cn(
-                      "py-4 px-4 text-right font-mono font-bold transition-colors duration-500",
-                      item.ltp === 0 ? "text-slate-700" : (item.market === 'US' ? "text-blue-300" : item.market === 'CRYPTO' ? "text-amber-300" : "text-emerald-300")
-                    )}>
-                      {item.ltp ? formatCurrency(item.ltp, item.market === 'NSE' ? 'INR' : 'USD') : '—'}
-                    </td>
-                    <td className="py-4 px-4 text-right font-mono text-slate-400">
-                      {item.oi ? formatNumber(item.oi) : '—'}
-                    </td>
-                    <td className="py-4 px-4 text-center">
-                      <div className="flex items-center justify-center gap-1">
-                        <Activity className={cn("h-3 w-3", (item.macd ?? 0) >= 0 ? "text-emerald-500" : "text-rose-500")} />
-                        <span className="text-[10px] font-mono text-slate-500">
-                          {item.macd?.toFixed(2) || '0.00'}
-                        </span>
-                      </div>
-                    </td>
-                    <td className="py-4 px-4 text-center">
-                       <span className={cn(
-                         "text-xs font-mono",
-                         (item.rsi ?? 0) > 70 ? "text-rose-400" : (item.rsi ?? 0) < 30 ? "text-emerald-400" : "text-slate-400"
-                       )}>
-                         {item.rsi?.toFixed(0) || '—'}
-                       </span>
-                    </td>
-                    <td className="py-4 pr-6 text-right text-[10px] font-mono text-slate-600">
-                      {item.symbol}
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+      {viewMode === 'WATCHLIST' ? (
+        <div className="rounded-[28px] border border-slate-800 bg-slate-900/40 p-1 overflow-hidden backdrop-blur-sm">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm table-fixed">
+              <TableHeader />
+              <tbody>
+                {renderTableRows(filteredResults, 'Resolving ATM strikes... Please wait.')}
+              </tbody>
+            </table>
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="space-y-6">
+          <div className="rounded-[28px] border border-emerald-900/30 bg-emerald-950/10 p-1 overflow-hidden backdrop-blur-sm">
+            <div className="px-6 py-4 border-b border-slate-800/50 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="h-8 w-8 rounded-full bg-emerald-500/20 flex items-center justify-center">
+                  <TrendingUp className="h-4 w-4 text-emerald-400" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-100">BULLISH: Crossing Up Zero Line</h3>
+                  <p className="text-xs text-slate-400">MACD just flipped from negative to positive</p>
+                </div>
+              </div>
+              <span className="px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-bold">
+                {scannerGroups.crossingUp.length} matches
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm table-fixed">
+                <TableHeader />
+                <tbody>{renderTableRows(scannerGroups.crossingUp, 'No instruments crossing up zero')}</tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="rounded-[28px] border border-blue-900/30 bg-blue-950/10 p-1 overflow-hidden backdrop-blur-sm">
+            <div className="px-6 py-4 border-b border-slate-800/50 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="h-8 w-8 rounded-full bg-blue-500/20 flex items-center justify-center">
+                  <Activity className="h-4 w-4 text-blue-400" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-100">MOMENTUM: MACD Above Zero</h3>
+                  <p className="text-xs text-slate-400">Currently in positive momentum territory</p>
+                </div>
+              </div>
+              <span className="px-3 py-1 rounded-full bg-blue-500/10 text-blue-400 text-xs font-bold">
+                {scannerGroups.aboveZero.length} matches
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm table-fixed">
+                <TableHeader />
+                <tbody>{renderTableRows(scannerGroups.aboveZero, 'No instruments with MACD above zero')}</tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="rounded-[28px] border border-amber-900/30 bg-amber-950/10 p-1 overflow-hidden backdrop-blur-sm">
+            <div className="px-6 py-4 border-b border-slate-800/50 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="h-8 w-8 rounded-full bg-amber-500/20 flex items-center justify-center">
+                  <TrendingUp className="h-4 w-4 text-amber-400" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-100">RECOVERY: Below Zero But Increasing</h3>
+                  <p className="text-xs text-slate-400">Still negative, but momentum is pushing upwards</p>
+                </div>
+              </div>
+              <span className="px-3 py-1 rounded-full bg-amber-500/10 text-amber-400 text-xs font-bold">
+                {scannerGroups.belowZeroIncreasing.length} matches
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm table-fixed">
+                <TableHeader />
+                <tbody>{renderTableRows(scannerGroups.belowZeroIncreasing, 'No recovering instruments')}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

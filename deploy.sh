@@ -95,9 +95,12 @@ gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command="
         sudo usermod -aG docker \$USER
     fi
     
-    mkdir -p nifty-trader && \
+    mkdir -p nifty-trader/data && \
     tar -xzf nifty-trader.tar.gz -C nifty-trader && \
     cd nifty-trader && \
+    # Migrate legacy files if they exist and data/ is empty
+    [ -f .env ] && [ ! -f data/.env ] && mv .env data/.env || true && \
+    [ -f .fyers_token.json ] && [ ! -f data/.fyers_token.json ] && mv .fyers_token.json data/.fyers_token.json || true && \
     sudo docker compose build --build-arg NEXT_PUBLIC_APP_INSTANCE_LABEL=GCloud && \
     sudo docker compose up -d
 "

@@ -26,6 +26,7 @@ class ATMOptionMetric(BaseModel):
     oi: int = 0
     oi_change: int = 0
     macd: float = 0.0
+    macd_prev: float = 0.0
     rsi: float = 0.0
 
 class ATMWatchlistResponse(BaseModel):
@@ -63,6 +64,7 @@ async def get_atm_watchlist(
             vtt=meta.ce_volume,
             oi=meta.ce_oi,
             macd=meta.ce_macd,
+            macd_prev=meta.ce_macd_prev,
             rsi=meta.ce_rsi
         ))
         # PE
@@ -76,6 +78,7 @@ async def get_atm_watchlist(
             vtt=meta.pe_volume,
             oi=meta.pe_oi,
             macd=meta.pe_macd,
+            macd_prev=meta.pe_macd_prev,
             rsi=meta.pe_rsi
         ))
 

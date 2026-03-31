@@ -310,7 +310,11 @@ class ATMRegistryService:
                 strike=atm_call.get("strike", 0.0),
                 expiry=datetime.fromtimestamp(target_expiry or expiry_dates[0], tz=timezone.utc).date().isoformat(),
                 last_updated=datetime.now(tz=IST),
-                market="US"
+                market="US",
+                ce_ltp=float(atm_call.get("lastPrice") or 0.0),
+                pe_ltp=float(atm_put.get("lastPrice") or 0.0),
+                ce_oi=int(atm_call.get("openInterest") or 0),
+                pe_oi=int(atm_put.get("openInterest") or 0)
             )
         except Exception as e:
             logger.debug("atm_resolution_failed_us", symbol=sym, error=str(e))

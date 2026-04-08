@@ -94,6 +94,8 @@ class FyersClient(BrokerBase):
         self._log_path = log_path
 
         self._access_token: str | None = None
+        self._refresh_token: str | None = None
+        self._access_token_expires_at: str | None = None
         self._fyers: FyersModel | None = None
         self._refresh_token_expires_at: str | None = None
         self._last_auto_refresh_attempt: datetime | None = None
@@ -214,10 +216,37 @@ class FyersClient(BrokerBase):
         if not self._access_token or not self._fyers:
             return False
         try:
-            resp = self._fyers.get_profile()
-            return resp.get("s") == "ok"
-        except Exception:
+            # Use a short timeout for the heartbeat to keep the UI responsive
+            # We don't use self.get_profile() here because it has longer internal retries
+            profile = self._fyers.get_profile()
+            return profile.get("s") == "ok"
+        except (AuthenticationError, APIError):
+            logger.warning("verify_connection_failed_cleaning_up")
+            self.clear_authentication()
             return False
+        except Exception as exc:
+            logger.error("verify_connection_unexpected_error", error=str(exc))
+            return False
+
+    def clear_authentication(self) -> None:
+        """Clear all in-memory and on-disk authentication state.
+
+        Used when a token is found to be invalid or expired.
+        """
+        self._access_token = None
+        self._fyers = None
+        self._refresh_token = None
+        self._access_token_expires_at = None
+        self._refresh_token_expires_at = None
+
+        if self._token_path.exists():
+            try:
+                self._token_path.unlink()
+                logger.info("cleared_stale_token_file", path=str(self._token_path))
+            except Exception as exc:
+                logger.error("failed_to_delete_token_file", error=str(exc))
+        
+        logger.info("authentication_state_cleared")
 
     @property
     def access_token(self) -> str | None:

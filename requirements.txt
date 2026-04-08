@@ -20,10 +20,11 @@ aioredis>=2.0.0
 # Task Queue
 celery>=5.3.6
 
-# WebSocket / HTTP
+# WebSocket / HTTP / Messaging
 aiohttp>=3.9.0
 websockets>=12.0
 httpx>=0.26.0
+pyzmq>=25.0.0
 
 # Data Processing
 pandas>=2.1.0

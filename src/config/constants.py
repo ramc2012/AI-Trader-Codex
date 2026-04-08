@@ -135,3 +135,4 @@ ABSOLUTE_MAX_OPEN_POSITIONS = 6
 API_V1_PREFIX = "/api/v1"
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 10000
+USER_AGENT = "NomadCurie/1.0.0 (Trading Bot; +https://github.com/ramc2012/AI-Trader-Codex)"

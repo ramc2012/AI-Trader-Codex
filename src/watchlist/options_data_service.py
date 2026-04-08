@@ -13,6 +13,7 @@ from src.database.operations import (
     get_option_chain_rows_for_expiry,
     upsert_option_chain_rows,
 )
+from src.integrations.broker_base import BrokerBase
 from src.integrations.fyers_client import FyersClient
 from src.utils.logger import get_logger
 
@@ -91,7 +92,7 @@ def _empty_side() -> dict[str, Any]:
 class OptionsDataService:
     """Fetches, normalizes, and persists options chain snapshots."""
 
-    def __init__(self, client: FyersClient):
+    def __init__(self, client: BrokerBase):
         self._client = client
 
     def get_expiries(self, underlying: str) -> list[dict[str, Any]]:

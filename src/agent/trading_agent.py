@@ -40,6 +40,7 @@ from src.config.settings import get_settings
 from src.execution.order_manager import Order, OrderManager, OrderSide, OrderStatus, OrderType, ProductType
 from src.execution.position_manager import PositionManager, PositionSide
 from src.execution.strategy_executor import StrategyExecutor
+from src.integrations.broker_base import BrokerBase
 from src.integrations.fyers_client import FyersClient
 from src.risk.position_sizer import PositionSizer
 from src.risk.risk_manager import RiskManager
@@ -55,10 +56,12 @@ from src.strategies.directional.supertrend_strategy import SupertrendStrategy
 from src.strategies.positional.options_momentum_buy import OptionsMomentumBuy
 from src.utils.logger import get_logger
 from src.utils.market_symbols import parse_currency_context
+from src.utils.pubsub import get_state_change_bus
 from src.utils.us_market_data import parse_nasdaq_chart_timestamp, parse_nasdaq_historical_date
 from src.watchlist.options_analytics import BlackScholes
 from src.watchlist.options_data_service import OptionsDataService
 from src.watchlist.atm_registry import ATMRegistryService
+from src.services.fno_radar_service import FnORadarService
 
 logger = get_logger(__name__)
 _YAHOO_HEADERS = {
@@ -120,7 +123,7 @@ class AgentConfig:
     scan_interval_seconds: int = 30
     paper_mode: bool = True
     capital: float = 41_750_000.0
-    india_capital: float = 250_000.0
+    india_capital: float = 6_000_000.0
     us_capital: float = 250_000.0
     crypto_capital: float = 250_000.0
     india_max_instrument_pct: float = 25.0
@@ -143,7 +146,7 @@ class AgentConfig:
     reinforcement_alpha: float = 0.2
     reinforcement_size_boost_pct: float = 60.0
     strategy_capital_bucket_enabled: bool = True
-    strategy_max_concurrent_positions: int = 4
+    strategy_max_concurrent_positions: int = 10
     telegram_status_interval_minutes: int = 30
     agent_style: str = "default"
 
@@ -193,7 +196,7 @@ class TradingAgent:
         position_manager: PositionManager,
         risk_manager: RiskManager,
         event_bus: AgentEventBus,
-        fyers_client: FyersClient,
+        broker_client: BrokerBase,
         atm_registry: Optional[ATMRegistryService] = None,
     ) -> None:
         self.config = config
@@ -202,10 +205,11 @@ class TradingAgent:
         self.position_manager = position_manager
         self.risk_manager = risk_manager
         self.event_bus = event_bus
-        self.fyers_client = fyers_client
+        self.broker_client = broker_client
         self.atm_registry = atm_registry
         self.position_sizer = PositionSizer(capital=config.capital)
-        self.options_service = OptionsDataService(fyers_client)
+        self.options_service = OptionsDataService(broker_client)
+        self.radar_service = FnORadarService(broker_client=broker_client)
         from src.data.alt_data_collector import AltDataCollector
         self.alt_data = AltDataCollector()
         self._macro_context = None
@@ -244,6 +248,7 @@ class TradingAgent:
         self._readiness_notified: Dict[str, bool] = {}
         self._warmed_symbols: set[str] = set()
         self._stale_data_keys: set[Tuple[str, str]] = set()
+        self._last_auth_warning_at: Optional[date] = None
         self._circuit_breaker_notified = False
 
     # ------------------------------------------------------------------
@@ -320,6 +325,8 @@ class TradingAgent:
         if self.config.agent_style in ("default", "positional"):
             self._tasks.append(asyncio.create_task(self._positional_loop()))
         
+        get_state_change_bus().notify("agent")
+        
         # We still need a background task for housekeeping (exits, daily summary, etc.)
         self._tasks.append(asyncio.create_task(self._housekeeping_loop()))
         
@@ -351,6 +358,7 @@ class TradingAgent:
             severity="info",
             metadata={"cycles": self._cycle_count, "trades": self._total_trades, "pnl": self._daily_pnl},
         ))
+        get_state_change_bus().notify("agent")
         logger.info("trading_agent_stopped")
 
     async def pause(self) -> None:
@@ -365,6 +373,7 @@ class TradingAgent:
             message="Agent paused. No new scans or trades will be executed until resumed.",
             severity="warning",
         ))
+        get_state_change_bus().notify("agent")
 
     async def resume(self) -> None:
         """Resume from paused state."""
@@ -378,6 +387,7 @@ class TradingAgent:
             message="Agent resumed. Scanning and trading active.",
             severity="success",
         ))
+        get_state_change_bus().notify("agent")
 
     def get_strategy_controls(self) -> List[Dict[str, Any]]:
         """Return toggle state for all known strategies."""
@@ -469,6 +479,7 @@ class TradingAgent:
         # Keep order stable for deterministic UI rendering and timeframe planning.
         enabled_set = set(self.config.strategies)
         self.config.strategies = [item for item in STRATEGY_REGISTRY.keys() if item in enabled_set]
+        get_state_change_bus().notify("agent")
         return True
 
     def build_strategy(self, name: str) -> BaseStrategy:
@@ -932,13 +943,13 @@ class TradingAgent:
     # ------------------------------------------------------------------
 
     async def _scalping_loop(self) -> None:
-        await self._run_style_loop("scalping", 30, ["1", "3", "5"])
+        await self._run_style_loop("scalping", 30, ["1", "3", "5", "10"])
 
     async def _swing_loop(self) -> None:
-        await self._run_style_loop("swing", 300, ["15", "60", "D"])
+        await self._run_style_loop("swing", 300, ["D"])
 
     async def _positional_loop(self) -> None:
-        await self._run_style_loop("positional", 3600, ["D", "W"])
+        await self._run_style_loop("positional", 3600, ["30", "60", "240", "W"])
 
     async def _run_style_loop(self, style: str, interval: int, timeframes: List[str]) -> None:
         """Generic loop for a specific trading style."""
@@ -1018,6 +1029,31 @@ class TradingAgent:
 
                 execution_symbols = list(active_symbols)
                 
+                # Dynamic Radar Discovery for Positional Loop
+                if style == "positional":
+                    try:
+                        radar_candidates = await self.radar_service.get_top_candidates(min_conviction=4, limit=10)
+                        if radar_candidates:
+                            # Convert to NSE:SYMBOL-EQ format
+                            radar_nse_symbols = [f"NSE:{s}-EQ" for s in radar_candidates]
+                            # Only add if not already in execution_symbols
+                            added_count = 0
+                            for rs in radar_nse_symbols:
+                                if rs not in execution_symbols:
+                                    execution_symbols.append(rs)
+                                    added_count += 1
+                            
+                            if added_count > 0:
+                                await self.event_bus.emit(AgentEvent(
+                                    event_type=AgentEventType.MARKET_SCAN,
+                                    title="Radar Candidates Injected",
+                                    message=f"Added {added_count} high-conviction Radar candidates to positional scan cycle.",
+                                    severity="info",
+                                    metadata={"radar_symbols": radar_nse_symbols},
+                                ))
+                    except Exception as exc:
+                        logger.warning("radar_injection_failed", error=str(exc))
+
                 # Expand symbols with ATM Options for the Positional loop
                 if style == "positional" and "Options_Momentum_Buy" in self.config.strategies:
                     option_contracts = await self._resolve_atm_options_for_underlyings(active_symbols)
@@ -1138,6 +1174,7 @@ class TradingAgent:
                     },
                 ))
 
+                await self._maybe_emit_pre_market_auth_warning()
                 await self._maybe_emit_periodic_summary()
                 await asyncio.sleep(self.config.scan_interval_seconds)
 
@@ -1209,10 +1246,13 @@ class TradingAgent:
             regime_meta = self._market_regime_profile(df, symbol_market)
             ltp = float(df["close"].iloc[-1])
             tf_label = f"{timeframe}m" if timeframe.isdigit() else timeframe
+            
+            # Safe formatting for LTP
+            ltp_str = f"{ltp:,.2f}" if ltp is not None else "N/A"
             await self.event_bus.emit(AgentEvent(
                 event_type=AgentEventType.MARKET_DATA_RECEIVED,
-                title=f"{short_name} LTP ({tf_label}): {ltp:,.2f}",
-                message=f"Loaded {len(df)} candles ({tf_label}). Last close: {ltp:,.2f}.",
+                title=f"{short_name} LTP ({tf_label}): {ltp_str}",
+                message=f"Loaded {len(df)} candles ({tf_label}). Last close: {ltp_str}.",
                 severity="info",
                 metadata={"symbol": symbol, "ltp": ltp, "candles": len(df), "timeframe": timeframe},
             ))
@@ -1230,24 +1270,14 @@ class TradingAgent:
                 if strat_name not in self.executor._strategies:
                     continue
                 
-                # Check for style compatibility
-                strat_lower = strat_name.lower()
-                is_scalping = any(x in strat_lower for x in ["scalp", "vwap", "orderflow", "breakout"])
-                is_swing = any(x in strat_lower for x in ["swing", "fractal", "ema", "rsi"])
-                is_positional = any(x in strat_lower for x in ["trend", "rotation", "golden", "options", "momentum"])
-                
-                # If a strategy fits multiple styles (common for EMA/RSI), allow it 
-                # to run in the current requested agent style.
-                if style == "scalping" and not is_scalping: continue
-                if style == "swing" and not is_swing: continue
-                if style == "positional" and not is_positional: continue
+                strat_display_name = f"{style.capitalize()} | {strat_name}"
 
                 await self.event_bus.emit(AgentEvent(
                     event_type=AgentEventType.STRATEGY_ANALYZING,
-                    title=f"Running {strat_name} ({tf_label})",
-                    message=f"Analyzing {short_name} on {tf_label} with {strat_name}...",
+                    title=f"Running {strat_display_name} ({tf_label})",
+                    message=f"Analyzing {short_name} on {tf_label} with {strat_display_name}...",
                     severity="info",
-                    metadata={"symbol": symbol, "strategy": strat_name, "timeframe": timeframe},
+                    metadata={"symbol": symbol, "strategy": strat_display_name, "timeframe": timeframe},
                 ))
 
                 strategy_signals = [r for r in results if r.get("strategy") == strat_name]
@@ -1314,12 +1344,14 @@ class TradingAgent:
                     signal.metadata["trade_priority_threshold"] = round(priority_threshold, 2)
 
                     if priority_score < priority_threshold:
+                        priority_str = f"{priority_score:.1f}" if priority_score is not None else "N/A"
+                        threshold_str = f"{priority_threshold:.1f}" if priority_threshold is not None else "N/A"
                         await self.event_bus.emit(AgentEvent(
                             event_type=AgentEventType.NO_SIGNAL,
                             title=f"{strat_name}: Priority Filtered",
                             message=(
                                 f"{strat_name} setup on {tf_label} was skipped. "
-                                f"Priority {priority_score:.1f} < threshold {priority_threshold:.1f} "
+                                f"Priority {priority_str} < threshold {threshold_str} "
                                 f"for {regime_meta.get('regime', 'transition')} regime."
                             ),
                             severity="info",
@@ -1337,7 +1369,7 @@ class TradingAgent:
                     candidate_signals.append(
                         {
                             "signal": signal,
-                            "strategy": strat_name,
+                            "strategy": strat_display_name,
                             "timeframe": timeframe,
                             "priority_score": priority_score,
                             "regime": regime_meta,
@@ -1990,11 +2022,16 @@ class TradingAgent:
             return
 
         format_price = lambda value: f"{value:,.2f}" if value is not None else "N/A"
+        format_qty = lambda value: f"{value:,.0f}" if value is not None else "N/A"
         reference_meta = signal.metadata.get("reference_timeframe_bias", {}) if isinstance(signal.metadata, dict) else {}
         execution_short_name = execution_symbol.split(":")[-1]
+        
+        strike_str = format_qty(option_contract.strike) if option_contract is not None else "N/A"
+        expiry_str = option_contract.expiry if option_contract is not None else "N/A"
+        
         contract_note = (
             f" Contract: {execution_short_name} ({option_contract.option_type}, "
-            f"strike {option_contract.strike:,.0f}, expiry {option_contract.expiry})."
+            f"strike {strike_str}, expiry {expiry_str})."
             if option_contract is not None
             else ""
         )
@@ -2074,7 +2111,9 @@ class TradingAgent:
         ))
 
         try:
-            self.position_sizer.capital = max(float(market_allocation["allocated_capital"]), 1.0)
+            # 1M Bucket per strategy for NSE (assigned in _strategy_budget_limits)
+            strategy_budget_map = self._strategy_budget_limits(strat_name, execution_symbol)
+            self.position_sizer.capital = max(float(strategy_budget_map["strategy_budget"]), 1.0)
             sizing = self.position_sizer.fixed_fractional(
                 entry_price=entry_price,
                 stop_loss=sl_price,
@@ -2086,15 +2125,16 @@ class TradingAgent:
         reinforcement_mult = self._position_size_multiplier(strat_name)
         market_condition_mult = self._market_condition_size_multiplier(signal, execution_timeframe)
         applied_size_mult = reinforcement_mult * market_condition_mult
-        if isinstance(signal.metadata, dict):
-            signal.metadata["reinforcement_size_multiplier"] = round(reinforcement_mult, 3)
-            signal.metadata["market_condition_size_multiplier"] = round(market_condition_mult, 3)
-            signal.metadata["applied_position_size_multiplier"] = round(applied_size_mult, 3)
+        
         quantity = max(int(quantity * applied_size_mult), 1)
         if self._is_bootstrap_phase():
             quantity = max(int(quantity * max(self.config.bootstrap_size_multiplier, 1.0)), 1)
 
-        lot_size = option_contract.lot_size if option_contract is not None else 1
+        # Ensure we use the ROOT to look up the lot size correctly.
+        root_for_lot = self._normalize_nse_underlying_root(execution_symbol)
+        lot_size = get_lot_size(root_for_lot)
+        
+        # Strictly align with lot size, ensuring at least one full lot is traded.
         quantity = self._align_quantity_to_lot(quantity, lot_size)
 
         (
@@ -2124,7 +2164,7 @@ class TradingAgent:
                     title=f"Order Rejected — {short_name}",
                     message=(
                         f"Risk caps cannot fit 1 lot ({lot_size}) for {execution_short_name} "
-                        f"at {entry_price:,.2f}."
+                        f"at {format_price(entry_price)}."
                     ),
                     severity="warning",
                     metadata={
@@ -2202,7 +2242,7 @@ class TradingAgent:
                 title=f"Order Rejected — {short_name}",
                 message=(
                     f"{strat_name} cannot fit a trade for {execution_short_name} "
-                    f"at {entry_price:,.2f} within current capital headroom."
+                    f"at {format_price(entry_price)} within current capital headroom."
                 ),
                 severity="warning",
                 metadata={
@@ -2222,7 +2262,7 @@ class TradingAgent:
                     title=f"Order Rejected — {short_name}",
                     message=(
                         f"{strat_name} budget cannot fit 1 lot ({lot_size}) for "
-                        f"{execution_short_name} at {entry_price:,.2f}."
+                        f"{execution_short_name} at {format_price(entry_price)}."
                     ),
                     severity="warning",
                     metadata={
@@ -2324,9 +2364,9 @@ class TradingAgent:
         if not validation.is_valid:
             await self.event_bus.emit(AgentEvent(
                 event_type=AgentEventType.RISK_CHECK_FAILED,
-                title=f"Risk Check Failed — {short_name}",
-                message=f"Trade rejected: {validation.reason}. Risk score: {validation.risk_score:.2f}.",
-                severity="warning",
+                title=f"Trade Rejected — {short_name}",
+                message=f"Trade rejected: {validation.reason}. Risk score: {getattr(validation, 'risk_score', 0):.2f}.",
+                severity="error",
                 metadata={
                     "symbol": execution_symbol,
                     "underlying_symbol": underlying_symbol,
@@ -2338,15 +2378,15 @@ class TradingAgent:
 
         await self.event_bus.emit(AgentEvent(
             event_type=AgentEventType.RISK_CHECK_PASSED,
-            title=f"Risk Check Passed — {short_name}",
-            message=f"Trade approved. Risk score: {validation.risk_score:.2f}. Proceeding to order placement.",
+            title=f"Trade Approved — {short_name}",
+            message=f"Trade approved. Risk score: {getattr(validation, 'risk_score', 0):.2f}. Proceeding to order placement.",
             severity="success",
-                metadata={
-                    "symbol": execution_symbol,
-                    "underlying_symbol": underlying_symbol,
-                    "risk_score": validation.risk_score,
-                },
-            ))
+            metadata={
+                "symbol": execution_symbol,
+                "underlying_symbol": underlying_symbol,
+                "risk_score": validation.risk_score,
+            },
+        ))
 
         # Place order. Index directional signals are converted into long options:
         # BUY -> buy CE, SELL -> buy PE.
@@ -2399,7 +2439,8 @@ class TradingAgent:
                     event_type=AgentEventType.ORDER_PLACED,
                     title=f"Order Filled — {short_name}",
                     message=(
-                        f"{side.name} {quantity} x {execution_short_name} @ {fill_price:,.2f}. "
+                        f"{side.name} {quantity} x {execution_short_name} @ {format_price(fill_price)}. "
+                        f"Entry Reason: {signal.metadata.get('reason', 'Signal Triggered')}. "
                         f"SL: {format_price(sl_price)}. "
                         f"Target: {format_price(target_price)}."
                     ),
@@ -2485,7 +2526,7 @@ class TradingAgent:
                 metadata={
                     "symbol": execution_symbol,
                     "underlying_symbol": underlying_symbol,
-                    "error": str(e),
+                        "error": str(e),
                 },
             ))
 
@@ -2493,17 +2534,31 @@ class TradingAgent:
         return symbol.endswith("-INDEX") or symbol in self._spot_to_index_name
 
     def _normalize_nse_underlying_root(self, symbol: str) -> str:
+        """Extract the base FnO root (e.g. NIFTY, BANKNIFTY) from any NSE symbol."""
         token = str(symbol or "").strip().upper()
         if not token:
             return ""
+
+        # Map spot names (e.g. NSE:NIFTY50-INDEX -> NIFTY)
         spot_match = self._spot_to_index_name.get(token)
         if spot_match:
             return spot_match
+
+        # Strip exchange
         token = token.split(":", 1)[-1]
-        if token.endswith("-EQ"):
-            token = token[:-3]
-        if token.endswith("-INDEX"):
-            token = token[:-6]
+
+        # Use regex to extract the root from option contracts (e.g. NIFTY25JAN... -> NIFTY)
+        match = re.match(r"^([A-Z]+)", token)
+        if match:
+            root = match.group(1)
+            # Re-map index-specific names to FnO roots if needed
+            if root in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                return root
+            # Check for common variants
+            if "NIFTY50" in root or root == "NIFTY-50":
+                return "NIFTY"
+            return root
+
         return token
 
     def _is_nse_option_eligible_underlying(self, symbol: str) -> bool:
@@ -2695,7 +2750,7 @@ class TradingAgent:
 
         if execution_market == "NSE":
             try:
-                depth_response = await asyncio.to_thread(self.fyers_client.get_market_depth, execution_symbol)
+                depth_response = await asyncio.to_thread(self.broker_client.get_market_depth, execution_symbol)
                 visible_qty = self._extract_visible_depth_quantity(depth_response, execution_symbol, side)
             except Exception as exc:
                 logger.debug("liquidity_depth_fetch_failed", symbol=execution_symbol, error=str(exc))
@@ -2823,7 +2878,12 @@ class TradingAgent:
 
         enabled = self._enabled_strategy_names() or list(self.config.strategies)
         strategy_count = max(len(enabled), 1)
-        strategy_budget = market_budget / strategy_count
+        
+        # User requested 1 million each to each strategy for NSE trading.
+        if market == "NSE":
+            strategy_budget = 1_000_000.0
+        else:
+            strategy_budget = market_budget / strategy_count
         max_slots = max(int(self.config.strategy_max_concurrent_positions), 1)
         per_trade_budget = min(strategy_budget / max_slots, max_instrument_budget)
 
@@ -4213,14 +4273,14 @@ class TradingAgent:
         # NSE readiness depends on auth when market session is open.
         nse_enabled = bool(self.config.trade_nse_when_open and self.config.symbols)
         nse_open = bool(sessions.get("nse", False))
-        nse_auth = bool(getattr(self.fyers_client, "is_authenticated", False))
+        nse_auth = bool(getattr(self.broker_client, "is_authenticated", False))
         auto_refreshed = False
         if nse_enabled and nse_open and not nse_auth:
-            refresh_fn = getattr(self.fyers_client, "try_auto_refresh_with_saved_pin", None)
+            refresh_fn = getattr(self.broker_client, "try_auto_refresh_with_saved_pin", None)
             if callable(refresh_fn):
                 try:
                     auto_refreshed = bool(await asyncio.to_thread(refresh_fn, False))
-                    nse_auth = bool(getattr(self.fyers_client, "is_authenticated", False))
+                    nse_auth = bool(getattr(self.broker_client, "is_authenticated", False))
                 except Exception as exc:
                     logger.warning("nse_readiness_refresh_error", error=str(exc))
         nse_ready = (not nse_enabled) or (not nse_open) or nse_auth
@@ -4382,14 +4442,14 @@ class TradingAgent:
             return None
 
     async def _fetch_fyers_market_data(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
-        if not self.fyers_client.is_authenticated:
-            refresh_fn = getattr(self.fyers_client, "try_auto_refresh_with_saved_pin", None)
+        if not self.broker_client.is_authenticated:
+            refresh_fn = getattr(self.broker_client, "try_auto_refresh_with_saved_pin", None)
             if callable(refresh_fn):
                 try:
                     await asyncio.to_thread(refresh_fn, False)
                 except Exception as exc:
                     logger.warning("fyers_market_data_refresh_error", symbol=symbol, error=str(exc))
-        if not self.fyers_client.is_authenticated:
+        if not self.broker_client.is_authenticated:
             return None
         end = datetime.now(tz=IST)
         days_back = {
@@ -4406,7 +4466,7 @@ class TradingAgent:
         start = end - pd.Timedelta(days=days_back)
 
         raw = await asyncio.to_thread(
-            lambda: self.fyers_client.get_history(
+            lambda: self.broker_client.get_history(
                 symbol=symbol,
                 resolution=timeframe,
                 range_from=start.strftime("%Y-%m-%d"),
@@ -5010,14 +5070,13 @@ class TradingAgent:
         prices: Dict[str, float] = {}
 
         if nse_symbols:
-            if not self.fyers_client.is_authenticated:
-                refresh_fn = getattr(self.fyers_client, "try_auto_refresh_with_saved_pin", None)
+            if not self.broker_client.is_authenticated:
+                refresh_fn = getattr(self.broker_client, "try_auto_refresh_with_saved_pin", None)
                 if callable(refresh_fn):
                     try:
                         await asyncio.to_thread(refresh_fn, False)
                     except Exception as exc:
                         logger.warning("fetch_live_prices_refresh_error", market="nse", error=str(exc))
-            if self.fyers_client.is_authenticated:
                 try:
                     raw = await asyncio.to_thread(lambda: self.fyers_client.get_quotes(nse_symbols))
                 except Exception as exc:
@@ -5572,22 +5631,21 @@ class TradingAgent:
             if plan is not None:
                 time_left_sec = max(int((plan.time_exit_at - now).total_seconds()), 0)
 
+            pnl_str = f"{unrealized_pnl:+,.0f}" if unrealized_pnl is not None else "N/A"
+            pnl_pct_str = f"{unrealized_pnl_pct:+.1f}" if unrealized_pnl_pct is not None else "N/A"
+            
             # Emit position update
+            message = f"Side: {side} | Qty: {quantity} | Avg: {avg_price:,.2f} | P&L: {pnl_str} ({pnl_pct_str}%)"
+            if plan is not None:
+                sl_str = f"{plan.stop_loss:,.2f}" if plan.stop_loss is not None else "N/A"
+                tg_str = f"{plan.target:,.2f}" if plan.target is not None else "N/A"
+                message += f" | SL: {sl_str} | Target: {tg_str} | Time Left: {time_left_sec}s"
+
             await self.event_bus.emit(AgentEvent(
                 event_type=AgentEventType.POSITION_UPDATE,
                 title=f"Position: {short_name}",
-                message=(
-                    f"Side: {side} | Qty: {quantity} | "
-                    f"Avg: {avg_price:,.2f} | "
-                    f"P&L: {unrealized_pnl:+,.0f} ({unrealized_pnl_pct:+.1f}%)"
-                    + (
-                        f" | SL: {plan.stop_loss:,.2f} | Target: {plan.target:,.2f} "
-                        f"| Time Left: {time_left_sec}s"
-                        if plan is not None
-                        else ""
-                    )
-                ),
-                severity="success" if unrealized_pnl >= 0 else "warning",
+                message=message,
+                severity="success" if unrealized_pnl is not None and unrealized_pnl >= 0 else "warning",
                 metadata={
                     "symbol": symbol,
                     "quantity": quantity,
@@ -5655,15 +5713,20 @@ class TradingAgent:
         winning = risk_summary.get("winning_trades", 0)
         losing = risk_summary.get("losing_trades", 0)
         win_rate = (winning / total_trades * 100) if total_trades > 0 else 0
+        win_rate_str = f"{win_rate:.1f}" if win_rate is not None else "N/A"
+        realized_pnl_val = risk_summary.get("realized_pnl", 0)
+        realized_pnl_str = f"{realized_pnl_val:+,.0f}" if realized_pnl_val is not None else "N/A"
+        available_risk_val = risk_summary.get("available_risk", 0)
+        available_risk_str = f"{available_risk_val:,.0f}" if available_risk_val is not None else "N/A"
 
         await self.event_bus.emit(AgentEvent(
             event_type=AgentEventType.DAILY_SUMMARY,
             title=f"Daily Summary — {datetime.now(tz=IST).strftime('%Y-%m-%d')}",
             message=(
                 f"Total Trades: {total_trades} ({winning}W / {losing}L)\n"
-                f"Win Rate: {win_rate:.1f}%\n"
-                f"Realized P&L: {risk_summary.get('realized_pnl', 0):+,.0f}\n"
-                f"Available Risk: {risk_summary.get('available_risk', 0):,.0f}"
+                f"Win Rate: {win_rate_str}%\n"
+                f"Realized P&L: {realized_pnl_str}\n"
+                f"Available Risk: {available_risk_str}"
             ),
             severity="success" if self._daily_pnl >= 0 else "warning",
             metadata={
@@ -5826,11 +5889,52 @@ class TradingAgent:
             for symbol in nse_symbols:
                 for tf in required_tfs:
                     days = {"D": 365, "60": 90, "15": 45, "5": 20, "3": 14, "1": 7}.get(tf, 30)
-                    await collect_symbol_data(self.fyers_client, symbol, tf, days)
+                    await collect_symbol_data(self.broker_client, symbol, tf, days)
                     await asyncio.sleep(0.3)
 
         except Exception as e:
             logger.warning("data_intelligence_error", error=str(e))
+
+    async def _maybe_emit_pre_market_auth_warning(self) -> None:
+        """Alert the user ~100 minutes before market open if the session is invalid."""
+        from src.config.market_hours import minutes_until_market_open
+        
+        # Check if it's currently roughly 100 minutes before the next NSE open.
+        # Window: 95 to 110 minutes before open.
+        minutes_to_open = minutes_until_market_open()
+        if not (95 <= minutes_to_open <= 110):
+            return
+
+        today = datetime.now(tz=IST).date()
+        if self._last_auth_warning_at == today:
+            return
+
+        # Check if Fyers session is valid.
+        if not self.fyers_client.is_authenticated:
+            # Try a quick auto-refresh first if possible
+            refresh_fn = getattr(self.fyers_client, "try_auto_refresh_with_saved_pin", None)
+            refreshed = False
+            if callable(refresh_fn):
+                try:
+                    refreshed = await asyncio.to_thread(refresh_fn, False)
+                except Exception:
+                    pass
+            
+            if not refreshed:
+                # Still not authenticated - send CRITICAL warning
+                await self.event_bus.emit(AgentEvent(
+                    event_type=AgentEventType.AGENT_ERROR,
+                    title="PRE-MARKET ACTION REQUIRED: Session Expired",
+                    message=(
+                        f"The {self.broker_client.name.value.upper()} session is currently invalid or expired. "
+                        f"Market opens in {int(minutes_to_open)} minutes. "
+                        "Please login manually via the dashboard to ensure the agent can trade."
+                    ),
+                    severity="error",
+                    metadata={"minutes_until_open": round(minutes_to_open, 1)},
+                ))
+                self._last_auth_warning_at = today
+                logger.warning("pre_market_auth_warning_sent", minutes_to_open=minutes_to_open)
 
     # ------------------------------------------------------------------
     # Helpers
